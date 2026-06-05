@@ -1,0 +1,230 @@
+"""Modal entrypoint for captioning the corpus with LP-MusicCaps, fanned out
+across many containers.
+
+Each container loads the captioning model once in ``@modal.enter()``, then
+processes a batch of MP3 files.  The orchestrator lists files missing from
+``tags.json``, dispatches batches via ``.map()``, and periodically flushes
+results back into ``tags.json`` on the tokens volume.
+
+Run (spawns and returns immediately; --detach keeps the app alive):
+    modal run --detach diskrot/modal_auto_tag.py
+
+Watch:
+    modal app logs nano-auto-tag -f
+"""
+# NOTE: do NOT add `from __future__ import annotations` here. Modal's class
+# parameter validation crashes on PEP 563 stringified field annotations. The
+# Captioner class currently has no modal.parameter() fields, but keeping the
+# rule consistent across modal_*.py files makes it safe to add one later.
+
+import json
+import time
+from pathlib import Path
+
+import modal
+
+app = modal.App("nano-auto-tag")
+
+
+def _prefetch_captioner():
+    """Bake BART + LP-MusicCaps weights into the image layer."""
+    from transformers import BartConfig, BartTokenizer
+    BartConfig.from_pretrained("facebook/bart-base")
+    BartTokenizer.from_pretrained("facebook/bart-base")
+    from huggingface_hub import hf_hub_download
+    hf_hub_download(repo_id="seungheondoh/lp-music-caps", filename="transfer.pth")
+
+
+# Heavy image for the GPU workers (captioner + torch).
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("ffmpeg", "libsndfile1")
+    .pip_install(
+        "torch>=2.4",
+        "torchaudio>=2.4",
+        "librosa>=0.10",
+        "numpy>=1.26",
+        "tqdm>=4.66",
+        "soundfile>=0.12",
+        "transformers>=4.35",
+        "huggingface_hub",
+    )
+    .run_function(_prefetch_captioner, secrets=[modal.Secret.from_name("huggingface-secret")])
+    .add_local_python_source("model", "diskrot")
+)
+
+# Slim image for the orchestrator — it just lists files, calls .map(), and
+# merges results into tags.json. No torch / captioner needed.
+orchestrator_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .add_local_python_source("diskrot")
+)
+
+corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
+
+
+@app.cls(
+    image=image,
+    gpu="L4",
+    timeout=60 * 60 * 4,
+    max_containers=50,
+    volumes={"/corpus": corpus_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+class Captioner:
+    @modal.enter()
+    def load_model(self):
+        from model.captioner import load_captioner
+        self.model = load_captioner("cuda")
+
+    @modal.method()
+    def caption_batch(
+        self, names: list[str]
+    ) -> list[tuple[str, dict | None, str | None]]:
+        """Returns one (stem, tags_or_None, error_or_None) per input."""
+        import librosa
+        import numpy as np
+        import torch
+        from model.captioner import DURATION, N_SAMPLES, SAMPLE_RATE
+
+        out: list[tuple[str, dict | None, str | None]] = []
+        for name in names:
+            path = Path("/corpus") / name
+            stem = path.stem
+            try:
+                audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
+                n_samples = SAMPLE_RATE * DURATION
+                if audio.shape[-1] > n_samples:
+                    offset = int(audio.shape[-1] * 0.25)
+                    offset = min(offset, audio.shape[-1] - n_samples)
+                    audio = audio[offset:offset + n_samples]
+                if audio.shape[-1] < n_samples:
+                    pad = np.zeros(n_samples, dtype=np.float32)
+                    pad[:audio.shape[-1]] = audio
+                    audio = pad
+                audio_t = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0).cuda()
+                captions = self.model.generate(audio_t, num_beams=5)
+                tags = {"description": captions[0]}
+                out.append((stem, tags, None))
+            except Exception as e:
+                out.append((stem, None, str(e)[:200]))
+        return out
+
+
+@app.function(
+    image=orchestrator_image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    timeout=60 * 60 * 24,
+    # Pin the long-lived coordinator to a non-preemptible instance so it never
+    # restarts mid-run (each restart costs a full corpus rescan). The GPU
+    # Captioner fan-out stays preemptible — its .map() inputs auto-retry. retries
+    # kept as a transient-failure backstop; tags.json is flushed every
+    # flush_every_batches so a restart resumes with at most the un-flushed tail lost.
+    nonpreemptible=True,
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
+)
+def run_auto_tag(batch_size: int, flush_every_batches: int) -> None:
+    """Full pass: list pending, fan out across Captioner containers, merge into
+    tags.json with periodic flushes. Spawned from the local entrypoint so
+    the user can launch and walk away."""
+    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    tags_path = Path("/tokens/tags.json")
+    existing: dict = {}
+    if tags_path.exists():
+        existing = json.loads(tags_path.read_text())
+
+    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
+    if existing:
+        print(f"RESUMING: {len(existing):,} of {len(mp3s):,} already captioned, "
+              f"{len(pending):,} still pending", flush=True)
+    else:
+        print(f"fresh run: {len(mp3s):,} mp3s, 0 already captioned, "
+              f"{len(pending):,} pending", flush=True)
+
+    if not pending:
+        print("Nothing to caption — all files already in tags.json", flush=True)
+        return
+
+    chunks = [pending[i:i + batch_size]
+              for i in range(0, len(pending), batch_size)]
+    print(f"dispatching {len(pending):,} files in {len(chunks):,} batches "
+          f"of ~{batch_size} across up to 50 containers...", flush=True)
+
+    def flush() -> None:
+        tags_path.parent.mkdir(parents=True, exist_ok=True)
+        tags_path.write_text(json.dumps(existing, indent=2))
+        # Retry a transient DataLossError so a storage blip on the periodic
+        # flush doesn't crash the orchestrator and trigger a full rescan +
+        # fleet re-spawn.
+        for attempt in range(3):
+            try:
+                tokens_vol.commit()
+                return
+            except modal.exception.DataLossError as e:
+                if attempt == 2:
+                    raise
+                print(f"commit failed ({e}); retry {attempt + 1}/2", flush=True)
+                time.sleep(2.0 * (attempt + 1))
+
+    captioner = Captioner()
+    n_done = n_failed = 0
+    n_batch_errors = 0
+    batch_idx = 0
+    # order_outputs=False: a preempted batch must not head-of-line-block the
+    # in-order yield (that idles the other containers while they still bill).
+    # Results are merged into tags.json by stem, so order doesn't matter.
+    # return_exceptions=True: a single batch raising (e.g. a worker that hard-
+    # crashes on a poison file, or a transient error) must NOT propagate out and
+    # crash this orchestrator — that would re-rescan and re-spin-up the fleet.
+    # Count it and continue; those files stay un-captioned and are picked up on
+    # the next run via the tags.json skip logic.
+    for batch in captioner.caption_batch.map(
+        chunks, order_outputs=False, return_exceptions=True
+    ):
+        if isinstance(batch, Exception):
+            n_batch_errors += 1
+            if n_batch_errors <= 20:
+                print(f"BATCH FAILED (files stay pending, redone next run): "
+                      f"{type(batch).__name__}: {str(batch)[:140]}", flush=True)
+            batch_idx += 1
+            continue
+        for stem, tags, error in batch:
+            if error is not None:
+                print(f"FAILED {stem}: {error}", flush=True)
+                n_failed += 1
+            else:
+                existing[stem] = tags
+                n_done += 1
+        batch_idx += 1
+        if batch_idx % flush_every_batches == 0:
+            flush()
+            done = n_done + n_failed
+            pct = 100.0 * done / len(pending)
+            print(f"  progress {done:,}/{len(pending):,} ({pct:.1f}%) "
+                  f"— captioned {n_done:,}, failed {n_failed:,} "
+                  f"(saved to tags.json)", flush=True)
+
+    flush()
+    print(f"\ncaptioned: {n_done:,}  failed: {n_failed:,}", flush=True)
+    if n_batch_errors:
+        print(f"batch errors: {n_batch_errors:,} "
+              f"(transient — affected files stay pending; re-run to finish them)",
+              flush=True)
+    print(f"total in tags.json: {len(existing):,}", flush=True)
+
+
+@app.local_entrypoint()
+def main(batch_size: int = 16, flush_every_batches: int = 4):
+    # spawn (not remote) — submit the orchestrator and return immediately.
+    # Combined with `modal run --detach`, the app stays alive after the local
+    # CLI exits, so the user can close their terminal and walk away.
+    fc = run_auto_tag.spawn(
+        batch_size=batch_size,
+        flush_every_batches=flush_every_batches,
+    )
+    print(f"auto-tag launched (detached) — function call id: {fc.object_id}")
+    print(f"watch:  modal app logs $(modal app list | "
+          f"awk '/nano-auto-tag.*ephemeral/{{print $2; exit}}') -f")
+    print(f"stop:   modal app stop $(modal app list | "
+          f"awk '/nano-auto-tag.*ephemeral/{{print $2; exit}}') -y")

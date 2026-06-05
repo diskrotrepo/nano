@@ -1,0 +1,496 @@
+"""Inference: mp3 in → mp3 (or wav) out via the trained nano audio GPT."""
+from __future__ import annotations
+
+import io
+import os
+import platform
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+import librosa
+import soundfile as sf
+import torch
+
+from model.codec import DACodec
+from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
+from model.text_encoder import CLAPTextEncoder
+from server.prompt_sweetener import PromptSweetener
+
+
+def _mlx_available() -> bool:
+    """True only on Apple-Silicon macOS with the `mlx` package installed.
+
+    MLX provides a much faster autoregressive decode path than PyTorch-MPS; it
+    only exists on arm64 macOS, and importing mlx.core confirms that."""
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        import mlx.core  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class InferenceEngine:
+    def __init__(self, ckpt_path: str | None = None, device: str | None = None):
+        self.device = device or os.environ.get("NANO_DEVICE") or (
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
+        self.codec = DACodec(device=self.device)
+        self.text_encoder: CLAPTextEncoder | None = None
+        self.sweetener: PromptSweetener | None = None  # lazy — only built on first use
+        self._silence_seed: torch.Tensor | None = None
+
+        ckpt_path = ckpt_path or os.environ.get("NANO_CKPT", "./checkpoints/latest.pt")
+        if Path(ckpt_path).exists():
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            cfg = GPTConfig(**ckpt["cfg"])
+            state = ckpt["model"]
+            # strip torch.compile's _orig_mod. prefix if present
+            if any(k.startswith("_orig_mod.") for k in state):
+                state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+
+            # Backend: MLX on Apple Silicon (unless NANO_MLX=0), else PyTorch.
+            self.backend = (
+                "mlx"
+                if os.environ.get("NANO_MLX", "auto") != "0"
+                and self.device == "mps"
+                and _mlx_available()
+                else "torch"
+            )
+            if self.backend == "mlx":
+                import mlx.core as mx
+
+                from model.nano_audio_gpt_mlx import MLXNanoAudioGPT
+
+                bits = int(os.environ.get("NANO_MLX_BITS", "8"))
+                self.model = MLXNanoAudioGPT(
+                    cfg, state, dtype=mx.float16, bits=bits if bits in (4, 8) else None
+                )
+                print(f"[inference] backend: mlx (Apple Silicon), weights="
+                      f"{'fp16' if self.model._bits == 16 else f'int{self.model._bits}'}")
+            else:
+                self.model = NanoAudioGPT(cfg).to(self.device)
+                self.model.load_state_dict(state)
+                self.model.eval()
+                if self.device != "cpu":
+                    self.model = self.model.half()
+                if self.device == "cuda":
+                    self.model = torch.compile(self.model)
+                print(f"[inference] backend: torch ({self.device})")
+            self.ckpt_step = ckpt.get("step", -1)
+            self.ckpt_path = ckpt_path
+            print(f"[inference] loaded ckpt {ckpt_path} (step {self.ckpt_step})")
+            print(f"[inference] config: d_model={cfg.d_model}, n_layers={cfg.n_layers}, "
+                  f"n_heads={cfg.n_heads}, max_seq_len={cfg.max_seq_len}, "
+                  f"vocab_per_codebook={cfg.vocab_per_codebook}")
+            print(f"[inference] model: {self.model.num_params()/1e6:.2f}M params on {self.device}")
+
+            # load text encoder if model was trained with text conditioning
+            if cfg.use_text_conditioning:
+                self.text_encoder = CLAPTextEncoder(d_out=cfg.d_model, device=self.device)
+                self.text_encoder.to(self.device)
+                text_proj_loaded = False
+                if "text_proj" in ckpt:
+                    self.text_encoder.proj.load_state_dict(ckpt["text_proj"])
+                    text_proj_loaded = True
+                self.text_encoder.eval()
+                print(f"[inference] text conditioning: on (text_proj loaded: {text_proj_loaded})")
+            else:
+                print("[inference] text conditioning: off")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint at {ckpt_path} — train a model first or set NANO_CKPT"
+            )
+
+    def _silence_seed_tokens(self) -> torch.Tensor:
+        """~1 second of DAC-encoded digital silence (86 frames). Used to seed
+        from-scratch generation for prompts that match a quiet trajectory
+        (lo-fi, ambient, slow). A shorter seed (e.g. 1 frame) leaves the model
+        without enough on-distribution context to find a coherent trajectory
+        and degenerates to noise; a longer one is unnecessary. For high-energy
+        prompts where the model can't escape the silence basin (hip-hop /
+        intense / distorted), use seed_mode='random' instead so the audio
+        context doesn't fight the cross-attention conditioning. Cached after
+        the first call."""
+        if self._silence_seed is None:
+            samples = self.codec.SAMPLE_RATE  # 1 second
+            silence = torch.zeros(1, samples, dtype=torch.float32)
+            self._silence_seed = self.codec.encode(silence).to(self.device)
+        return self._silence_seed
+
+    def _gen_metadata(
+        self,
+        mode: str,
+        text: str | None = None,
+        negative_text: str | None = None,
+        temperature: float | list[float] | None = None,
+        top_k: int | None | list[int | None] = None,
+        top_p: float | None | list[float | None] = None,
+        cfg_scale: float | None = None,
+        style_weight: float | None = None,
+        **extra: object,
+    ) -> dict[str, str]:
+        """Build the `nano_*` metadata dict embedded into generated mp3s as ID3
+        TXXX frames. Captures model identity + the conditioning + all sampling
+        params so a generation is reproducible from the file alone. `None`/empty
+        values are skipped; lists (per-codebook params) are stringified as-is."""
+        cfg = self.model.cfg
+        fields: dict[str, object | None] = {
+            "nano_model": "nano",
+            "nano_ckpt": os.path.basename(self.ckpt_path),
+            "nano_step": self.ckpt_step,
+            "nano_params": self.model.num_params(),
+            "nano_d_model": cfg.d_model,
+            "nano_n_layers": cfg.n_layers,
+            "nano_n_heads": cfg.n_heads,
+            "nano_max_seq_len": cfg.max_seq_len,
+            "nano_mode": mode,
+            "nano_prompt": text,
+            "nano_negative": negative_text,
+            "nano_temperature": temperature,
+            "nano_top_k": top_k,
+            "nano_top_p": top_p,
+            "nano_cfg_scale": cfg_scale,
+            "nano_style_weight": style_weight,
+            **{f"nano_{k}": v for k, v in extra.items()},
+            "nano_generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return {k: str(v) for k, v in fields.items() if v is not None and v != ""}
+
+    def sweeten_prompt(self, text: str) -> str:
+        """Rewrite a terse user prompt into LP-MusicCaps caption style via a
+        small local LLM, to strengthen CLAP conditioning. Lazy-loads the
+        sweetener on first use; returns ``text`` unchanged on any failure."""
+        if self.sweetener is None:
+            self.sweetener = PromptSweetener(device=self.device)
+        return self.sweetener.sweeten(text)
+
+    def _build_conditioning(
+        self,
+        text: str | None = None,
+        style_audio_bytes: bytes | None = None,
+        style_weight: float = 0.5,
+    ) -> torch.Tensor | None:
+        """Build a conditioning embedding from text (tags + lyrics), style audio, or both.
+
+        text may contain tags and lyrics separated by ". " (combined by the server).
+        Tags and lyrics get separate positions in cross-attention.
+        When style_audio is also provided, blends with the tag embedding.
+        Returns [1, N, D] or None.
+        """
+        if self.text_encoder is None:
+            return None
+
+        # Split tags from lyrics (server joins them as "tags. lyrics")
+        tags_str = ""
+        lyrics_str = ""
+        if text and text.strip():
+            parts = text.split(". ", 1)
+            tags_str = parts[0]
+            lyrics_str = parts[1] if len(parts) > 1 else ""
+
+        # Encode tags (position 0)
+        tag_emb = None
+        if tags_str:
+            tag_emb = self.text_encoder.encode([tags_str]).to(self.device)  # [1, 1, D]
+
+        # Blend with style audio if provided
+        if style_audio_bytes:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(style_audio_bytes)
+                style_path = f.name
+            try:
+                audio_emb = self.text_encoder.encode_audio([style_path]).to(self.device)
+            finally:
+                os.unlink(style_path)
+            if tag_emb is not None:
+                tag_emb = tag_emb * (1 - style_weight) + audio_emb * style_weight
+            else:
+                tag_emb = audio_emb
+
+        # Encode lyrics (position 1)
+        lyrics_emb = None
+        if lyrics_str:
+            lyrics_emb = self.text_encoder.encode([lyrics_str]).to(self.device)  # [1, 1, D]
+
+        # Stack available embeddings
+        parts = [e for e in (tag_emb, lyrics_emb) if e is not None]
+        if not parts:
+            return None
+        cond = torch.cat(parts, dim=1)  # [1, 1 or 2, D]
+        # match the GPT's compute dtype (half on mlx/cuda/mps, fp32 on torch-cpu);
+        # the mlx backend re-casts to its own dtype at the generate() boundary.
+        return cond.to(self._cond_dtype())
+
+    def _cond_dtype(self) -> torch.dtype:
+        """dtype for the conditioning tensor. fp32 only for the torch-on-CPU path;
+        every accelerated path (mlx, cuda, mps-half) runs in fp16."""
+        if self.backend == "torch" and self.device == "cpu":
+            return torch.float32
+        return torch.float16
+
+    @torch.no_grad()
+    def continue_audio(
+        self,
+        mp3_bytes: bytes,
+        add_seconds: float = 25.0,
+        prompt_seconds: float | None = None,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        style_audio_bytes: bytes | None = None,
+        style_weight: float = 0.5,
+    ) -> tuple[bytes, str]:
+        """Take an mp3 prompt, return (audio_bytes, mime_type) of the continuation.
+
+        Tries to return mp3; falls back to wav if the ffmpeg backend is unavailable.
+        The returned audio is [prompt | new_audio] concatenated.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(mp3_bytes)
+            in_path = f.name
+        try:
+            prompt_tokens = self.codec.encode(in_path)  # [K, T_prompt]
+        finally:
+            os.unlink(in_path)
+
+        if prompt_seconds is not None:
+            max_prompt_frames = int(prompt_seconds * self.codec.FRAME_RATE_HZ)
+            if prompt_tokens.shape[1] > max_prompt_frames:
+                prompt_tokens = prompt_tokens[:, :max_prompt_frames]
+
+        # cap so the delayed sequence fits in the model's positional window
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1  # T_total such that T_total + K - 1 <= max_seq_len
+        new_frames = int(add_seconds * self.codec.FRAME_RATE_HZ)
+        if prompt_tokens.shape[1] + new_frames > max_total:
+            new_frames = max(0, max_total - prompt_tokens.shape[1])
+        if new_frames == 0:
+            raise ValueError("Prompt already at max context; cannot generate more.")
+
+        prompt_tokens = prompt_tokens.to(self.device)
+        cond_emb = self._build_conditioning(text, style_audio_bytes, style_weight)
+        neg_emb = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt_tokens, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None) else 1.0,
+        )  # [K, T_total]
+
+        wav = self.codec.decode(out_tokens.cpu())  # [samples] mono
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+
+        meta = self._gen_metadata(
+            "continue", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            style_weight=style_weight if style_audio_bytes else None,
+            add_seconds=add_seconds, prompt_seconds=prompt_seconds,
+        )
+        return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
+
+    @torch.no_grad()
+    def extend_audio(
+        self,
+        full_audio_bytes: bytes,
+        add_seconds: float = 20.0,
+        overlap_seconds: float = 8.0,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        style_audio_bytes: bytes | None = None,
+        style_weight: float = 0.5,
+    ) -> tuple[bytes, str]:
+        """Take the full current clip, use its tail as prompt, return original + new audio.
+
+        Lets the UI grow a clip past the model's 35s single-shot cap by chaining.
+        Each call adds ~add_seconds of audio onto the end.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(full_audio_bytes)
+            in_path = f.name
+        try:
+            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
+            full_wav = torch.from_numpy(y).unsqueeze(0)
+            full_tokens = self.codec.encode(full_wav)
+        finally:
+            os.unlink(in_path)
+
+        overlap_frames = max(1, min(
+            int(overlap_seconds * self.codec.FRAME_RATE_HZ),
+            full_tokens.shape[1],
+        ))
+        prompt_tokens = full_tokens[:, -overlap_frames:]
+
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        new_frames = int(add_seconds * self.codec.FRAME_RATE_HZ)
+        if prompt_tokens.shape[1] + new_frames > max_total:
+            new_frames = max(0, max_total - prompt_tokens.shape[1])
+        if new_frames == 0:
+            raise ValueError("Overlap window is already at model context limit; reduce overlap_seconds.")
+
+        prompt_dev = prompt_tokens.to(self.device)
+        cond_emb = self._build_conditioning(text, style_audio_bytes, style_weight)
+        neg_emb = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt_dev, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None) else 1.0,
+        )
+        new_tokens = out_tokens[:, prompt_tokens.shape[1]:]  # [K, new_frames]
+
+        new_wav = self.codec.decode(new_tokens.cpu())
+        if new_wav.dim() == 1:
+            new_wav = new_wav.unsqueeze(0)
+
+        full = torch.cat([full_wav, new_wav], dim=1)
+        meta = self._gen_metadata(
+            "extend", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            style_weight=style_weight if style_audio_bytes else None,
+            add_seconds=add_seconds, overlap_seconds=overlap_seconds,
+        )
+        return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
+
+
+    @torch.no_grad()
+    def generate_audio(
+        self,
+        seconds: float = 30.0,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        seed_mode: str = "random",
+        text: str | None = None,
+        negative_text: str | None = None,
+        style_audio_bytes: bytes | None = None,
+        style_weight: float = 0.5,
+        score_clap: bool = False,
+    ):
+        """Generate audio from scratch (no audio prompt). Returns (audio_bytes, mime_type).
+
+        When ``score_clap`` is True (and text conditioning is present), also
+        computes the CLAP text<->audio similarity of the generated clip against
+        ``text`` and returns it as a third element: (audio_bytes, mime, clap).
+        Default stays a 2-tuple so existing callers are unaffected.
+
+        seed_mode controls how the from-scratch generation is bootstrapped:
+            "random" (default): one random DAC token per codebook. With the
+                current tight sampling (top_k=50, top_p=0.95) + CFG, random
+                seeding produces coherent output that the prompt can steer
+                in any direction — including "loud" prompts that a silence
+                seed structurally can't escape.
+            "silence": one DAC frame of steady-state silence. Better for
+                prompts that semantically *match* silence (slow, ambient,
+                quiet) — the model continues the quiet context coherently.
+                Fails for high-energy prompts because the audio context
+                (silence) overpowers the cross-attention conditioning: the
+                model has no training example of "silence → drum hit" in
+                one step, so it stays silent regardless of cfg_scale.
+        """
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1  # T_total such that T_total + K - 1 <= max_seq_len
+
+        if seed_mode == "silence":
+            seed_tokens: torch.Tensor | None = self._silence_seed_tokens()
+            seed_frames = int(seed_tokens.shape[1])
+        elif seed_mode == "random":
+            # Pass None so model.generate() picks a fresh random seed per call
+            # (cached silence would be deterministic across calls — random
+            # gives more variety).
+            seed_tokens = None
+            seed_frames = 1
+        else:
+            raise ValueError(f"unknown seed_mode {seed_mode!r}; expected 'random' or 'silence'")
+
+        new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
+        if seed_frames + new_frames > max_total:
+            new_frames = max(0, max_total - seed_frames)
+        if new_frames == 0:
+            raise ValueError("Requested duration exceeds model context limit.")
+
+        cond_emb = self._build_conditioning(text, style_audio_bytes, style_weight)
+        neg_emb = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt=seed_tokens, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None) else 1.0,
+        )  # [K, seed_frames + new_frames]
+
+        # strip the seed frame(s) before decoding
+        out_tokens = out_tokens[:, seed_frames:]
+
+        wav = self.codec.decode(out_tokens.cpu())
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+
+        meta = self._gen_metadata(
+            "generate", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            style_weight=style_weight if style_audio_bytes else None,
+            seconds=seconds, seed_mode=seed_mode,
+        )
+        body, mime = _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
+        if not score_clap:
+            return body, mime
+
+        clap = None
+        if cond_emb is not None and text and text.strip():
+            # Score against the prompt in raw CLAP space. Write a wav (the
+            # proven path; mirrors scripts/eval_checkpoint.py:_compute_clap) so
+            # CLAP's loader never has to decode mp3.
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp = f.name
+                sf.write(tmp, wav.squeeze().contiguous().cpu().numpy(), self.codec.SAMPLE_RATE)
+            try:
+                clap = self.text_encoder.audio_text_similarity(tmp, text)
+            finally:
+                os.unlink(tmp)
+        return body, mime, clap
+
+
+def _encode_audio(
+    wav: torch.Tensor, sr: int, metadata: dict[str, str] | None = None
+) -> tuple[bytes, str]:
+    """Encode [1, samples] mono float audio to mp3 (via subprocess ffmpeg) or fall back to wav.
+
+    Any `metadata` dict is written into the mp3 as ID3v2 TXXX (user-defined) frames
+    — keys are namespaced `nano_*`, none of which collide with standard frames, so
+    ffmpeg's id3v2 muxer emits each as a TXXX frame. The wav fallback carries no
+    metadata (only reached when ffmpeg is unavailable)."""
+    audio = wav.squeeze().contiguous().cpu().numpy()  # [samples]
+
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, audio, sr, format="WAV", subtype="PCM_16")
+
+    meta_args: list[str] = []
+    for k, v in (metadata or {}).items():
+        meta_args += ["-metadata", f"{k}={v}"]
+
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", "pipe:0",
+             "-codec:a", "libmp3lame", "-b:a", "192k",
+             *meta_args, "-id3v2_version", "3", "-f", "mp3", "pipe:1"],
+            input=wav_buf.getvalue(), capture_output=True, check=True,
+        )
+        return proc.stdout, "audio/mpeg"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return wav_buf.getvalue(), "audio/wav"

@@ -1,0 +1,278 @@
+"""Modal entrypoint for tokenizing mp3s on GPU, fanned out across many containers.
+
+Mirrors the parallelism pattern from modal_transcribe.py: one container per GPU,
+each loads DAC once via @modal.enter() and processes files via .map().
+
+Setup (one-time):
+    modal volume create nano-corpus
+    modal volume put nano-corpus /path/to/mp3s/ /
+
+Run tokenization (detached so the local shell can disconnect):
+    modal run --detach diskrot/modal_tokenize.py
+
+Pull tokens locally (optional):
+    modal volume get nano-tokens / ./token_cache/
+"""
+# NOTE: do NOT add `from __future__ import annotations` here. Modal's class
+# parameter validation (`@app.cls` + `modal.parameter()`) reads raw type
+# annotations and rejects them when they get stringified by PEP 563 — you'll
+# see `KeyError: 'float'` / `AttributeError: 'str' object has no attribute
+# '__name__'` at module import time. Python 3.12 doesn't need the future
+# import anyway (`list[str]`, `str | None` work natively).
+
+import time
+from pathlib import Path
+
+import modal
+
+app = modal.App("nano-tokenize")
+
+
+def _cache_dac():
+    # Pre-download the DAC 44kHz checkpoint at image build time so 50 containers
+    # don't each fetch ~500MB at cold start.
+    import dac
+
+    dac.utils.download(model_type="44khz")
+
+
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("ffmpeg", "libsndfile1")
+    .pip_install(
+        "torch==2.4.1",
+        "torchaudio==2.4.1",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "librosa>=0.10",
+        "descript-audio-codec>=1.0.0",
+        "numpy>=1.26",
+        "tqdm>=4.66",
+        "soundfile>=0.12",
+    )
+    .run_commands("pip install 'protobuf>=4'")  # override descript-audiotools' old pin
+    # `expandable_segments:True` switches the PyTorch caching allocator to a
+    # strategy that doesn't fragment as the encoder loop grinds through files.
+    # Without it, ~20 files into a container the GPU reports 21 GiB used /
+    # 22 GiB total even though no single encode needs >5 GiB — fragmentation
+    # eats the rest. PyTorch's own CUDA-OOM error suggests setting this.
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    .run_function(_cache_dac)
+    .add_local_python_source("model", "diskrot")
+)
+
+corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
+
+
+@app.cls(
+    image=image,
+    gpu="L4",
+    timeout=60 * 60,
+    max_containers=50,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+)
+class Tokenizer:
+    # Modal restricts modal.parameter() types to {int, str, bytes, bool} — no
+    # float. Integer seconds is fine here since min_frames = min_seconds * 86
+    # rounds to int anyway.
+    min_seconds: int = modal.parameter(default=20)
+
+    @modal.enter()
+    def load_codec(self):
+        from model.codec import DACodec
+
+        self.codec = DACodec(device="cuda")
+        self.min_frames = int(self.min_seconds * self.codec.FRAME_RATE_HZ)
+
+    @modal.method()
+    def tokenize_batch(
+        self, mp3_names: list[str]
+    ) -> list[tuple[str, str, int, str | None]]:
+        """Tokenize a batch of files within one container with prefetched audio
+        loading and a single batched DAC forward pass. Returns one
+        (key, status, frames, error) per input."""
+        from diskrot.tokenize import tokenize_files_streaming
+
+        items = [
+            (Path("/corpus") / name, Path("/tokens") / (Path(name).stem + ".pt"))
+            for name in mp3_names
+        ]
+        out: list[tuple[str, str, int, str | None]] = []
+        # batch_size=1: encode one file at a time. Batching multiple 5-min
+        # chunks into a single forward pass pads them to the longest and
+        # multiplies peak GPU memory by the batch size — OOMs on L4 (22 GiB)
+        # at batch_size=8 even after prep splits long tracks to ≤10 min.
+        # Per-file encode loses ~30% throughput vs batched but is safe.
+        for (mp3_path, _), result in zip(
+            items,
+            tokenize_files_streaming(
+                self.codec, items, self.min_frames, batch_size=1
+            ),
+        ):
+            out.append((mp3_path.stem, result.status, result.frames, result.error))
+        # One commit per batch — each container writes independent .pt files so
+        # commits don't conflict; batching them amortizes commit overhead.
+        # Retry a transient DataLossError ("failed to publish commit to server")
+        # so a storage blip doesn't fail the whole batch and bubble up through
+        # the orchestrator's .map() loop — which would crash run_tokenize and
+        # trigger a full restart + fleet re-spawn (see run_tokenize).
+        for attempt in range(3):
+            try:
+                tokens_vol.commit()
+                break
+            except modal.exception.DataLossError as e:
+                if attempt == 2:
+                    raise
+                print(f"commit failed ({e}); retry {attempt + 1}/2", flush=True)
+                time.sleep(2.0 * (attempt + 1))
+        return out
+
+
+# Lightweight image for the orchestrator (no torch/DAC needed — it just
+# lists files, dispatches .map(), and tallies results).
+orchestrator_image = modal.Image.debian_slim(python_version="3.12")
+
+
+@app.function(
+    image=orchestrator_image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+)
+def list_pending() -> list[str]:
+    """Return mp3 filenames not yet tokenized (no matching .pt in /tokens)."""
+    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    existing = {p.stem for p in Path("/tokens").glob("*.pt")}
+    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
+    print(f"found {len(mp3s)} total mp3s, {len(existing)} already tokenized, "
+          f"{len(pending)} pending")
+    return pending
+
+
+@app.function(
+    image=orchestrator_image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    timeout=60 * 60 * 24,  # 24h cap on the whole orchestration
+    # Pin the long-lived coordinator to a non-preemptible instance so it never
+    # restarts mid-run (each restart costs a full list_pending() rescan). The
+    # GPU Tokenizer fan-out stays preemptible — its .map() inputs auto-retry and
+    # commit .pt files per batch. retries kept as a transient-failure backstop;
+    # a restart still resumes via list_pending() skipping existing .pt files.
+    nonpreemptible=True,
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
+)
+def run_tokenize(min_seconds: int, batch_size: int) -> None:
+    """Run the full tokenize pass: list pending, fan out to GPU containers,
+    aggregate results, print summary. Designed to be `.spawn()`-ed from the
+    local entrypoint so the user can launch and walk away."""
+    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    existing = {p.stem for p in Path("/tokens").glob("*.pt")}
+    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
+    if existing:
+        print(f"RESUMING: {len(existing)} of {len(mp3s)} already tokenized, "
+              f"{len(pending)} still pending", flush=True)
+    else:
+        print(f"fresh run: {len(mp3s)} total mp3s, 0 already tokenized, "
+              f"{len(pending)} pending", flush=True)
+
+    if not pending:
+        print("Nothing to tokenize — all files already have .pt cache", flush=True)
+        return
+
+    chunks = [pending[i:i + batch_size]
+              for i in range(0, len(pending), batch_size)]
+    print(f"Dispatching {len(pending)} files in {len(chunks)} batches of "
+          f"~{batch_size} across parallel containers...", flush=True)
+    tokenizer = Tokenizer(min_seconds=min_seconds)
+
+    n_done = n_short = n_failed = 0
+    n_oom = n_decode = n_other = 0
+    n_batch_errors = 0
+    total_frames = 0
+    # Periodic progress: unlike auto_tag (which flushes a shared tags.json and
+    # prints on each flush), tokenize workers commit their own .pt per batch, so
+    # the orchestrator has no flush to piggyback on — we print a progress line
+    # every PROGRESS_EVERY processed files instead.
+    n_seen = 0
+    PROGRESS_EVERY = 10_000
+    next_report = PROGRESS_EVERY
+    # Sample a handful of "other" errors at the start so users can still
+    # debug novel failure modes — after that, just count by category.
+    OTHER_SAMPLES = 20
+    other_samples_shown = 0
+
+    # order_outputs=False: a preempted batch must not head-of-line-block the
+    # in-order yield (that idles the other containers while they still bill).
+    # Results are tallied independently, so order doesn't matter.
+    # return_exceptions=True: a single batch raising (e.g. a transient
+    # DataLossError on commit that survived the worker-side retry) must NOT
+    # propagate out and crash this orchestrator — that would trigger run_tokenize's
+    # retry, re-glob, re-dispatch, and re-spin-up the whole 50-container fleet.
+    # Instead we count the failed batch and continue; its files stay uncommitted
+    # (pending) and are picked up on the next run via the list_pending skip logic.
+    for batch in tokenizer.tokenize_batch.map(
+        chunks, order_outputs=False, return_exceptions=True
+    ):
+        if isinstance(batch, Exception):
+            n_batch_errors += 1
+            if n_batch_errors <= 20:
+                print(f"BATCH FAILED (files stay pending, redone next run): "
+                      f"{type(batch).__name__}: {str(batch)[:140]}", flush=True)
+            continue
+        for key, status, frames, error in batch:
+            if status == "failed":
+                n_failed += 1
+                err_lower = (error or "").lower()
+                if "out of memory" in err_lower or "cuda oom" in err_lower:
+                    n_oom += 1
+                elif "decode" in err_lower or "invalid data" in err_lower:
+                    n_decode += 1
+                else:
+                    n_other += 1
+                    if other_samples_shown < OTHER_SAMPLES:
+                        short = (error or "").split("\n")[0][:140]
+                        print(f"FAILED {key}: {short}")
+                        other_samples_shown += 1
+                        if other_samples_shown == OTHER_SAMPLES:
+                            print(f"  …suppressing further 'other' error details "
+                                  f"(category will still be counted)")
+            elif status == "skipped_short":
+                n_short += 1
+            elif status == "done":
+                n_done += 1
+                total_frames += frames
+        n_seen += len(batch)
+        if n_seen >= next_report:
+            processed = n_done + n_short + n_failed
+            pct = 100.0 * processed / len(pending)
+            print(f"  progress {processed:,}/{len(pending):,} ({pct:.1f}%) "
+                  f"— tokenized {n_done:,}, short {n_short:,}, failed {n_failed:,}",
+                  flush=True)
+            next_report += PROGRESS_EVERY
+
+    print(f"\ndone:                {n_done}", flush=True)
+    print(f"skipped (too short): {n_short}", flush=True)
+    print(f"failed:              {n_failed} "
+          f"(OOM {n_oom} · decode {n_decode} · other {n_other})", flush=True)
+    if n_batch_errors:
+        print(f"batch errors:        {n_batch_errors} "
+              f"(transient — affected files stay pending; re-run to finish them)",
+              flush=True)
+    if n_done > 0:
+        # FRAME_RATE_HZ is 86 (DAC 44.1kHz, hop=512) — hardcoded to avoid
+        # importing torch here.
+        secs = total_frames / 86
+        print(f"total audio cached:  {secs/60:.1f} min ({secs/3600:.2f} hours)")
+
+
+@app.local_entrypoint()
+def main(min_seconds: int = 20, batch_size: int = 8):
+    # spawn (not remote) — submit the orchestrator and return immediately.
+    # Combined with `modal run --detach`, the app stays alive after the local
+    # CLI exits, so the user can close their terminal and walk away.
+    fc = run_tokenize.spawn(min_seconds=min_seconds, batch_size=batch_size)
+    print(f"tokenize launched (detached) — function call id: {fc.object_id}")
+    print(f"watch:  modal app logs $(modal app list | "
+          f"awk '/nano-tokenize.*ephemeral/{{print $2; exit}}') -f")
+    print(f"stop:   modal app stop $(modal app list | "
+          f"awk '/nano-tokenize.*ephemeral/{{print $2; exit}}') -y")

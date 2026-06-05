@@ -1,0 +1,51 @@
+[project]
+name = "nano"
+version = "0.1.0"
+description = "Nano-scale audio continuation model"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "librosa>=0.10",
+    "descript-audio-codec>=1.0.0",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    "modal>=0.66",
+    "soundfile>=0.12",
+    "msclap",
+    "transformers>=4.35",
+    "torchcodec>=0.13.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.7", "pytest>=8"]
+# Apple-Silicon-only MLX inference backend (server/inference.py auto-selects it
+# on arm64 macOS; NANO_MLX=0 forces the PyTorch-MPS path). The marker keeps it
+# out of CUDA/Linux installs.
+mlx = ["mlx>=0.18; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[tool.setuptools.packages.find]
+include = ["model*", "diskrot*", "server*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+markers = [
+    "benchmark: perf benchmarks; slow, not run by default. Run with `pytest -m benchmark`.",
+]
+
+[tool.uv]
+override-dependencies = [
+    "protobuf>=5.27,<7",
+]
