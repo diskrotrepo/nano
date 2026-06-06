@@ -1,0 +1,257 @@
+"""Phoneme lyric encoder for singing-intelligible conditioning.
+
+The pooled CLAP lyric vector (one 1024-d "vibe" embedding) cannot carry *which
+syllable to sing when* — see model/text_encoder.py and the project plan. This
+module replaces it with a trainable encoder over a **phoneme-ID sequence**, which
+the audio decoder cross-attends to (soft, near-monotonic alignment learned
+implicitly — no inference-time duration model needed).
+
+Two pieces live here:
+
+1. A frozen phoneme vocabulary + ``text_to_phoneme_ids`` (g2p via ``g2p_en``).
+   This is the SINGLE source of truth for the id mapping so training and
+   inference agree exactly — a train/inference g2p-vocab mismatch is the biggest
+   footgun in the whole change. The ARPABET symbol list is hardcoded (not read
+   from ``g2p_en`` at runtime) so a ``g2p_en`` upgrade can't silently renumber.
+
+2. ``LyricEncoder`` — a small bidirectional Transformer producing a sequence
+   ``[B, L, d_model]`` plus its pad mask. It is instantiated *inside*
+   ``NanoAudioGPT`` so DDP syncs it and it saves/restores with the model
+   state_dict automatically (unlike the sidecar CLAP projection).
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- Phoneme vocabulary -------------------------------------------------------
+# ARPABET phones as emitted by g2p_en's CMUdict path, vowels carrying lexical
+# stress (0/1/2). Copied from g2p_en 2.1.0's canonical ``G2p().phonemes`` minus
+# its 4 internal seq2seq specials; frozen here so the id mapping never moves.
+_ARPABET: tuple[str, ...] = (
+    "AA0", "AA1", "AA2", "AE0", "AE1", "AE2", "AH0", "AH1", "AH2",
+    "AO0", "AO1", "AO2", "AW0", "AW1", "AW2", "AY0", "AY1", "AY2",
+    "B", "CH", "D", "DH",
+    "EH0", "EH1", "EH2", "ER0", "ER1", "ER2", "EY0", "EY1", "EY2",
+    "F", "G", "HH",
+    "IH0", "IH1", "IH2", "IY0", "IY1", "IY2",
+    "JH", "K", "L", "M", "N", "NG",
+    "OW0", "OW1", "OW2", "OY0", "OY1", "OY2",
+    "P", "R", "S", "SH", "T", "TH",
+    "UH0", "UH1", "UH2", "UW", "UW0", "UW1", "UW2",
+    "V", "W", "Y", "Z", "ZH",
+)
+
+# Special tokens occupy the low ids; everything downstream keys off these names.
+PAD_PHONEME = "<pad>"
+BOS_PHONEME = "<bos>"
+WORD_BOUNDARY_PHONEME = "<wb>"  # word/space/punctuation boundary
+UNK_PHONEME = "<unk>"
+
+# Frozen vocab: specials first (so PAD==0), then the ARPABET phones.
+PHONEME_VOCAB: tuple[str, ...] = (
+    PAD_PHONEME, BOS_PHONEME, WORD_BOUNDARY_PHONEME, UNK_PHONEME,
+) + _ARPABET
+
+PHONEME_TO_ID: dict[str, int] = {p: i for i, p in enumerate(PHONEME_VOCAB)}
+PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
+BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
+WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
+UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 74
+
+# Punctuation g2p_en passes through verbatim that we fold into a word boundary
+# rather than dropping (keeps phrase structure the decoder can align to).
+_BOUNDARY_PUNCT = frozenset({",", ".", "!", "?", ";", ":", "-", "...", " "})
+
+_G2P = None  # lazily constructed per process (G2p() loads nltk data + a model)
+
+
+def _get_g2p():
+    """Lazily build a process-local g2p_en.G2p (expensive: nltk + numpy model)."""
+    global _G2P
+    if _G2P is None:
+        from g2p_en import G2p
+
+        _G2P = G2p()
+    return _G2P
+
+
+def text_to_phoneme_ids(
+    text: str, max_len: int | None = None, add_bos: bool = True,
+) -> list[int]:
+    """Convert a lyric string to phoneme ids using the frozen vocab.
+
+    g2p_en emits ARPABET phones, ``' '`` between words, and raw punctuation;
+    we map phones via PHONEME_TO_ID, fold spaces/sentence punctuation to a single
+    WORD_BOUNDARY token, and drop anything else (rare g2p artifacts) to UNK.
+    Deterministic for a given g2p_en version + nltk data — the contract train and
+    inference both rely on. ``max_len`` truncates (after the optional BOS).
+    """
+    if not text or not text.strip():
+        return []
+    g2p = _get_g2p()
+    ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
+    prev_boundary = True  # suppress a leading boundary token
+    for sym in g2p(text):
+        pid = PHONEME_TO_ID.get(sym)
+        if pid is not None:
+            ids.append(pid)
+            prev_boundary = False
+        elif sym in _BOUNDARY_PUNCT:
+            if not prev_boundary:  # collapse runs of space/punct
+                ids.append(WORD_BOUNDARY_ID)
+                prev_boundary = True
+        # else: unknown artifact — skip (UNK reserved but unused for now)
+    # Trim a trailing boundary.
+    if ids and ids[-1] == WORD_BOUNDARY_ID:
+        ids.pop()
+    if max_len is not None and len(ids) > max_len:
+        ids = ids[:max_len]
+    return ids
+
+
+def text_to_word_phoneme_groups(words: list[str]) -> list[list[int]]:
+    """Phonemize a word list, returning one phoneme-id group per input word.
+
+    Runs g2p ONCE on the joined phrase (so cross-word context / POS is preserved)
+    and splits the phone stream on g2p's word-boundary spaces. This lets the
+    dataset phonemize a song's lyrics once and then slice the groups by word index
+    for any crop window, instead of re-running g2p per segment. If the split count
+    doesn't line up with the words (stray punctuation), falls back to per-word g2p
+    so the 1:1 word→group alignment the caller relies on always holds.
+    """
+    if not words:
+        return []
+    g2p = _get_g2p()
+    groups: list[list[int]] = [[]]
+    for sym in g2p(" ".join(words)):
+        if sym == " ":
+            groups.append([])
+            continue
+        pid = PHONEME_TO_ID.get(sym)
+        if pid is not None:
+            groups[-1].append(pid)
+        # non-space punctuation / artifacts: dropped (don't split the word)
+    if len(groups) == len(words):
+        return groups
+    # Alignment drift — phonemize each word independently (loses some context but
+    # guarantees the per-word grouping the dataset needs).
+    return [
+        [PHONEME_TO_ID[s] for s in g2p(w) if s in PHONEME_TO_ID]
+        for w in words
+    ]
+
+
+# --- Encoder ------------------------------------------------------------------
+class _SinusoidalPositionalEncoding(nn.Module):
+    """Fixed sinusoidal positions added to phoneme embeddings (order matters)."""
+
+    def __init__(self, d_model: int, max_len: int):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        # Re-derivable from (d_model, max_len); keep out of ckpts.
+        self.register_buffer("pe", pe, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[: x.shape[1]].to(x.dtype)
+
+
+class _EncoderLayer(nn.Module):
+    """Pre-norm bidirectional self-attention + GELU MLP (matches house style)."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.ln1 = nn.RMSNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.ln2 = nn.RMSNorm(d_model)
+        self.fc1 = nn.Linear(d_model, d_ff, bias=False)
+        self.fc2 = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
+        B, L, D = x.shape
+        h = self.ln1(x)
+        q, k, v = self.qkv(h).split(D, dim=-1)
+        q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=False,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        y = y.transpose(1, 2).contiguous().view(B, L, D)
+        x = x + self.proj(y)
+        x = x + self.fc2(F.gelu(self.fc1(self.ln2(x))))
+        return x
+
+
+class LyricEncoder(nn.Module):
+    """Encode phoneme ids -> a sequence [B, L, d_model] for cross-attention.
+
+    Bidirectional (the lyric line is fully known), so no causal mask and no RoPE;
+    a fixed sinusoidal positional encoding carries order. ``forward`` returns the
+    encoded sequence and the (passed-through) padding mask so the decoder's lyric
+    cross-attention can mask padded positions.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_layers: int = 3,
+        n_heads: int = 8,
+        d_ff: int = 4096,
+        max_len: int = 256,
+        vocab_size: int = PHONEME_VOCAB_SIZE,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=PAD_PHONEME_ID)
+        self.pos = _SinusoidalPositionalEncoding(d_model, max_len)
+        self.drop = nn.Dropout(dropout)
+        self.layers = nn.ModuleList(
+            [_EncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+        )
+        self.ln_final = nn.RMSNorm(d_model)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=0.02)
+            with torch.no_grad():
+                m.weight[PAD_PHONEME_ID].zero_()
+
+    def forward(
+        self, ids: torch.Tensor, mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ids: [B, L] long. mask: [B, L] bool (True = real phoneme).
+
+        Returns (lyric_emb [B, L, d_model], mask [B, L]).
+        """
+        # Float additive key-padding mask for SDPA: [B, 1, 1, L], 0 keep / -inf drop.
+        attn_mask = None
+        if mask is not None:
+            attn_mask = torch.zeros(
+                mask.shape[0], 1, 1, mask.shape[1], dtype=torch.float32, device=mask.device,
+            ).masked_fill(~mask[:, None, None, :], float("-inf"))
+        x = self.drop(self.pos(self.embed(ids)))
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        x = self.ln_final(x)
+        return x, mask

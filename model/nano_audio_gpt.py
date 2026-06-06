@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .delay_pattern import revert_delay
+from .lyric_encoder import PHONEME_VOCAB_SIZE, LyricEncoder
 
 KVCache = tuple[torch.Tensor, torch.Tensor]  # (past_k, past_v)
 
@@ -81,6 +82,15 @@ class GPTConfig:
     dropout: float = 0.05
     max_seq_len: int = 8192  # delayed sequence length cap (also sizes RoPE cos/sin table)
     use_text_conditioning: bool = False
+    # Lyric (phoneme-sequence) conditioning — separate from the pooled-CLAP tag
+    # path. When enabled, a LyricEncoder submodule encodes phoneme ids into a
+    # sequence the decoder cross-attends to (so the model can sing actual words).
+    use_lyric_conditioning: bool = False
+    phoneme_vocab_size: int = PHONEME_VOCAB_SIZE
+    lyric_enc_layers: int = 3
+    lyric_enc_heads: int = 8
+    lyric_enc_d_ff: int = 4096
+    max_lyric_len: int = 256
     rope_base: float = 10000.0
     use_gradient_checkpointing: bool = True
 
@@ -161,8 +171,18 @@ class CrossAttention(nn.Module):
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.dropout = cfg.dropout
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, D] audio hidden states, cond: [B, T_cond, D] text embeddings."""
+    def forward(
+        self, x: torch.Tensor, cond: torch.Tensor, kv_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """x: [B, T, D] audio hidden states, cond: [B, T_cond, D] text embeddings.
+
+        kv_mask: optional additive attention mask broadcastable to
+        [B, n_heads, T, T_cond] (0 keep, -inf drop) — used to mask padded
+        positions in a variable-length lyric sequence. Callers must guarantee
+        each query row has at least one un-masked key (a fully -inf row makes
+        SDPA's softmax produce NaN); the lyric path ensures this by always
+        keeping the BOS phoneme valid.
+        """
         B, T, D = x.shape
         T_c = cond.shape[1]
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -171,6 +191,7 @@ class CrossAttention(nn.Module):
         v = v.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
         y = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=kv_mask,
             is_causal=False,
             dropout_p=self.dropout if self.training else 0.0,
         )
@@ -198,6 +219,13 @@ class Block(nn.Module):
         if self.has_cross_attn:
             self.ln_cross = nn.RMSNorm(cfg.d_model)
             self.cross_attn = CrossAttention(cfg)
+        # Separate cross-attention for the lyric phoneme sequence (kept distinct
+        # from the pooled tag vector so one softmax doesn't pit a global vibe
+        # vector against 256 phonemes, and so each stream drops independently).
+        self.has_lyric_attn = cfg.use_lyric_conditioning
+        if self.has_lyric_attn:
+            self.ln_lyric = nn.RMSNorm(cfg.d_model)
+            self.lyric_attn = CrossAttention(cfg)
         self.ln2 = nn.RMSNorm(cfg.d_model)
         self.mlp = MLP(cfg)
         self.use_gradient_checkpointing = cfg.use_gradient_checkpointing
@@ -208,12 +236,16 @@ class Block(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         text_emb: torch.Tensor | None,
+        lyric_emb: torch.Tensor | None,
+        lyric_kv_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         # Training-only path (no KV cache). Wrapped by gradient checkpointing.
         attn_out, _ = self.attn(self.ln1(x), cos, sin, cache=None)
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
             x = x + self.cross_attn(self.ln_cross(x), text_emb)
+        if self.has_lyric_attn and lyric_emb is not None:
+            x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -224,14 +256,21 @@ class Block(nn.Module):
         sin: torch.Tensor,
         cache: KVCache | None = None,
         text_emb: torch.Tensor | None = None,
+        lyric_emb: torch.Tensor | None = None,
+        lyric_kv_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | None]:
         if cache is None and self.training and self.use_gradient_checkpointing:
-            x = checkpoint(self._body, x, cos, sin, text_emb, use_reentrant=False)
+            x = checkpoint(
+                self._body, x, cos, sin, text_emb, lyric_emb, lyric_kv_mask,
+                use_reentrant=False,
+            )
             return x, None
         attn_out, new_cache = self.attn(self.ln1(x), cos, sin, cache=cache)
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
             x = x + self.cross_attn(self.ln_cross(x), text_emb)
+        if self.has_lyric_attn and lyric_emb is not None:
+            x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
         x = x + self.mlp(self.ln2(x))
         return x, new_cache
 
@@ -246,6 +285,20 @@ class NanoAudioGPT(nn.Module):
         head_dim = cfg.d_model // cfg.n_heads
         self.rotary = RotaryEmbedding(head_dim, cfg.max_seq_len, cfg.rope_base)
         self.drop = nn.Dropout(cfg.dropout)
+        # LyricEncoder lives INSIDE the model so DDP syncs its grads and it
+        # saves/restores with the model state_dict (no sidecar key like the CLAP
+        # projection). It runs once per forward; its output sequence feeds every
+        # block's lyric cross-attention.
+        if cfg.use_lyric_conditioning:
+            self.lyric_encoder = LyricEncoder(
+                d_model=cfg.d_model,
+                n_layers=cfg.lyric_enc_layers,
+                n_heads=cfg.lyric_enc_heads,
+                d_ff=cfg.lyric_enc_d_ff,
+                max_len=cfg.max_lyric_len,
+                vocab_size=cfg.phoneme_vocab_size,
+                dropout=cfg.dropout,
+            )
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.ln_final = nn.RMSNorm(cfg.d_model)
         self.heads = nn.ModuleList(
@@ -262,12 +315,32 @@ class NanoAudioGPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
+    def encode_lyrics(
+        self, lyric_ids: torch.Tensor, lyric_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the lyric encoder once: (ids [B,L], mask [B,L]) -> (emb [B,L,D],
+        additive cross-attn mask [B,1,1,L]).
+
+        The additive mask is 0 at real phonemes and -inf at padding. Callers must
+        ensure every row keeps at least one valid phoneme (BOS) so no query row is
+        fully masked (that would NaN the cross-attn softmax)."""
+        lyric_emb, lyric_mask = self.lyric_encoder(lyric_ids, lyric_mask)
+        kv_mask = torch.zeros(
+            lyric_mask.shape[0], 1, 1, lyric_mask.shape[1],
+            dtype=lyric_emb.dtype, device=lyric_emb.device,
+        ).masked_fill(~lyric_mask[:, None, None, :], float("-inf"))
+        return lyric_emb, kv_mask
+
     def forward(
         self,
         tokens: torch.Tensor,
         kv_caches: list[KVCache] | None = None,
         start_pos: int = 0,
         text_emb: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_emb: torch.Tensor | None = None,
+        lyric_kv_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
@@ -275,7 +348,13 @@ class NanoAudioGPT(nn.Module):
         kv_caches: when None, training path (returns logits only).
                    when a list, returns (logits, new_caches).
         start_pos: positional offset for the tokens (used with KV cache).
-        text_emb: [B, T_text, D] optional text conditioning embeddings.
+        text_emb: [B, T_text, D] optional (pooled CLAP) tag conditioning.
+        lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask. When given (and
+            lyric conditioning is enabled), the lyric encoder runs INSIDE this
+            forward — so DDP syncs its grads. Used on the training path.
+        lyric_emb/lyric_kv_mask: pre-encoded lyric sequence + additive mask (from
+            encode_lyrics). Used on the generate path to encode once and reuse
+            across decode steps. Takes precedence over lyric_ids.
         returns: logits [B, K, T, V] or (logits, new_caches)
         """
         B, K, T = tokens.shape
@@ -284,6 +363,13 @@ class NanoAudioGPT(nn.Module):
             f"seq pos {start_pos + T} > max_seq_len {self.cfg.max_seq_len} "
             f"(RoPE table size — bump GPTConfig.max_seq_len if you need longer)"
         )
+
+        if (
+            lyric_emb is None
+            and lyric_ids is not None
+            and self.cfg.use_lyric_conditioning
+        ):
+            lyric_emb, lyric_kv_mask = self.encode_lyrics(lyric_ids, lyric_mask)
 
         x = self.tok_embeds[0](tokens[:, 0])
         for k in range(1, K):
@@ -295,7 +381,10 @@ class NanoAudioGPT(nn.Module):
         new_caches: list[KVCache] = []
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches else None
-            x, new_cache = block(x, cos, sin, cache=cache, text_emb=text_emb)
+            x, new_cache = block(
+                x, cos, sin, cache=cache, text_emb=text_emb,
+                lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask,
+            )
             new_caches.append(new_cache)
         x = self.ln_final(x)
 
@@ -318,15 +407,32 @@ class NanoAudioGPT(nn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """Continue a prompt, or generate unconditionally when prompt is None.
 
         prompt: [K, T_prompt] or [B, K, T_prompt], or None for unconditional
         text_emb: [B, 1, D] optional text conditioning (from CLAPTextEncoder)
+        lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask for the lyric
+            conditioning stream. Encoded once and reused across decode steps.
+        lyric_ids_neg/lyric_mask_neg: optional *negative* lyric stream for the
+            CFG baseline (default baseline drops lyrics entirely).
+        lyric_cfg_scale: when set (and lyric conditioning is active), guide the
+            lyric axis with its OWN scale via composed guidance — runs a third
+            "tags-only, lyrics-dropped" stream and blends
+            logits = base + cfg_scale*(tags_only - base)
+                          + lyric_cfg_scale*(cond - tags_only).
+            This lets a user push lyric intelligibility harder than tag adherence.
+            When None, lyrics are guided jointly with tags by cfg_scale (cheaper,
+            one fewer forward pass).
         cfg_scale: classifier-free guidance scale. 1.0 = no guidance (single
             forward pass). >1.0 = run an additional baseline forward pass and
-            blend logits = base + cfg_scale * (cond - base). Active when either
-            text_emb or text_emb_neg is set.
+            blend logits = base + cfg_scale * (cond - base). Active when any of
+            text_emb / text_emb_neg / lyric conditioning is set.
         text_emb_neg: [B, N, D] optional *negative* conditioning. The CFG
             baseline pass is run with this instead of None, so guidance steers
             *away* from it: logits = neg + cfg_scale * (cond - neg). When None
@@ -387,8 +493,6 @@ class NanoAudioGPT(nn.Module):
         for k in range(K):
             tokens[:, k, k:k + T_prompt] = prompt[:, k]
 
-        use_cfg = cfg_scale != 1.0 and (text_emb is not None or text_emb_neg is not None)
-
         was_training = self.training
         self.eval()
         try:
@@ -404,33 +508,72 @@ class NanoAudioGPT(nn.Module):
                     for _ in range(self.cfg.n_layers)
                 ]
 
-            caches_cond = _make_caches()
-            caches_uncond = _make_caches() if use_cfg else None
+            # Encode lyric streams ONCE (the encoder is ~100M params — encoding
+            # per decode step would dominate cost). Reused across all steps.
+            lyric_pos = lyric_kv_pos = None
+            lyric_neg = lyric_kv_neg = None
+            if self.cfg.use_lyric_conditioning and lyric_ids is not None:
+                lyric_pos, lyric_kv_pos = self.encode_lyrics(lyric_ids, lyric_mask)
+            if self.cfg.use_lyric_conditioning and lyric_ids_neg is not None:
+                lyric_neg, lyric_kv_neg = self.encode_lyrics(lyric_ids_neg, lyric_mask_neg)
+
+            has_cond = any(
+                v is not None for v in (text_emb, text_emb_neg, lyric_pos, lyric_neg)
+            )
+            composed = (
+                lyric_cfg_scale is not None and lyric_cfg_scale != 1.0
+                and lyric_pos is not None
+            )
+            use_cfg = (cfg_scale != 1.0 and has_cond) or composed
+
+            # Conditioning streams run in lockstep, each with its own KV cache:
+            #   cond  = positive tags + positive lyrics
+            #   base  = negative/absent tags + negative/absent lyrics (CFG baseline)
+            #   mid   = positive tags + lyrics dropped (only for composed guidance,
+            #           to isolate the lyric axis)
+            cond_s = {"text": text_emb, "lemb": lyric_pos, "lkv": lyric_kv_pos}
+            streams = [cond_s]
+            base_s = mid_s = None
+            if use_cfg:
+                base_s = {"text": text_emb_neg, "lemb": lyric_neg, "lkv": lyric_kv_neg}
+                streams.append(base_s)
+            if composed:
+                mid_s = {"text": text_emb, "lemb": None, "lkv": None}
+                streams.append(mid_s)
+            for s in streams:
+                s["caches"] = _make_caches()
+
+            def _run(inp: torch.Tensor, start: int):
+                for s in streams:
+                    out, s["caches"] = self.forward(
+                        inp, kv_caches=s["caches"], start_pos=start,
+                        text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                    )
+                    s["logits"] = out
+
+            def _combine():
+                if composed:
+                    return (
+                        base_s["logits"]
+                        + cfg_scale * (mid_s["logits"] - base_s["logits"])
+                        + lyric_cfg_scale * (cond_s["logits"] - mid_s["logits"])
+                    )
+                if use_cfg:
+                    return base_s["logits"] + cfg_scale * (cond_s["logits"] - base_s["logits"])
+                return cond_s["logits"]
 
             # prefill: run full prompt through transformer
             prefill_len = max(1, T_prompt)
             prefill_inp = tokens[:, :, :prefill_len]
-            logits, caches_cond = self.forward(
-                prefill_inp, kv_caches=caches_cond, start_pos=0, text_emb=text_emb,
-            )
-            if use_cfg:
-                logits_base, caches_uncond = self.forward(
-                    prefill_inp, kv_caches=caches_uncond, start_pos=0, text_emb=text_emb_neg,
-                )
-                logits = logits_base + cfg_scale * (logits - logits_base)
+            _run(prefill_inp, 0)
+            logits = _combine()
 
             # decode: one position at a time using cached K/V
             for p in range(prefill_len, T_delay):
                 if p > prefill_len:
                     inp = tokens[:, :, p - 1:p]
-                    logits, caches_cond = self.forward(
-                        inp, kv_caches=caches_cond, start_pos=p - 1, text_emb=text_emb,
-                    )
-                    if use_cfg:
-                        logits_base, caches_uncond = self.forward(
-                            inp, kv_caches=caches_uncond, start_pos=p - 1, text_emb=text_emb_neg,
-                        )
-                        logits = logits_base + cfg_scale * (logits - logits_base)
+                    _run(inp, p - 1)
+                    logits = _combine()
 
                 step_logits = logits[:, :, -1, :].clone()  # [B, K, V]
                 step_logits[..., pad] = float("-inf")

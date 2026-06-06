@@ -8,11 +8,21 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import torch
 
 from diskrot.dataset import TokenDataset
 from diskrot.pack_cache import pack
 from model.codec import DACodec
+
+
+def _g2p_available() -> bool:
+    try:
+        from model.lyric_encoder import text_to_word_phoneme_groups
+        text_to_word_phoneme_groups(["test"])
+        return True
+    except Exception:
+        return False
 
 
 def _packed_dir(tokens_dir):
@@ -67,7 +77,7 @@ def test_skips_too_short_files(synth_tokens_dir):
 def test_getitem_shape_and_dtype(synth_tokens_dir):
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=1000))
     ds = TokenDataset(tokens_dir, segment_frames=300)
-    tokens, tags, lyrics = ds[0]
+    tokens, tags, lyric_ids = ds[0]
     assert tokens.shape == (9, 300)
     # int16 stays int16 on host (saves ~24 GB shared RAM at production scale).
     # Training loop casts to int64 via .long() after .to(device) — see
@@ -75,7 +85,10 @@ def test_getitem_shape_and_dtype(synth_tokens_dir):
     # for the correctness contract.
     assert tokens.dtype == torch.int16
     assert tags == ""
-    assert lyrics == ""
+    # No lyrics_path → an instrumental segment is a single BOS token (never an
+    # empty/fully-padded sequence, which would NaN the lyric cross-attention).
+    from model.lyric_encoder import BOS_PHONEME_ID
+    assert lyric_ids.tolist() == [BOS_PHONEME_ID]
 
 
 def test_getitem_uses_random_crop_within_bounds(synth_tokens_dir):
@@ -142,6 +155,52 @@ def test_lyrics_window_filtering(synth_tokens_dir, tmp_path):
     # Missing entry.
     out = ds._get_segment_lyrics("nonexistent", start_sec=0.0, end_sec=10.0)
     assert out == ""
+
+
+@pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
+def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
+    """_get_segment_lyric_ids returns BOS + phonemes for overlapping words, and a
+    lone BOS when nothing overlaps or the song is instrumental."""
+    from model.lyric_encoder import BOS_PHONEME_ID
+
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
+    lyrics_path = tmp_path / "lyrics.json"
+    lyrics_path.write_text(json.dumps({
+        "song_000": {"words": [
+            {"word": "hello", "start": 0.0, "end": 1.0},
+            {"word": "world", "start": 2.0, "end": 3.0},
+        ]},
+    }))
+    ds = TokenDataset(tokens_dir, segment_frames=500,
+                      lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
+
+    full = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
+    assert full[0] == BOS_PHONEME_ID
+    assert len(full) > 1  # phonemes present
+    # No overlap → lone BOS.
+    assert ds._get_segment_lyric_ids("song_000", 10.0, 11.0) == [BOS_PHONEME_ID]
+    # Instrumental / missing → lone BOS.
+    assert ds._get_segment_lyric_ids("nonexistent", 0.0, 10.0) == [BOS_PHONEME_ID]
+
+
+def test_collate_lyrics_pads_and_masks(synth_tokens_dir):
+    """collate_lyrics pads ragged phoneme sequences and builds the bool mask."""
+    from diskrot.dataset import collate_lyrics
+    from model.lyric_encoder import BOS_PHONEME_ID, PAD_PHONEME_ID
+
+    batch = [
+        (torch.zeros(9, 300, dtype=torch.int16), "tagA",
+         torch.tensor([BOS_PHONEME_ID, 10, 11], dtype=torch.long)),
+        (torch.zeros(9, 300, dtype=torch.int16), "tagB",
+         torch.tensor([BOS_PHONEME_ID], dtype=torch.long)),
+    ]
+    tokens, tags, ids, mask = collate_lyrics(batch)
+    assert tokens.shape == (2, 9, 300)
+    assert tags == ["tagA", "tagB"]
+    assert ids.shape == (2, 3)
+    assert ids[1].tolist() == [BOS_PHONEME_ID, PAD_PHONEME_ID, PAD_PHONEME_ID]
+    assert mask[0].tolist() == [True, True, True]
+    assert mask[1].tolist() == [True, False, False]
 
 
 def test_frame_rate_constant_unchanged():

@@ -20,7 +20,12 @@ MP3 corpus → DAC tokenizer → [9 codebooks, 1024 vocab, 86 Hz] → Transforme
 
 **Delay pattern**: MusicGen-style — codebook k is shifted right by k positions. At each step, all 9 codebook embeddings are summed as input; 9 separate linear heads predict the next token per codebook. This lets later codebooks condition on earlier codebooks at the same frame.
 
-**Text conditioning** (two distinct stages — don't conflate them): (1) **description generation** — `auto_tag` runs the LP-MusicCaps captioner to write a natural-language description per song into `tags.json` (this is the part that has been iterated on); (2) **description encoding** — at train/inference time, frozen Microsoft CLAP (1024-dim) encodes that tag string (and the lyric string) and a learned linear layer projects to d_model. Cross-attention in each transformer block; tags and lyrics enter as position 0 and position 1. Classifier-free guidance via 10% dropout of conditioning during training. (CLAP is still the encoder; swapping the captioner only changes stage 1.)
+**Text conditioning** — tags and lyrics travel **separate paths** (don't conflate them):
+
+- **Tags** (genre/timbre/"vibe"): `auto_tag` runs the LP-MusicCaps captioner to write a natural-language description per song into `tags.json`; at train/inference frozen Microsoft CLAP (1024-dim) encodes that string and a learned linear layer projects to d_model — a single pooled vector at cross-attention position 0.
+- **Lyrics** (the actual words to sing): conditioned as a **phoneme-ID sequence**, NOT through CLAP. `text_to_phoneme_ids` (g2p_en) converts the lyric string to ARPABET phonemes; a trainable `LyricEncoder` ([model/lyric_encoder.py](model/lyric_encoder.py)) — a small bidirectional transformer living *inside* `NanoAudioGPT` — encodes them into a sequence, and each transformer block has a **separate lyric cross-attention** over it. The model learns its own (near-monotonic) alignment, so no inference-time timestamps/duration model are needed. This is what makes the model sing intelligible words; a single pooled CLAP "vibe" vector structurally cannot.
+
+Each stream drops independently for classifier-free guidance (10% each during training); at inference `cfg_scale` guides them jointly, or an optional `lyric_cfg_scale` pushes the lyric axis harder via composed guidance. The phoneme `LyricEncoder` is a submodule of the model, so it saves/restores in the `model` state_dict (no sidecar key like CLAP's `text_proj`). Checkpoints from before the lyric encoder (v7) are incompatible — `ckpt_subdir` is now `v8_sing`.
 
 ## Key Files
 
@@ -28,12 +33,13 @@ MP3 corpus → DAC tokenizer → [9 codebooks, 1024 vocab, 86 Hz] → Transforme
 - `nano_audio_gpt.py` — GPTConfig, NanoAudioGPT, StaticLayerKVCache, CausalSelfAttention, CrossAttention. The core model.
 - `codec.py` — DACodec wrapper. Constants: SAMPLE_RATE=44100, N_CODEBOOKS=9, VOCAB_SIZE=1024, FRAME_RATE_HZ=86. encode() and decode() methods.
 - `delay_pattern.py` — apply_delay(), revert_delay(), build_train_inputs(). MusicGen delay logic.
-- `text_encoder.py` — CLAPTextEncoder. Frozen CLAP + learned projection. encode() for text, encode_audio() for style references.
+- `text_encoder.py` — CLAPTextEncoder. Frozen CLAP + learned projection. encode() for **tags**, encode_audio() for style references. (Lyrics no longer go through CLAP.)
+- `lyric_encoder.py` — phoneme lyric conditioning. Frozen `PHONEME_VOCAB` (ARPABET) + `text_to_phoneme_ids`/`text_to_word_phoneme_groups` (g2p_en, the single train==inference id mapping) + `LyricEncoder` (small bidirectional transformer, a submodule of NanoAudioGPT). The token-sequence path that lets the model sing words.
 - `captioner.py` — Vendored LP-MusicCaps (BART-based audio captioner). load_captioner() for inference.
 
 ### Training (`diskrot/`)
 - `train.py` — TrainConfig + train_run(). Device-agnostic training loop. Cosine LR with warmup, AdamW, early stopping, per-codebook loss logging. CLI: `python -m diskrot.train`.
-- `dataset.py` — TokenDataset. Mmap-backed sharded dataset via `load_mmap_bundle()`. Serves random 30s crops. Returns (tokens, tags, lyrics) tuples.
+- `dataset.py` — TokenDataset. Mmap-backed sharded dataset via `load_mmap_bundle()`. Serves random 30s crops. `__getitem__` returns `(tokens, tags, lyric_ids)` (time-aligned phoneme ids for the crop window, BOS-seeded); `collate_lyrics` pads the ragged lyric sequences + builds the mask. g2p runs once per song (cached, sliced by word).
 - `tokenize.py` — Converts MP3 corpus to cached DAC .pt files. CLI: `python -m diskrot.tokenize`.
 - `auto_tag.py` — LP-MusicCaps audio captioning. Generates natural-language descriptions from audio. CLI: `python -m diskrot.auto_tag`.
 - `transcribe_lyrics.py` — Demucs vocal isolation + Whisper transcription. CLI: `python -m diskrot.transcribe_lyrics`.

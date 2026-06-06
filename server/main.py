@@ -127,6 +127,7 @@ async def continue_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
+    lyric_cfg_scale: float = Form(0.0),
 ) -> Response:
     assert engine is not None
     data = await audio.read()
@@ -148,6 +149,7 @@ async def continue_endpoint(
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
+            lyric_cfg_scale=lyric_cfg_scale or None,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -171,6 +173,7 @@ async def generate_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
+    lyric_cfg_scale: float = Form(0.0),
     score_clap: bool = Form(False),
 ) -> Response:
     """Generate audio from scratch. Optional text and/or style_audio conditioning.
@@ -209,6 +212,7 @@ async def generate_endpoint(
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
+            lyric_cfg_scale=lyric_cfg_scale or None,
             score_clap=score_clap,
         )
     except ValueError as e:
@@ -241,6 +245,7 @@ async def extend_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
+    lyric_cfg_scale: float = Form(0.0),
 ) -> Response:
     """Append more audio onto the end of an existing clip. Returns original + new."""
     assert engine is not None
@@ -263,6 +268,7 @@ async def extend_endpoint(
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
+            lyric_cfg_scale=lyric_cfg_scale or None,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))

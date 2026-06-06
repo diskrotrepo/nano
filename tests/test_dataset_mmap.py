@@ -32,12 +32,14 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     # 6 songs, val_ratio=0.2 -> max(1, 1.2) = 1 val; rest train.
     assert len(val) == 1
     assert len(train) == 5
-    tokens, tag, lyric = train[0]
+    tokens, tag, lyric_ids = train[0]
     assert isinstance(tokens, torch.Tensor)
     assert tokens.dtype == torch.int16
     assert tokens.shape == (9, 400)
     assert tag == ""  # no tags fixture passed
-    assert lyric == ""
+    # no lyrics fixture → a single BOS phoneme token (see lyric_encoder)
+    from model.lyric_encoder import BOS_PHONEME_ID
+    assert lyric_ids.tolist() == [BOS_PHONEME_ID]
 
 
 def test_from_mmap_matches_in_memory_dataset(synth_tokens_dir):

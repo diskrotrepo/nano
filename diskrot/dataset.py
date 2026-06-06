@@ -54,6 +54,27 @@ def _load_lyrics(lyrics_path: str | Path | None, verbose: bool = True) -> dict[s
     return lyrics
 
 
+def collate_lyrics(batch):
+    """DataLoader collate for TokenDataset's (tokens, tags, lyric_ids) items.
+
+    Pads the variable-length phoneme-id sequences to the batch max and builds a
+    bool mask (True = real phoneme). Required because default_collate can't stack
+    ragged lyric tensors. Returns (tokens [B,K,T], tags list[str],
+    lyric_ids [B,Lmax], lyric_mask [B,Lmax]).
+    """
+    from model.lyric_encoder import PAD_PHONEME_ID
+
+    tokens = torch.stack([b[0] for b in batch])  # [B, K, T] int16
+    tags = [b[1] for b in batch]
+    lyrics = [b[2] for b in batch]
+    lmax = max(int(t.shape[0]) for t in lyrics)
+    ids = torch.full((len(batch), lmax), PAD_PHONEME_ID, dtype=torch.long)
+    for i, t in enumerate(lyrics):
+        ids[i, : t.shape[0]] = t
+    mask = ids != PAD_PHONEME_ID
+    return tokens, tags, ids, mask
+
+
 
 # ---- mmap-backed sharded loader -------------------------------------------
 
@@ -140,6 +161,7 @@ class TokenDataset(Dataset):
         seed: int = 42,
         tags_path: str | Path | None = None,
         lyrics_path: str | Path | None = None,
+        max_lyric_len: int = 256,
     ):
         from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
 
@@ -161,7 +183,7 @@ class TokenDataset(Dataset):
             lyrics_path=lyrics_path,
         )
         # Delegate to from_mmap and steal its state into self.
-        ds = TokenDataset.from_mmap(bundle, split, segment_frames)
+        ds = TokenDataset.from_mmap(bundle, split, segment_frames, max_lyric_len)
         self.__dict__.update(ds.__dict__)
 
     @classmethod
@@ -170,6 +192,7 @@ class TokenDataset(Dataset):
         bundle: dict,
         split: str,
         segment_frames: int,
+        max_lyric_len: int = 256,
     ) -> "TokenDataset":
         """Wire up a TokenDataset over the sharded mmap bundle.
 
@@ -181,6 +204,7 @@ class TokenDataset(Dataset):
             raise ValueError(f"split must be 'train' or 'val', got {split}")
         ds = cls.__new__(cls)
         ds.segment_frames = segment_frames
+        ds.max_lyric_len = max_lyric_len
         ds._packed_dir = bundle["packed_dir"]
         ds._mmap_entries = bundle[f"{split}_entries"]
         ds._shard_metas = bundle["shard_metas"]
@@ -191,6 +215,9 @@ class TokenDataset(Dataset):
         all_lyrics = bundle.get("lyrics", {})
         ds._tags = {n: all_tags[n] for n in name_set if n in all_tags}
         ds._lyrics = {n: all_lyrics[n] for n in name_set if n in all_lyrics}
+        # Per-song phoneme groups (one list[int] per word), built lazily on first
+        # access and reused across crops — g2p runs once per song, not per segment.
+        ds._word_phones = {}
         ds.has_tags = len(ds._tags) > 0 or len(ds._lyrics) > 0
         return ds
 
@@ -229,7 +256,37 @@ class TokenDataset(Dataset):
                  if w["end"] > start_sec and w["start"] < end_sec]
         return " ".join(words)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, str]:
+    def _get_segment_lyric_ids(self, name: str, start_sec: float, end_sec: float) -> list[int]:
+        """Phoneme ids for the words overlapping [start_sec, end_sec].
+
+        Always starts with BOS (so an empty/instrumental segment is a single valid
+        token, never a fully-padded row — which would NaN the cross-attention).
+        Words are separated by WORD_BOUNDARY; truncated to max_lyric_len.
+        """
+        from model.lyric_encoder import (
+            BOS_PHONEME_ID, WORD_BOUNDARY_ID, text_to_word_phoneme_groups,
+        )
+
+        entry = self._lyrics.get(name)
+        if not entry or not entry.get("words"):
+            return [BOS_PHONEME_ID]
+        groups = self._word_phones.get(name)
+        if groups is None:
+            groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
+            self._word_phones[name] = groups
+
+        ids = [BOS_PHONEME_ID]
+        for w, g in zip(entry["words"], groups):
+            if w["end"] > start_sec and w["start"] < end_sec:
+                if len(ids) > 1:
+                    ids.append(WORD_BOUNDARY_ID)
+                ids.extend(g)
+                if len(ids) >= self.max_lyric_len:
+                    ids = ids[: self.max_lyric_len]
+                    break
+        return ids
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, torch.Tensor]:
         t = self._get(idx)  # [K, T_full] int16 — torch.Tensor or np.memmap view
         T = t.shape[1]
         start = random.randint(0, T - self.segment_frames)
@@ -240,8 +297,8 @@ class TokenDataset(Dataset):
             crop = torch.from_numpy(np.ascontiguousarray(crop))
         tokens = crop
         tags = self._tags.get(self.names[idx], "")
-        # time-aligned lyrics for this segment
+        # time-aligned lyric phoneme ids for this segment
         start_sec = start / DACodec.FRAME_RATE_HZ
         end_sec = (start + self.segment_frames) / DACodec.FRAME_RATE_HZ
-        lyrics = self._get_segment_lyrics(self.names[idx], start_sec, end_sec)
-        return tokens, tags, lyrics
+        lyric_ids = self._get_segment_lyric_ids(self.names[idx], start_sec, end_sec)
+        return tokens, tags, torch.tensor(lyric_ids, dtype=torch.long)

@@ -84,6 +84,32 @@ class _MLP(mnn.Module):
         self.fc2 = mnn.Linear(cfg.d_ff, cfg.d_model, bias=False)
 
 
+class _LyricEncLayer(mnn.Module):
+    """One bidirectional encoder layer; param names mirror torch _EncoderLayer."""
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        d = cfg.d_model
+        self.ln1 = _RMSNorm(d)
+        self.qkv = mnn.Linear(d, 3 * d, bias=False)
+        self.proj = mnn.Linear(d, d, bias=False)
+        self.ln2 = _RMSNorm(d)
+        self.fc1 = mnn.Linear(d, cfg.lyric_enc_d_ff, bias=False)
+        self.fc2 = mnn.Linear(cfg.lyric_enc_d_ff, d, bias=False)
+
+
+class _LyricEncoder(mnn.Module):
+    """MLX mirror of model.lyric_encoder.LyricEncoder (params only; the
+    sinusoidal positional table is non-persistent and recomputed on the parent,
+    like the RoPE cos/sin tables)."""
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.embed = mnn.Embedding(cfg.phoneme_vocab_size, cfg.d_model)
+        self.layers = [_LyricEncLayer(cfg) for _ in range(cfg.lyric_enc_layers)]
+        self.ln_final = _RMSNorm(cfg.d_model)
+
+
 class _Block(mnn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -93,6 +119,10 @@ class _Block(mnn.Module):
         if self.has_cross_attn:
             self.ln_cross = _RMSNorm(cfg.d_model)
             self.cross_attn = _CrossAttention(cfg)
+        self.has_lyric_attn = cfg.use_lyric_conditioning
+        if self.has_lyric_attn:
+            self.ln_lyric = _RMSNorm(cfg.d_model)
+            self.lyric_attn = _CrossAttention(cfg)
         self.ln2 = _RMSNorm(cfg.d_model)
         self.mlp = _MLP(cfg)
 
@@ -146,6 +176,12 @@ class MLXNanoAudioGPT(mnn.Module):
 
         # Module tree mirrors torch param names exactly so weights load 1:1.
         self.tok_embeds = [mnn.Embedding(cfg.vocab_with_pad, cfg.d_model) for _ in range(K)]
+        self.has_lyric = cfg.use_lyric_conditioning
+        if self.has_lyric:
+            self.lyric_encoder = _LyricEncoder(cfg)
+            self._lyric_heads = cfg.lyric_enc_heads
+            self._lyric_head_dim = cfg.d_model // cfg.lyric_enc_heads
+            self._lyric_scale = self._lyric_head_dim ** -0.5
         self.blocks = [_Block(cfg) for _ in range(cfg.n_layers)]
         self.ln_final = _RMSNorm(cfg.d_model)
         self.heads = [mnn.Linear(cfg.d_model, cfg.vocab_with_pad, bias=False) for _ in range(K)]
@@ -157,6 +193,17 @@ class MLXNanoAudioGPT(mnn.Module):
         emb = np.concatenate([freqs, freqs], axis=-1)  # [max_seq_len, head_dim]
         self._cos = mx.array(np.cos(emb)).astype(dtype)
         self._sin = mx.array(np.sin(emb)).astype(dtype)
+
+        # Lyric sinusoidal positional table (non-persistent in torch — recomputed,
+        # stored as an underscore attr so it stays out of the loaded param tree).
+        if self.has_lyric:
+            d = cfg.d_model
+            pe = np.zeros((cfg.max_lyric_len, d))
+            pos = np.arange(cfg.max_lyric_len)[:, None]
+            div = np.exp(np.arange(0, d, 2) * (-np.log(10000.0) / d))
+            pe[:, 0::2] = np.sin(pos * div)
+            pe[:, 1::2] = np.cos(pos * div)
+            self._lyric_pe = mx.array(pe).astype(dtype)
 
         self._load_torch_weights(state_dict)
         self._n_params = sum(v.numel() for k, v in state_dict.items())
@@ -187,6 +234,10 @@ class MLXNanoAudioGPT(mnn.Module):
             if not isinstance(module, mnn.Linear):
                 return False
             if path.startswith("tok_embeds"):
+                return False
+            # Keep the lyric encoder full-precision: it's small and phonetically
+            # sensitive — quantizing it risks intelligibility for little memory.
+            if path.startswith("lyric_encoder"):
                 return False
             # group quant needs in_features divisible by group_size
             if module.weight.shape[-1] % group_size != 0:
@@ -234,7 +285,9 @@ class MLXNanoAudioGPT(mnn.Module):
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return attn.proj(y)
 
-    def _cross_attn(self, ca: _CrossAttention, x: mx.array, cond: mx.array) -> mx.array:
+    def _cross_attn(
+        self, ca: _CrossAttention, x: mx.array, cond: mx.array, mask: mx.array | None = None,
+    ) -> mx.array:
         B, T, D = x.shape
         T_c = cond.shape[1]
         q = ca.q_proj(x).reshape(B, T, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
@@ -242,9 +295,31 @@ class MLXNanoAudioGPT(mnn.Module):
         k, v = mx.split(kv, 2, axis=-1)
         k = k.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
-        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=ca.scale, mask=None)
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=ca.scale, mask=mask)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return ca.out_proj(y)
+
+    def _encode_lyrics(self, ids: mx.array, mask: mx.array) -> tuple[mx.array, mx.array]:
+        """ids [B, L] int32, mask [B, L] bool. Returns (lyric_emb [B, L, D],
+        additive cross-attn mask [B, 1, 1, L]). Mirrors torch encode_lyrics."""
+        enc = self.lyric_encoder
+        B, L = ids.shape
+        D = self.cfg.d_model
+        nh, hd = self._lyric_heads, self._lyric_head_dim
+        x = enc.embed(ids) + self._lyric_pe[:L][None]
+        add = mx.where(mask[:, None, None, :], mx.array(0.0), mx.array(NEG_INF)).astype(x.dtype)
+        for layer in enc.layers:
+            h = layer.ln1(x)
+            q, k, v = mx.split(layer.qkv(h), 3, axis=-1)
+            q = q.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
+            k = k.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
+            v = v.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
+            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self._lyric_scale, mask=add)
+            y = y.transpose(0, 2, 1, 3).reshape(B, L, D)
+            x = x + layer.proj(y)
+            x = x + layer.fc2(mnn.gelu(layer.fc1(layer.ln2(x))))
+        x = enc.ln_final(x)
+        return x, add
 
     def __call__(
         self,
@@ -252,6 +327,8 @@ class MLXNanoAudioGPT(mnn.Module):
         caches: list[_LayerCache] | None = None,
         start_pos: int = 0,
         text_emb: mx.array | None = None,
+        lyric_emb: mx.array | None = None,
+        lyric_kv_mask: mx.array | None = None,
     ) -> mx.array:
         """tokens: [B, K, T] int32. Returns logits [B, K, T, V]."""
         B, K, T = tokens.shape
@@ -264,15 +341,28 @@ class MLXNanoAudioGPT(mnn.Module):
             x = x + self._self_attn(block.attn, block.ln1(x), cos, sin, cache)
             if block.has_cross_attn and text_emb is not None:
                 x = x + self._cross_attn(block.cross_attn, block.ln_cross(x), text_emb)
+            if block.has_lyric_attn and lyric_emb is not None:
+                x = x + self._cross_attn(
+                    block.lyric_attn, block.ln_lyric(x), lyric_emb, mask=lyric_kv_mask
+                )
             x = x + block.mlp.fc2(mnn.gelu(block.mlp.fc1(block.ln2(x))))
 
         x = self.ln_final(x)
         logits = mx.stack([head(x) for head in self.heads], axis=1)  # [B, K, T, V]
         return logits
 
-    def logits_oneshot(self, tokens: mx.array, text_emb: mx.array | None = None) -> mx.array:
+    def logits_oneshot(
+        self,
+        tokens: mx.array,
+        text_emb: mx.array | None = None,
+        lyric_emb: mx.array | None = None,
+        lyric_kv_mask: mx.array | None = None,
+    ) -> mx.array:
         """Full causal forward with no KV cache — used by parity tests."""
-        return self(tokens, caches=None, start_pos=0, text_emb=text_emb)
+        return self(
+            tokens, caches=None, start_pos=0, text_emb=text_emb,
+            lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask,
+        )
 
     def _new_caches(self, B: int, T_max: int) -> list[_LayerCache]:
         return [
@@ -321,6 +411,11 @@ class MLXNanoAudioGPT(mnn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """Drop-in for NanoAudioGPT.generate. Accepts/returns torch tensors."""
         cfg = self.cfg
@@ -361,29 +456,70 @@ class MLXNanoAudioGPT(mnn.Module):
 
         cond = None if text_emb is None else _t2m(text_emb, self._dtype)
         neg = None if text_emb_neg is None else _t2m(text_emb_neg, self._dtype)
-        use_cfg = cfg_scale != 1.0 and (cond is not None or neg is not None)
 
-        caches_cond = self._new_caches(B, T_delay)
-        caches_uncond = self._new_caches(B, T_delay) if use_cfg else None
+        def _ids_to_mx(ids):
+            return mx.array(ids.detach().to(torch.int64).cpu().numpy().astype(np.int32))
+
+        # Encode lyric streams once (encoder is large; reuse across decode steps).
+        lyric_pos = lyric_kv_pos = None
+        lyric_neg = lyric_kv_neg = None
+        if self.has_lyric and lyric_ids is not None:
+            lyric_pos, lyric_kv_pos = self._encode_lyrics(
+                _ids_to_mx(lyric_ids), _ids_to_mx(lyric_mask).astype(mx.bool_)
+            )
+        if self.has_lyric and lyric_ids_neg is not None:
+            lyric_neg, lyric_kv_neg = self._encode_lyrics(
+                _ids_to_mx(lyric_ids_neg), _ids_to_mx(lyric_mask_neg).astype(mx.bool_)
+            )
+
+        has_cond = any(v is not None for v in (cond, neg, lyric_pos, lyric_neg))
+        composed = (
+            lyric_cfg_scale is not None and lyric_cfg_scale != 1.0 and lyric_pos is not None
+        )
+        use_cfg = (cfg_scale != 1.0 and has_cond) or composed
+
+        # Conditioning streams in lockstep (mirror the torch generate):
+        #   cond = +tags +lyrics, base = -tags -lyrics, mid = +tags lyrics-dropped.
+        cond_s = {"text": cond, "lemb": lyric_pos, "lkv": lyric_kv_pos}
+        streams = [cond_s]
+        base_s = mid_s = None
+        if use_cfg:
+            base_s = {"text": neg, "lemb": lyric_neg, "lkv": lyric_kv_neg}
+            streams.append(base_s)
+        if composed:
+            mid_s = {"text": cond, "lemb": None, "lkv": None}
+            streams.append(mid_s)
+        for s in streams:
+            s["caches"] = self._new_caches(B, T_delay)
+
+        def _run(inp, start):
+            for s in streams:
+                s["logits"] = self(
+                    inp, caches=s["caches"], start_pos=start,
+                    text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                )
+
+        def _combine():
+            if composed:
+                return (
+                    base_s["logits"]
+                    + cfg_scale * (mid_s["logits"] - base_s["logits"])
+                    + lyric_cfg_scale * (cond_s["logits"] - mid_s["logits"])
+                )
+            if use_cfg:
+                return base_s["logits"] + cfg_scale * (cond_s["logits"] - base_s["logits"])
+            return cond_s["logits"]
 
         prefill_len = max(1, T_prompt)
-        logits = self(tokens[:, :, :prefill_len], caches=caches_cond, start_pos=0, text_emb=cond)
-        if use_cfg:
-            logits_base = self(
-                tokens[:, :, :prefill_len], caches=caches_uncond, start_pos=0, text_emb=neg
-            )
-            logits = logits_base + cfg_scale * (logits - logits_base)
-        mx.eval(logits, [c.k for c in caches_cond])
+        _run(tokens[:, :, :prefill_len], 0)
+        logits = _combine()
+        mx.eval(logits, [c.k for c in cond_s["caches"]])
 
         for pos in range(prefill_len, T_delay):
             if pos > prefill_len:
                 inp = tokens[:, :, pos - 1:pos]
-                logits = self(inp, caches=caches_cond, start_pos=pos - 1, text_emb=cond)
-                if use_cfg:
-                    logits_base = self(
-                        inp, caches=caches_uncond, start_pos=pos - 1, text_emb=neg
-                    )
-                    logits = logits_base + cfg_scale * (logits - logits_base)
+                _run(inp, pos - 1)
+                logits = _combine()
 
             step = logits[:, :, -1, :]  # [B, K, V]
             step[:, :, pad] = NEG_INF

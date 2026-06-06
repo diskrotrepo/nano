@@ -20,7 +20,8 @@ matches the question.
 |---|---|
 | Are the samples any good? (audio metrics + WAVs) | `python -m scripts.eval_checkpoint --ckpt ./checkpoints/best.pt --out ./eval/run` (add `--sweep` for a sampling sweep) |
 | Am I overfitting / at capacity? | `modal run scripts/eval_train_vs_val.py` |
-| Is lyric conditioning earning its compute? | `modal run scripts/eval_lyrics_ablation.py` |
+| Is lyric conditioning earning its compute? (val-loss ablation) | `modal run scripts/eval_lyrics_ablation.py` |
+| Can a listener make out the words? (intelligibility / WER) | `modal run scripts/eval_lyric_wer.py` (tune `--cfg-scale`, `--lyric-cfg-scale`) |
 | What sampling params are best? | `python -m eval.sweep.run_sweep --stage 1` then `--stage 2 --top-n 4` |
 | How well is each genre covered? | `python -m eval.genre_sweep` (gaps: `python eval/genre_gap_eval.py`) |
 | Is the DAC codec itself fine? | `python scripts/dac_roundtrip.py` |
@@ -50,9 +51,21 @@ capacity, go bigger.
 modal run scripts/eval_lyrics_ablation.py
 # flags: --n-batches 400  --batch-size 64  --val-ratio 0.12  --segment-seconds 10.0
 ```
-Compares val loss on lyric-bearing samples under full (tags+lyrics) vs tags_only vs
-uncond. If the lyrics delta ≈ 0, lyrics aren't earning compute — consider dropping
-the Demucs+Whisper pipeline.
+Compares val loss on lyric-bearing samples under full (tags+phoneme lyrics) vs
+tags_only (lyric stream dropped) vs uncond. If the lyrics delta ≈ 0, the lyric
+conditioner isn't being used — but for *intelligibility* prefer the WER eval below
+(val loss can improve without the words being recoverable).
+
+### Lyric intelligibility / WER — `eval_lyric_wer` (Modal, H100)
+```bash
+modal run scripts/eval_lyric_wer.py
+# flags: --ckpt-path /ckpts/v8_sing/best.pt  --n-clips 30  --cfg-scale 3  --lyric-cfg-scale 0
+```
+The **primary success metric** for "does it sing the words." Generates audio
+conditioned on held-out lyric lines, transcribes the output with the same
+Demucs+Whisper pipeline used to build the training lyrics, and reports WER vs the
+input lyric. Gibberish ≈ 1.0; falling WER across checkpoints == emerging
+intelligibility. Raise `--lyric-cfg-scale` (e.g. 5–6) to push the lyric axis harder.
 
 ### Sampling sweep — `eval.sweep.run_sweep`
 ```bash

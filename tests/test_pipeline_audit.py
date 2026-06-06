@@ -127,8 +127,12 @@ def test_evaluate_restores_train_mode_on_exception():
     assert model.training is True
 
     # Minimal loader — yields one bogus batch then stops.
+    # collate_lyrics shape: (tokens, tags, lyric_ids, lyric_mask).
     def loader_iter():
-        yield (torch.zeros(1, 9, 10, dtype=torch.long), [""], [""])
+        yield (
+            torch.zeros(1, 9, 10, dtype=torch.long), [""],
+            torch.ones(1, 1, dtype=torch.long), torch.ones(1, 1, dtype=torch.bool),
+        )
 
     cfg = TrainConfig(device="cpu")
 

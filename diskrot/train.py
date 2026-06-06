@@ -26,7 +26,7 @@ from model.codec import DACodec
 from model.delay_pattern import build_train_inputs
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
-from diskrot.dataset import TokenDataset
+from diskrot.dataset import TokenDataset, collate_lyrics
 
 
 @dataclass
@@ -398,33 +398,23 @@ def _unwrapped_state_dict(model: torch.nn.Module) -> dict:
 
 
 def _build_cond(
-    text_encoder: CLAPTextEncoder, tags: list[str], lyrics: list[str], device: str,
+    text_encoder: CLAPTextEncoder, tags: list[str], device: str,
     tag_cache: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor | None:
-    """Encode tags and lyrics as separate CLAP embeddings, stacked along seq dim.
+    """Encode tags as a pooled CLAP embedding -> [B, 1, D], or None if no tags.
 
-    Returns [B, 1, D] (tags only), [B, 2, D] (tags + lyrics), or None.
-    If tag_cache is provided, looks up pre-computed CLAP embeddings for tags
-    and applies the projection layer (avoids running CLAP every step).
+    Lyrics no longer flow through CLAP — they are conditioned via the phoneme
+    LyricEncoder + lyric cross-attention (see model/lyric_encoder.py). This builds
+    only the pooled TAG vector. If tag_cache is provided, looks up pre-computed
+    CLAP embeddings and applies the projection layer (avoids running CLAP).
     """
-    has_tags = any(t != "" for t in tags)
-    has_lyrics = any(ly != "" for ly in lyrics)
-    if not has_tags and not has_lyrics:
+    if not any(t != "" for t in tags):
         return None
-
-    parts = []
-    if has_tags:
-        if tag_cache is not None:
-            zero = torch.zeros(text_encoder.CLAP_DIM, device=device)
-            raw = torch.stack([tag_cache.get(t, zero) for t in tags])  # [B, 1024]
-            projected = text_encoder.proj(raw).unsqueeze(1)            # [B, 1, d_out]
-            parts.append(projected)
-        else:
-            parts.append(text_encoder.encode(tags).to(device))  # [B, 1, D]
-    if has_lyrics:
-        parts.append(text_encoder.encode(lyrics).to(device))  # [B, 1, D]
-
-    return torch.cat(parts, dim=1)  # [B, 1 or 2, D]
+    if tag_cache is not None:
+        zero = torch.zeros(text_encoder.CLAP_DIM, device=device)
+        raw = torch.stack([tag_cache.get(t, zero) for t in tags])  # [B, 1024]
+        return text_encoder.proj(raw).unsqueeze(1)                 # [B, 1, d_out]
+    return text_encoder.encode(tags).to(device)                    # [B, 1, D]
 
 
 @torch.no_grad()
@@ -443,8 +433,9 @@ def _evaluate(
     # model stays in eval — dropout disabled, training silently degraded.
     model.eval()
     try:
+        use_lyrics = cfg.model.use_lyric_conditioning
         losses, per_cb_sums = [], None
-        for i, (batch, tags, lyrics) in enumerate(loader):
+        for i, (batch, tags, lyric_ids, lyric_mask) in enumerate(loader):
             if i >= n_batches:
                 break
             # int16 on host (P3 — saves ~24 GB shared RAM at the production
@@ -455,10 +446,14 @@ def _evaluate(
 
             text_emb = None
             if text_encoder is not None:
-                text_emb = _build_cond(text_encoder, list(tags), list(lyrics), cfg.device, tag_cache)
+                text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
+            l_ids = l_mask = None
+            if use_lyrics:
+                l_ids = lyric_ids.to(cfg.device, non_blocking=True)
+                l_mask = lyric_mask.to(cfg.device, non_blocking=True)
 
             with torch.amp.autocast(cfg.device, enabled=amp_enabled):
-                logits = model(inputs, text_emb=text_emb)
+                logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids, lyric_mask=l_mask)
                 _, per_cb = _loss_fn(logits, targets, pad_id)
             if per_cb_sums is None:
                 per_cb_sums = per_cb.clone()
@@ -512,15 +507,17 @@ def train_run(
         if main:
             print(f"using preloaded mmap bundle (skipping per-rank disk load)",
                   flush=True)
-        train_ds = TokenDataset.from_mmap(shared_bundle, "train", segment_frames)
-        val_ds = TokenDataset.from_mmap(shared_bundle, "val", segment_frames)
+        train_ds = TokenDataset.from_mmap(
+            shared_bundle, "train", segment_frames, cfg.model.max_lyric_len)
+        val_ds = TokenDataset.from_mmap(
+            shared_bundle, "val", segment_frames, cfg.model.max_lyric_len)
     else:
         train_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="train",
                                 val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
-                                lyrics_path=cfg.lyrics_path)
+                                lyrics_path=cfg.lyrics_path, max_lyric_len=cfg.model.max_lyric_len)
         val_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="val",
                               val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
-                              lyrics_path=cfg.lyrics_path)
+                              lyrics_path=cfg.lyrics_path, max_lyric_len=cfg.model.max_lyric_len)
 
     pin = cfg.device == "cuda"
     if use_ddp:
@@ -534,18 +531,20 @@ def train_run(
         )
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=train_sampler,
                                   num_workers=2, pin_memory=pin, drop_last=True,
-                                  persistent_workers=True, prefetch_factor=4)
+                                  persistent_workers=True, prefetch_factor=4,
+                                  collate_fn=collate_lyrics)
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, sampler=val_sampler,
                                 num_workers=1, pin_memory=pin, drop_last=True,
-                                persistent_workers=True)
+                                persistent_workers=True, collate_fn=collate_lyrics)
     else:
         train_sampler = None
         val_sampler = None
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                                   num_workers=2, pin_memory=pin, drop_last=True, persistent_workers=True,
-                                  prefetch_factor=4)
+                                  prefetch_factor=4, collate_fn=collate_lyrics)
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=True,
-                                num_workers=1, pin_memory=pin, drop_last=True, persistent_workers=True)
+                                num_workers=1, pin_memory=pin, drop_last=True, persistent_workers=True,
+                                collate_fn=collate_lyrics)
 
     model = NanoAudioGPT(cfg.model).to(cfg.device)
     n_params = model.num_params()
@@ -600,6 +599,11 @@ def train_run(
                     print(f"cached {len(tag_cache)} tag embeddings", flush=True)
     elif cfg.model.use_text_conditioning and main:
         print("WARNING: use_text_conditioning=True but no tags found — training without text")
+
+    if cfg.model.use_lyric_conditioning and main:
+        n_lyrics = len(train_ds._lyrics) + len(val_ds._lyrics)
+        print(f"lyric (phoneme) conditioning enabled: {n_lyrics} songs with lyrics "
+              f"(max_lyric_len={cfg.model.max_lyric_len}, cfg_dropout={cfg.cfg_dropout})")
 
     # Wrap in DDP *before* torch.compile so the compiled graph includes the
     # DDP comm hooks. device_ids selects this rank's GPU.
@@ -677,13 +681,13 @@ def train_run(
     while step < cfg.steps:
         t_io = time.time()
         try:
-            batch, tags, lyrics = next(train_iter)
+            batch, tags, lyric_ids, lyric_mask = next(train_iter)
         except StopIteration:
             epoch += 1
             if use_ddp and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
-            batch, tags, lyrics = next(train_iter)
+            batch, tags, lyric_ids, lyric_mask = next(train_iter)
         dataloader_wait_s += time.time() - t_io
 
         # int16 on host (P3 — saves ~24 GB shared RAM). Cast to int64 on
@@ -691,17 +695,23 @@ def train_run(
         batch = batch.to(cfg.device, non_blocking=True).long()
         inputs, targets = build_train_inputs(batch, pad_id)
 
-        # text conditioning with classifier-free guidance dropout
+        # Tag + lyric conditioning, each dropped INDEPENDENTLY for classifier-free
+        # guidance (teaches tags-only / lyrics-only / both / neither so inference
+        # can guide each axis). "Drop lyrics" = pass None so the lyric encoder +
+        # cross-attn are skipped this step (find_unused_parameters covers it).
         text_emb = None
-        if text_encoder is not None:
-            if _rng.random() >= cfg.cfg_dropout:
-                text_emb = _build_cond(text_encoder, list(tags), list(lyrics), cfg.device, tag_cache)
+        if text_encoder is not None and _rng.random() >= cfg.cfg_dropout:
+            text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
+        l_ids = l_mask = None
+        if cfg.model.use_lyric_conditioning and _rng.random() >= cfg.cfg_dropout:
+            l_ids = lyric_ids.to(cfg.device, non_blocking=True)
+            l_mask = lyric_mask.to(cfg.device, non_blocking=True)
 
         for g in optim.param_groups:
             g["lr"] = _cosine_lr(step, cfg)
 
         with torch.amp.autocast(cfg.device, enabled=amp_enabled):
-            logits = model(inputs, text_emb=text_emb)
+            logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids, lyric_mask=l_mask)
             loss, per_cb = _loss_fn(logits, targets, pad_id)
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -878,7 +888,12 @@ if __name__ == "__main__":
     p.add_argument("--lyrics-path", type=str, default=None, help="path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning")
     args = p.parse_args()
 
-    model_cfg = GPTConfig(use_text_conditioning=args.tags_path is not None or args.lyrics_path is not None)
+    # Tags drive the pooled-CLAP path (use_text_conditioning); lyrics drive the
+    # phoneme LyricEncoder path (use_lyric_conditioning) — independent flags now.
+    model_cfg = GPTConfig(
+        use_text_conditioning=args.tags_path is not None,
+        use_lyric_conditioning=args.lyrics_path is not None,
+    )
     cfg = TrainConfig(
         device=args.device,
         steps=args.steps,

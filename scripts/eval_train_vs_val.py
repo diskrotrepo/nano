@@ -45,7 +45,7 @@ def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_
     from model.codec import DACodec
     from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
     from model.text_encoder import CLAPTextEncoder
-    from diskrot.dataset import TokenDataset
+    from diskrot.dataset import TokenDataset, collate_lyrics
     from diskrot.train import TrainConfig, _evaluate
 
     device = "cuda"
@@ -89,6 +89,7 @@ def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_
         loader = DataLoader(
             ds, batch_size=batch_size, shuffle=True,
             num_workers=2, pin_memory=True, drop_last=True, persistent_workers=True,
+            collate_fn=collate_lyrics,
         )
         mean, per_cb = _evaluate(model, loader, tcfg, n_batches,
                                  text_encoder=text_encoder, tag_cache=tag_cache)

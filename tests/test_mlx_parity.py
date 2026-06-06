@@ -96,6 +96,81 @@ def test_unconditional_generate_from_none():
     assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
 
 
+def _lyric_cfg(**overrides) -> GPTConfig:
+    base = dict(
+        use_lyric_conditioning=True, lyric_enc_layers=2, lyric_enc_heads=4,
+        lyric_enc_d_ff=128, max_lyric_len=16,
+    )
+    base.update(overrides)
+    return _tiny_cfg(**base)
+
+
+def _lyric_inputs():
+    from model.lyric_encoder import BOS_PHONEME_ID, PAD_PHONEME_ID
+
+    # BOS + a few phones + one pad slot; mask keeps BOS valid (no fully-masked row).
+    ids = torch.tensor([[BOS_PHONEME_ID, 10, 11, 12, 13, PAD_PHONEME_ID]])
+    mask = ids != PAD_PHONEME_ID
+    return ids, mask
+
+
+def test_oneshot_logits_match_torch_with_lyrics():
+    """The lyric encoder + lyric cross-attn port must match torch end-to-end."""
+    import mlx.core as mx
+
+    cfg = _lyric_cfg(use_text_conditioning=True)
+    m, mlx_m = _build_pair(cfg)
+    K, T = cfg.n_codebooks, 12
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, T))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    ids, mask = _lyric_inputs()
+
+    with torch.no_grad():
+        ref = m(tokens, text_emb=text_emb, lyric_ids=ids, lyric_mask=mask).numpy()
+    lemb, lkv = mlx_m._encode_lyrics(
+        mx.array(ids.numpy().astype(np.int32)), mx.array(mask.numpy())
+    )
+    got = np.array(
+        mlx_m.logits_oneshot(
+            mx.array(tokens.numpy().astype(np.int32)),
+            text_emb=mx.array(text_emb.numpy()),
+            lyric_emb=lemb, lyric_kv_mask=lkv,
+        )
+    )
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() < 1e-3
+
+
+def test_cached_decode_matches_with_lyrics():
+    """Greedy KV-cached generate with lyric conditioning must match torch exactly."""
+    cfg = _lyric_cfg(use_text_conditioning=True)
+    m, mlx_m = _build_pair(cfg, seed=7)
+    K = cfg.n_codebooks
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 10))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    ids, mask = _lyric_inputs()
+    kw = dict(num_new_frames=6, temperature=0.0, top_k=None, top_p=None,
+              text_emb=text_emb, cfg_scale=1.0, lyric_ids=ids, lyric_mask=mask)
+    out_t = m.generate(tokens[0], **kw)
+    out_m = mlx_m.generate(tokens[0], **kw)
+    assert torch.equal(out_t, out_m)
+
+
+def test_lyric_composed_cfg_runs_and_in_range():
+    """Composed dual-axis guidance (separate lyric_cfg_scale) runs on MLX."""
+    cfg = _lyric_cfg(use_text_conditioning=True)
+    _, mlx_m = _build_pair(cfg, seed=8)
+    K = cfg.n_codebooks
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 8))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    ids, mask = _lyric_inputs()
+    out = mlx_m.generate(tokens[0], num_new_frames=5, temperature=0.9, top_k=50,
+                         top_p=0.95, text_emb=text_emb, cfg_scale=2.0,
+                         lyric_cfg_scale=4.0, lyric_ids=ids, lyric_mask=mask)
+    assert out.shape == (K, 8 + 5)
+    assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
+
+
 @pytest.mark.parametrize("bits", [8, 4])
 def test_quantized_runs_in_range(bits):
     """int8/int4 just need to run and produce valid tokens — no bit-parity."""

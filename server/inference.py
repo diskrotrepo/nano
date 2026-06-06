@@ -176,17 +176,16 @@ class InferenceEngine:
         text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
-    ) -> torch.Tensor | None:
-        """Build a conditioning embedding from text (tags + lyrics), style audio, or both.
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Build conditioning from text (tags + lyrics), style audio, or both.
 
-        text may contain tags and lyrics separated by ". " (combined by the server).
-        Tags and lyrics get separate positions in cross-attention.
-        When style_audio is also provided, blends with the tag embedding.
-        Returns [1, N, D] or None.
+        text may contain tags and lyrics separated by ". " (combined by the
+        server). Tags go through the pooled CLAP encoder; lyrics are phonemized
+        (g2p) into a token sequence for the LyricEncoder cross-attention — they no
+        longer go through CLAP. Style audio (when given) blends into the tag
+        embedding. Returns ``(tag_emb [1,1,D] | None, lyric_ids [1,L] | None,
+        lyric_mask [1,L] | None)``.
         """
-        if self.text_encoder is None:
-            return None
-
         # Split tags from lyrics (server joins them as "tags. lyrics")
         tags_str = ""
         lyrics_str = ""
@@ -195,38 +194,36 @@ class InferenceEngine:
             tags_str = parts[0]
             lyrics_str = parts[1] if len(parts) > 1 else ""
 
-        # Encode tags (position 0)
+        # --- Tags (pooled CLAP, position 0) + optional style-audio blend ---
         tag_emb = None
-        if tags_str:
-            tag_emb = self.text_encoder.encode([tags_str]).to(self.device)  # [1, 1, D]
-
-        # Blend with style audio if provided
-        if style_audio_bytes:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                f.write(style_audio_bytes)
-                style_path = f.name
-            try:
-                audio_emb = self.text_encoder.encode_audio([style_path]).to(self.device)
-            finally:
-                os.unlink(style_path)
+        if self.text_encoder is not None:
+            if tags_str:
+                tag_emb = self.text_encoder.encode([tags_str]).to(self.device)  # [1,1,D]
+            if style_audio_bytes:
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                    f.write(style_audio_bytes)
+                    style_path = f.name
+                try:
+                    audio_emb = self.text_encoder.encode_audio([style_path]).to(self.device)
+                finally:
+                    os.unlink(style_path)
+                tag_emb = audio_emb if tag_emb is None else (
+                    tag_emb * (1 - style_weight) + audio_emb * style_weight
+                )
             if tag_emb is not None:
-                tag_emb = tag_emb * (1 - style_weight) + audio_emb * style_weight
-            else:
-                tag_emb = audio_emb
+                tag_emb = tag_emb.to(self._cond_dtype())
 
-        # Encode lyrics (position 1)
-        lyrics_emb = None
-        if lyrics_str:
-            lyrics_emb = self.text_encoder.encode([lyrics_str]).to(self.device)  # [1, 1, D]
+        # --- Lyrics (phoneme sequence for the LyricEncoder) ---
+        lyric_ids = lyric_mask = None
+        if lyrics_str and getattr(self.model.cfg, "use_lyric_conditioning", False):
+            from model.lyric_encoder import PAD_PHONEME_ID, text_to_phoneme_ids
 
-        # Stack available embeddings
-        parts = [e for e in (tag_emb, lyrics_emb) if e is not None]
-        if not parts:
-            return None
-        cond = torch.cat(parts, dim=1)  # [1, 1 or 2, D]
-        # match the GPT's compute dtype (half on mlx/cuda/mps, fp32 on torch-cpu);
-        # the mlx backend re-casts to its own dtype at the generate() boundary.
-        return cond.to(self._cond_dtype())
+            ids = text_to_phoneme_ids(lyrics_str, max_len=self.model.cfg.max_lyric_len)
+            if ids:
+                lyric_ids = torch.tensor(ids, dtype=torch.long, device=self.device)[None]
+                lyric_mask = lyric_ids != PAD_PHONEME_ID
+
+        return tag_emb, lyric_ids, lyric_mask
 
     def _cond_dtype(self) -> torch.dtype:
         """dtype for the conditioning tensor. fp32 only for the torch-on-CPU path;
@@ -249,6 +246,7 @@ class InferenceEngine:
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
+        lyric_cfg_scale: float | None = None,
     ) -> tuple[bytes, str]:
         """Take an mp3 prompt, return (audio_bytes, mime_type) of the continuation.
 
@@ -278,13 +276,17 @@ class InferenceEngine:
             raise ValueError("Prompt already at max context; cannot generate more.")
 
         prompt_tokens = prompt_tokens.to(self.device)
-        cond_emb = self._build_conditioning(text, style_audio_bytes, style_weight)
-        neg_emb = self._build_conditioning(negative_text)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt_tokens, num_new_frames=new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=cond_emb, text_emb_neg=neg_emb,
-            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None) else 1.0,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None
+                                    or cond_lids is not None or neg_lids is not None) else 1.0,
+            lyric_cfg_scale=lyric_cfg_scale,
         )  # [K, T_total]
 
         wav = self.codec.decode(out_tokens.cpu())  # [samples] mono
@@ -313,6 +315,7 @@ class InferenceEngine:
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
+        lyric_cfg_scale: float | None = None,
     ) -> tuple[bytes, str]:
         """Take the full current clip, use its tail as prompt, return original + new audio.
 
@@ -344,13 +347,17 @@ class InferenceEngine:
             raise ValueError("Overlap window is already at model context limit; reduce overlap_seconds.")
 
         prompt_dev = prompt_tokens.to(self.device)
-        cond_emb = self._build_conditioning(text, style_audio_bytes, style_weight)
-        neg_emb = self._build_conditioning(negative_text)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt_dev, num_new_frames=new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=cond_emb, text_emb_neg=neg_emb,
-            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None) else 1.0,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None
+                                    or cond_lids is not None or neg_lids is not None) else 1.0,
+            lyric_cfg_scale=lyric_cfg_scale,
         )
         new_tokens = out_tokens[:, prompt_tokens.shape[1]:]  # [K, new_frames]
 
@@ -381,6 +388,7 @@ class InferenceEngine:
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
+        lyric_cfg_scale: float | None = None,
         score_clap: bool = False,
     ):
         """Generate audio from scratch (no audio prompt). Returns (audio_bytes, mime_type).
@@ -425,13 +433,17 @@ class InferenceEngine:
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
-        cond_emb = self._build_conditioning(text, style_audio_bytes, style_weight)
-        neg_emb = self._build_conditioning(negative_text)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt=seed_tokens, num_new_frames=new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=cond_emb, text_emb_neg=neg_emb,
-            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None) else 1.0,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None
+                                    or cond_lids is not None or neg_lids is not None) else 1.0,
+            lyric_cfg_scale=lyric_cfg_scale,
         )  # [K, seed_frames + new_frames]
 
         # strip the seed frame(s) before decoding

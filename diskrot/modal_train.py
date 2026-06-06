@@ -37,6 +37,19 @@ def _prefetch_clap() -> None:
     CLAP(version="2023", use_cuda=False)
 
 
+def _prefetch_g2p() -> None:
+    """Bake g2p_en's nltk data + model into the image so dataloader workers never
+    block on a download. The phoneme LyricEncoder phonemizes lyrics with g2p_en;
+    its first G2p() call needs the CMUdict + POS tagger nltk corpora."""
+    import nltk
+
+    for res in ("averaged_perceptron_tagger_eng", "cmudict", "averaged_perceptron_tagger"):
+        nltk.download(res, quiet=True)
+    from g2p_en import G2p
+
+    G2p()("warm up the cache")
+
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
@@ -50,12 +63,14 @@ image = (
         "soundfile>=0.12",
         "msclap",
         "wandb>=0.16",
+        "g2p_en==2.1.0",
     )
     # Override descript-audiotools' protobuf<3.20 pin, but stay under 7 so
     # wandb's `protobuf<7` constraint is satisfied. Intersection of the three
     # constraints lands on protobuf 4.x; 4.25 picks a recent stable.
     .run_commands("pip install 'protobuf>=4.25,<5'")
     .run_function(_prefetch_clap)
+    .run_function(_prefetch_g2p)
     .add_local_python_source("model", "diskrot")
 )
 
@@ -96,7 +111,16 @@ DEFAULTS = {
     "steps": 400_000,
     "patience": 20,
     "eval_batches": 50,
-    "ckpt_subdir": "v7_1500m",
+    # v8_sing: first run with phoneme LyricEncoder cross-attention so the model
+    # sings intelligible words. Fresh start — incompatible with v7 checkpoints
+    # (new modules + GPTConfig fields).
+    "ckpt_subdir": "v8_sing",
+    # Lyric (phoneme) conditioning — a ~100M bidirectional encoder feeding a
+    # per-block lyric cross-attention. Enabled together with tag conditioning.
+    "lyric_enc_layers": 3,
+    "lyric_enc_heads": 8,
+    "lyric_enc_d_ff": 4096,
+    "max_lyric_len": 256,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 8 (global 64 on 8 ranks)
 
@@ -135,15 +159,26 @@ def _build_model_cfg(
     text_conditioned: bool,
     max_seq_len: int = DEFAULTS["max_seq_len"],
     use_gradient_checkpointing: bool = True,
+    lyric_enc_layers: int = DEFAULTS["lyric_enc_layers"],
+    lyric_enc_heads: int = DEFAULTS["lyric_enc_heads"],
+    lyric_enc_d_ff: int = DEFAULTS["lyric_enc_d_ff"],
+    max_lyric_len: int = DEFAULTS["max_lyric_len"],
 ):
     from model.nano_audio_gpt import GPTConfig
 
+    # text_conditioned drives BOTH the pooled-CLAP tag path and the phoneme lyric
+    # path — this bespoke model ships tags + lyric conditioning together.
     return GPTConfig(
         use_text_conditioning=text_conditioned,
+        use_lyric_conditioning=text_conditioned,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
         d_ff=d_ff, dropout=dropout,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
+        lyric_enc_layers=lyric_enc_layers,
+        lyric_enc_heads=lyric_enc_heads,
+        lyric_enc_d_ff=lyric_enc_d_ff,
+        max_lyric_len=max_lyric_len,
     )
 
 
