@@ -21,6 +21,11 @@ Deploy (persistent URL):
 Point at a different checkpoint on the volume:
     NANO_CKPT=/ckpts/v7_1500m/latest.pt modal serve diskrot/modal_serve.py
 
+Quantize the weights to shrink the model + speed up the memory-bound decode
+(CUDA only; mirrors NANO_MLX_BITS on the Apple-Silicon path). Default is fp16:
+    NANO_BITS=8 modal serve diskrot/modal_serve.py   # int8 weight-only (~1.5GB)
+    NANO_BITS=4 modal serve diskrot/modal_serve.py   # int4 weight-only (~0.75GB)
+
 Smoke test once it's up (URL is printed by modal serve/deploy):
     curl https://<your-app>.modal.run/health
     curl -X POST https://<your-app>.modal.run/generate \\
@@ -84,6 +89,9 @@ image = (
         # transformers powers the opt-in `sweeten` prompt rewriter; harmless to
         # include even when unused (the model is lazy-loaded on first sweeten).
         "transformers>=4.35",
+        # weight-only int8/int4 quantization for the CUDA path (NANO_BITS=8|4);
+        # only imported when NANO_BITS selects a quantized mode.
+        "torchao>=0.7",
     )
     # Match modal_train.py's protobuf intersection (descript-audiotools pins
     # <3.20, but msclap/transformers want newer). 4.x satisfies everyone.

@@ -42,6 +42,26 @@ modal deploy diskrot/modal_serve.py    # persistent public URL
 On the volume it prefers `/ckpts/v7_1500m/best_inference.pt`, falling back to
 `best.pt` then `latest.pt`. Override with `NANO_CKPT=/ckpts/custom.pt`.
 
+## Weight quantization (optional)
+
+Shrinks the ~3GB fp16 model and speeds up the memory-bound decode. **Weight-only**
+(activations/KV cache stay fp16), so quality cost is small at int8 and more
+aggressive at int4 — A/B before shipping. Set at serve time; no new checkpoint
+needed (quantization happens at load).
+
+- **CUDA** (Modal serve, via torchao): `NANO_BITS=8` (int8, ~1.5GB) or `NANO_BITS=4`
+  (int4, ~0.75GB). Default fp16. int4 runs the compute in bf16 (needs sm80+; the L4
+  is fine).
+  ```bash
+  NANO_BITS=8 modal serve diskrot/modal_serve.py
+  ```
+- **Apple Silicon** (local MLX backend): `NANO_MLX_BITS=8|4` (default 8). Force the
+  PyTorch-MPS path instead with `NANO_MLX=0`.
+
+Both skip the embeddings and the lyric encoder (small + intelligibility-sensitive)
+and quantize the big attention/MLP/head Linears. The startup log prints the active
+weight format (`weights=int8 weight-only (fp16 compute)`).
+
 ## Endpoints
 
 `GET /health`, `POST /generate`, `POST /continue`, `POST /extend`. All generation

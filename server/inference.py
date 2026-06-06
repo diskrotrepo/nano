@@ -34,6 +34,41 @@ def _mlx_available() -> bool:
         return False
 
 
+def _quantize_torch_linears(model: torch.nn.Module, bits: int, group_size: int = 64) -> None:
+    """Weight-only int4/int8 quantization of the model's nn.Linear layers via
+    torchao — the CUDA counterpart to the MLX backend's `mnn.quantize`.
+
+    Mirrors that path's policy (model/nano_audio_gpt_mlx.py:_quantize): quantize
+    the big Linears (attention qkv/proj, MLP, output heads) but keep all
+    embeddings and the small, phonetically sensitive lyric encoder in full
+    precision. Done in-place via tensor subclasses, so it composes with
+    torch.compile (apply this *before* compiling).
+
+    int8 is per-output-channel and runs in fp16. int4 is group-quantized
+    (group_size=64, matching the MLX path) and requires bf16 activations — the
+    caller casts the model to bf16 in that case. Linears whose in_features aren't
+    divisible by group_size are left unquantized (the int4 tinygemm kernel
+    requires it); none of nano's Linears hit that today (d_model=2048, d_ff=8192,
+    heads in=2048 are all divisible by 64), but the guard mirrors MLX."""
+    from torchao.quantization import (
+        int4_weight_only,
+        int8_weight_only,
+        quantize_,
+    )
+
+    def filter_fn(module: torch.nn.Module, fqn: str) -> bool:
+        if not isinstance(module, torch.nn.Linear):
+            return False
+        if fqn.startswith("lyric_encoder"):
+            return False
+        if bits == 4 and module.in_features % group_size != 0:
+            return False
+        return True
+
+    config = int4_weight_only(group_size=group_size) if bits == 4 else int8_weight_only()
+    quantize_(model, config, filter_fn=filter_fn)
+
+
 class InferenceEngine:
     def __init__(self, ckpt_path: str | None = None, device: str | None = None):
         self.device = device or os.environ.get("NANO_DEVICE") or (
@@ -78,11 +113,27 @@ class InferenceEngine:
                 self.model = NanoAudioGPT(cfg).to(self.device)
                 self.model.load_state_dict(state)
                 self.model.eval()
+
+                # Weight quantization (CUDA only), mirroring NANO_MLX_BITS on the
+                # MLX path. NANO_BITS=8|4 → int8/int4 weight-only via torchao;
+                # anything else (default) stays fp16. int4's tinygemm kernel needs
+                # bf16 activations, so the compute dtype follows the bit-width.
+                bits = int(os.environ.get("NANO_BITS", "16"))
+                quantized = self.device == "cuda" and bits in (4, 8)
+                self._torch_dtype = (
+                    torch.bfloat16 if (quantized and bits == 4) else torch.float16
+                )
                 if self.device != "cpu":
-                    self.model = self.model.half()
+                    self.model = self.model.to(self._torch_dtype)
+                if quantized:
+                    _quantize_torch_linears(self.model, bits)
+                self.model._bits = bits if quantized else 16
                 if self.device == "cuda":
                     self.model = torch.compile(self.model)
-                print(f"[inference] backend: torch ({self.device})")
+                wdesc = "fp16" if self._torch_dtype == torch.float16 else "bf16"
+                if self.model._bits != 16:
+                    wdesc = f"int{self.model._bits} weight-only ({wdesc} compute)"
+                print(f"[inference] backend: torch ({self.device}), weights={wdesc}")
             self.ckpt_step = ckpt.get("step", -1)
             self.ckpt_path = ckpt_path
             print(f"[inference] loaded ckpt {ckpt_path} (step {self.ckpt_step})")
@@ -226,10 +277,12 @@ class InferenceEngine:
         return tag_emb, lyric_ids, lyric_mask
 
     def _cond_dtype(self) -> torch.dtype:
-        """dtype for the conditioning tensor. fp32 only for the torch-on-CPU path;
-        every accelerated path (mlx, cuda, mps-half) runs in fp16."""
-        if self.backend == "torch" and self.device == "cpu":
-            return torch.float32
+        """dtype for the conditioning tensor, to match the model's compute dtype.
+        fp32 only for the torch-on-CPU path; the torch accelerated paths follow
+        `self._torch_dtype` (fp16, or bf16 when running int4-quantized); MLX is
+        always fp16."""
+        if self.backend == "torch":
+            return torch.float32 if self.device == "cpu" else self._torch_dtype
         return torch.float16
 
     @torch.no_grad()
