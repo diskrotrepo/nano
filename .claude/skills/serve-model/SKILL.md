@@ -2,9 +2,9 @@
 name: serve-model
 description: >-
   Serve nano inference locally or on Modal and exercise the generation endpoints.
-  Use this skill when the user wants to run the server, generate or continue/extend
-  audio from a checkpoint, deploy the inference API, or test /generate /continue
-  /extend with text, lyrics, or style conditioning.
+  Use this skill when the user wants to run the server, generate or extend audio
+  from a checkpoint, deploy the inference API, or test /generate /extend with text,
+  lyrics, or style conditioning.
 allowed-tools: Read, Bash
 ---
 
@@ -64,9 +64,8 @@ weight format (`weights=int8 weight-only (fp16 compute)`).
 
 ## Endpoints
 
-`GET /health`, `POST /generate`, `POST /continue`, `POST /extend`. All generation
-endpoints accept optional `prompt` (tags), `lyrics`, `style_audio` (file), and
-`style_weight`.
+`GET /health`, `POST /generate`, `POST /extend`. Both generation endpoints accept
+optional `prompt` (tags), `lyrics`, `style_audio` (file), and `style_weight`.
 
 **Sampling fields (HTTP form):** `temperature` / `top_k` / `top_p` are **scalars
 only** — passing a list (`[0.9,...]`) returns HTTP 422. For per-codebook control use
@@ -87,12 +86,14 @@ curl -X POST http://localhost:8000/generate \
 Other `/generate` knobs: `cfg_scale` (default 3.0), `negative_prompt`, `sweeten`
 (default on). From-scratch generation always seeds from a random DAC column.
 
-`/continue` (extend an uploaded clip) and `/extend` (use a clip's tail as prompt)
-take a multipart `audio=@file.mp3` plus `add_seconds` / `prompt_seconds` /
-`overlap_seconds`. Chain `/extend` to grow clips past the ~95s single-shot limit.
+`/extend` continues a clip forward from a point in time. It takes a multipart
+`audio=@file.mp3` plus `add_seconds`, `overlap_seconds` (seed window before the cut
+point), and optional `from_seconds` (the cut point T — keep the original up to T,
+regenerate after; defaults to the clip's tail = seamless append). Chain `/extend` to
+grow clips past the ~95s single-shot limit.
 
 See the **Inference** section of [README.md](../../../README.md) for the full curl
-set (style blending, continue, extend).
+set (style blending, extend).
 
 ## Comes from
 

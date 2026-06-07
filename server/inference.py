@@ -277,92 +277,12 @@ class InferenceEngine:
         return torch.float16
 
     @torch.no_grad()
-    def continue_audio(
-        self,
-        mp3_bytes: bytes,
-        add_seconds: float = 25.0,
-        prompt_seconds: float | None = None,
-        prompt_start: float = 0.0,
-        temperature: float | list[float] = 0.9,
-        top_k: int | None | list[int | None] = 50,
-        top_p: float | None | list[float | None] = 0.95,
-        cfg_scale: float = 3.0,
-        text: str | None = None,
-        negative_text: str | None = None,
-        style_audio_bytes: bytes | None = None,
-        style_weight: float = 0.5,
-        lyric_cfg_scale: float | None = None,
-    ) -> tuple[bytes, str]:
-        """Take an mp3 prompt, return (audio_bytes, mime_type) of the continuation.
-
-        The seed is the window ``[prompt_start, prompt_start + prompt_seconds]`` of
-        the uploaded clip (``prompt_start`` defaults to 0 = the head, the historical
-        behavior; ``prompt_seconds=None`` runs to the clip end). Tries to return
-        mp3; falls back to wav if the ffmpeg backend is unavailable. The returned
-        audio is [seed_window | new_audio] concatenated.
-        """
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            f.write(mp3_bytes)
-            in_path = f.name
-        try:
-            prompt_tokens = self.codec.encode(in_path)  # [K, T_prompt]
-        finally:
-            os.unlink(in_path)
-
-        # Select the seed window [prompt_start, prompt_start + prompt_seconds].
-        if prompt_start > 0:
-            start_frame = int(prompt_start * self.codec.FRAME_RATE_HZ)
-            prompt_tokens = prompt_tokens[:, start_frame:]
-        if prompt_seconds is not None:
-            max_prompt_frames = int(prompt_seconds * self.codec.FRAME_RATE_HZ)
-            if prompt_tokens.shape[1] > max_prompt_frames:
-                prompt_tokens = prompt_tokens[:, :max_prompt_frames]
-        if prompt_tokens.shape[1] == 0:
-            raise ValueError("Selected prompt window is empty; widen the selection.")
-
-        # cap so the delayed sequence fits in the model's positional window
-        K = self.model.cfg.n_codebooks
-        max_total = self.model.cfg.max_seq_len - K + 1  # T_total such that T_total + K - 1 <= max_seq_len
-        new_frames = int(add_seconds * self.codec.FRAME_RATE_HZ)
-        if prompt_tokens.shape[1] + new_frames > max_total:
-            new_frames = max(0, max_total - prompt_tokens.shape[1])
-        if new_frames == 0:
-            raise ValueError("Prompt already at max context; cannot generate more.")
-
-        prompt_tokens = prompt_tokens.to(self.device)
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight)
-        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
-        out_tokens = self.model.generate(
-            prompt_tokens, num_new_frames=new_frames,
-            temperature=temperature, top_k=top_k, top_p=top_p,
-            text_emb=cond_emb, text_emb_neg=neg_emb,
-            lyric_ids=cond_lids, lyric_mask=cond_lmask,
-            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
-            cfg_scale=cfg_scale if (cond_emb is not None or neg_emb is not None
-                                    or cond_lids is not None or neg_lids is not None) else 1.0,
-            lyric_cfg_scale=lyric_cfg_scale,
-        )  # [K, T_total]
-
-        wav = self.codec.decode(out_tokens.cpu())  # [samples] mono
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)
-
-        meta = self._gen_metadata(
-            "continue", text=text, negative_text=negative_text,
-            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
-            style_weight=style_weight if style_audio_bytes else None,
-            add_seconds=add_seconds, prompt_seconds=prompt_seconds,
-            prompt_start=prompt_start if prompt_start > 0 else None,
-        )
-        return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
-
-    @torch.no_grad()
     def extend_audio(
         self,
         full_audio_bytes: bytes,
         add_seconds: float = 20.0,
         overlap_seconds: float = 8.0,
-        overlap_start: float | None = None,
+        from_seconds: float | None = None,
         temperature: float | list[float] = 0.9,
         top_k: int | None | list[int | None] = 50,
         top_p: float | None | list[float | None] = 0.95,
@@ -373,12 +293,17 @@ class InferenceEngine:
         style_weight: float = 0.5,
         lyric_cfg_scale: float | None = None,
     ) -> tuple[bytes, str]:
-        """Take the full current clip, seed from a window of it, return original + new audio.
+        """Continue a clip forward from a point in time. Returns [original 0→T | new].
 
-        The seed window is ``[overlap_start, overlap_start + overlap_seconds]``.
-        When ``overlap_start is None`` (default) it's the clip's tail — the
-        historical behavior that continues seamlessly. Lets the UI grow a clip past
-        the model's single-shot cap by chaining; each call adds ~add_seconds.
+        ``from_seconds`` (T) is the cut point: the original is kept verbatim up to T
+        and the model generates forward from there, *discarding* whatever the clip
+        had after T. The seed is the ``overlap_seconds`` immediately before T. When
+        ``from_seconds is None`` (default) T is the clip's end, so nothing is dropped
+        and you get ``[full original | new]`` — the historical behavior.
+
+        The kept prefix is the raw uploaded waveform (never re-decoded through DAC),
+        and only the small seed window counts against the context budget, so this
+        chains a clip past the model's single-shot cap; each call adds ~add_seconds.
         """
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             f.write(full_audio_bytes)
@@ -390,17 +315,21 @@ class InferenceEngine:
         finally:
             os.unlink(in_path)
 
-        overlap_frames = max(1, min(
-            int(overlap_seconds * self.codec.FRAME_RATE_HZ),
-            full_tokens.shape[1],
-        ))
-        if overlap_start is None:
-            prompt_tokens = full_tokens[:, -overlap_frames:]  # tail
+        # Cut point T (in frames): the end of the original we keep, and where the
+        # model picks up. None = the clip's tail (keep everything, append to end).
+        if from_seconds is None:
+            cut_frame = full_tokens.shape[1]
         else:
-            s = max(0, int(overlap_start * self.codec.FRAME_RATE_HZ))
-            prompt_tokens = full_tokens[:, s:s + overlap_frames]
+            cut_frame = max(1, min(
+                int(from_seconds * self.codec.FRAME_RATE_HZ),
+                full_tokens.shape[1],
+            ))
+        # Seed = the overlap_seconds immediately before T.
+        overlap_frames = max(1, int(overlap_seconds * self.codec.FRAME_RATE_HZ))
+        seed_start = max(0, cut_frame - overlap_frames)
+        prompt_tokens = full_tokens[:, seed_start:cut_frame]
         if prompt_tokens.shape[1] == 0:
-            raise ValueError("Selected overlap window is empty; widen the selection.")
+            raise ValueError("Selected seed window is empty; move the point later or widen overlap_seconds.")
 
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
@@ -429,13 +358,22 @@ class InferenceEngine:
         if new_wav.dim() == 1:
             new_wav = new_wav.unsqueeze(0)
 
-        full = torch.cat([full_wav, new_wav], dim=1)
+        # Keep the raw original up to T, then append the continuation. The tail
+        # default keeps the whole clip exactly (no frame→sample rounding loss).
+        if from_seconds is None:
+            keep_samples = full_wav.shape[1]
+        else:
+            keep_samples = min(
+                int(round(cut_frame / self.codec.FRAME_RATE_HZ * self.codec.SAMPLE_RATE)),
+                full_wav.shape[1],
+            )
+        full = torch.cat([full_wav[:, :keep_samples], new_wav], dim=1)
         meta = self._gen_metadata(
             "extend", text=text, negative_text=negative_text,
             temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
             style_weight=style_weight if style_audio_bytes else None,
             add_seconds=add_seconds, overlap_seconds=overlap_seconds,
-            overlap_start=overlap_start,
+            from_seconds=from_seconds,
         )
         return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
 

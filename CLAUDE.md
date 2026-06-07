@@ -53,8 +53,8 @@ Each stream drops independently for classifier-free guidance (10% each during tr
 - `modal_inspect_ckpts.py` — Inspect a checkpoint trajectory on the volume. `modal run diskrot/modal_inspect_ckpts.py --prefix v7_1500m`.
 
 ### Server (`server/`)
-- `main.py` — FastAPI app with endpoints: GET /health, POST /generate, POST /continue, POST /extend. All generation endpoints accept optional text, lyrics, style_audio, and style_weight params.
-- `inference.py` — InferenceEngine. Loads checkpoint, handles float16 casting and torch.compile. continue_audio(), extend_audio(), generate_audio() methods.
+- `main.py` — FastAPI app with endpoints: GET /health, POST /generate, POST /extend. All generation endpoints accept optional text, lyrics, style_audio, and style_weight params. (`/extend` continues a clip forward from a cut point `from_seconds`, defaulting to the clip tail.)
+- `inference.py` — InferenceEngine. Loads checkpoint, handles float16 casting and torch.compile. generate_audio(), extend_audio() methods.
 
 ### Scripts (`scripts/`)
 - `dac_roundtrip.py` — DAC encode/decode sanity check. Writes orig + reconstructed WAVs.

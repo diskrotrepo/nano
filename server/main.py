@@ -5,9 +5,13 @@ Run:
 
 Endpoints:
     GET  /health
-    POST /generate       form params, optional text + style_audio conditioning
-    POST /continue       multipart: audio file + optional text/style_audio conditioning
-    POST /extend         multipart: audio file + optional text/style_audio conditioning
+    POST /generate       from scratch — random seed → fresh clip
+    POST /extend         continue forward from a point T → [original 0→T | new]
+
+Both accept optional text (tags), lyrics, and style_audio conditioning. /extend
+seeds from the overlap_seconds before a cut point T, keeps the original up to T,
+and generates forward (T defaults to the clip end, a seamless grow-the-clip).
+See each endpoint's docstring (surfaced in /docs).
 """
 from __future__ import annotations
 
@@ -109,55 +113,6 @@ def health() -> dict:
     }
 
 
-@app.post("/continue")
-async def continue_endpoint(
-    audio: UploadFile = File(...),
-    add_seconds: float = Form(25.0),
-    prompt_seconds: float = Form(8.0),
-    prompt_start: float = Form(0.0),
-    temperature: float = Form(0.9),
-    top_k: int = Form(50),
-    top_p: float = Form(0.95),
-    per_cb_temperature: str = Form(""),
-    per_cb_top_k: str = Form(""),
-    per_cb_top_p: str = Form(""),
-    cfg_scale: float = Form(3.0),
-    prompt: str = Form(""),
-    lyrics: str = Form(""),
-    negative_prompt: str = Form(""),
-    sweeten: bool = Form(True),
-    style_audio: UploadFile | None = File(None),
-    style_weight: float = Form(0.5),
-    lyric_cfg_scale: float = Form(0.0),
-) -> Response:
-    assert engine is not None
-    data = await audio.read()
-    if not data:
-        raise HTTPException(400, "empty audio upload")
-    style_bytes = (await style_audio.read()) if style_audio else None
-    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
-    try:
-        body, mime = engine.continue_audio(
-            data,
-            add_seconds=add_seconds,
-            prompt_seconds=prompt_seconds if prompt_seconds > 0 else None,
-            prompt_start=max(0.0, prompt_start),
-            temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
-            top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
-            top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
-            cfg_scale=cfg_scale,
-            text=combined,
-            negative_text=negative_prompt.strip() or None,
-            style_audio_bytes=style_bytes or None,
-            style_weight=style_weight,
-            lyric_cfg_scale=lyric_cfg_scale or None,
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return Response(content=body, media_type=mime, headers=sweet_headers)
-
-
 @app.post("/generate")
 async def generate_endpoint(
     seconds: float = Form(30.0),
@@ -177,7 +132,12 @@ async def generate_endpoint(
     lyric_cfg_scale: float = Form(0.0),
     score_clap: bool = Form(False),
 ) -> Response:
-    """Generate audio from scratch. Optional text and/or style_audio conditioning.
+    """Generate audio from scratch — no audio input. Returns a fresh clip.
+
+    Bootstraps the autoregressive loop from a random DAC seed and produces
+    `seconds` of audio, steered entirely by the optional text / lyrics /
+    style_audio conditioning. This is the starting point; /extend builds on an
+    existing clip instead.
 
     score_clap: when true and a text prompt is present, the CLAP text<->audio
         adherence of the generated clip is returned in the X-Nano-Clap-Score
@@ -225,7 +185,7 @@ async def extend_endpoint(
     audio: UploadFile = File(...),
     add_seconds: float = Form(20.0),
     overlap_seconds: float = Form(8.0),
-    overlap_start: float = Form(-1.0),
+    from_seconds: float = Form(-1.0),
     temperature: float = Form(0.9),
     top_k: int = Form(50),
     top_p: float = Form(0.95),
@@ -241,7 +201,17 @@ async def extend_endpoint(
     style_weight: float = Form(0.5),
     lyric_cfg_scale: float = Form(0.0),
 ) -> Response:
-    """Append more audio onto the end of an existing clip. Returns original + new."""
+    """Continue a clip forward from a point in time. Returns [original 0→T | new].
+
+    `from_seconds` (T) is the cut point: the original is kept verbatim from the
+    start up to T, the model generates add_seconds forward from there, and whatever
+    the clip had after T is discarded. The seed is the `overlap_seconds` just
+    before T. Omit from_seconds (or pass <0) to use the clip's tail — then nothing
+    is dropped and you get [full original | new], the seamless grow-the-clip case.
+
+    Only the small seed window counts against the context budget, so call this
+    repeatedly to chain a clip past the model's single-shot length cap.
+    """
     assert engine is not None
     data = await audio.read()
     if not data:
@@ -254,7 +224,7 @@ async def extend_endpoint(
             data,
             add_seconds=add_seconds,
             overlap_seconds=overlap_seconds,
-            overlap_start=overlap_start if overlap_start >= 0 else None,
+            from_seconds=from_seconds if from_seconds >= 0 else None,
             temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),

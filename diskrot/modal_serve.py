@@ -1,8 +1,8 @@
 """Modal entrypoint for the nano inference server.
 
 Serves the existing FastAPI app (``server/main.py``) on a GPU container, loading
-the checkpoint from the ``nano-ckpts`` volume. The same /health, /generate,
-/continue and /extend endpoints are exposed over a public HTTPS URL.
+the checkpoint from the ``nano-ckpts`` volume. The same /health, /generate and
+/extend endpoints are exposed over a public HTTPS URL.
 
 Setup (one-time):
     pip install modal
