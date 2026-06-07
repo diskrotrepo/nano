@@ -3,17 +3,15 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-enum NanoMode { generate, continueAudio, extend }
+enum NanoMode { generate, extend }
 
 extension NanoModeX on NanoMode {
   String get path => switch (this) {
         NanoMode.generate => '/generate',
-        NanoMode.continueAudio => '/continue',
         NanoMode.extend => '/extend',
       };
   String get label => switch (this) {
         NanoMode.generate => 'generate',
-        NanoMode.continueAudio => 'continue',
         NanoMode.extend => 'extend',
       };
 }
@@ -59,11 +57,10 @@ class GenParams {
   double seconds = 30.0;
   bool scoreClap = false;
 
-  // continue / extend
+  // extend
   AudioFile? inputAudio;
-  double addSeconds = 25.0; // continue default; extend uses 20 (set on switch)
-  double promptSeconds = 8.0; // continue
-  double overlapSeconds = 8.0; // extend
+  double addSeconds = 20.0;
+  double overlapSeconds = 8.0;
 }
 
 class NanoResult {
@@ -142,14 +139,6 @@ class NanoApi {
       case NanoMode.generate:
         f['seconds'] = p.seconds.toString();
         f['score_clap'] = p.scoreClap.toString();
-      case NanoMode.continueAudio:
-        _requireInput(p);
-        f['add_seconds'] = p.addSeconds.toString();
-        f['prompt_seconds'] = p.promptSeconds.toString();
-        req.files.add(http.MultipartFile.fromBytes(
-          'audio', p.inputAudio!.bytes,
-          filename: p.inputAudio!.name,
-        ));
       case NanoMode.extend:
         _requireInput(p);
         f['add_seconds'] = p.addSeconds.toString();

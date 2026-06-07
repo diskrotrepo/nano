@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:js_interop';
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
@@ -25,6 +26,10 @@ class AudioBlob {
   }
 
   void revoke() => web.URL.revokeObjectURL(url);
+
+  /// Read this clip's duration (seconds) from a detached `<audio>` element's
+  /// metadata. Returns 0 if it can't be determined.
+  Future<double> duration() => audioDurationSeconds(url);
 
   void download(String filename) {
     final a = web.document.createElement('a') as web.HTMLAnchorElement
@@ -325,4 +330,105 @@ class _WaveformPainter extends CustomPainter {
   @override
   bool shouldRepaint(_WaveformPainter old) =>
       old.progress != progress || !identical(old.peaks, peaks);
+}
+
+/// Read an audio clip's duration (seconds) from its blob URL via a detached
+/// `<audio>` element's metadata. Returns 0 if it can't be determined.
+Future<double> audioDurationSeconds(String url) {
+  final c = Completer<double>();
+  final el = web.document.createElement('audio') as web.HTMLAudioElement
+    ..preload = 'metadata'
+    ..src = url;
+  void finish(double v) {
+    if (!c.isCompleted) c.complete(v);
+  }
+
+  el.addEventListener('loadedmetadata', (web.Event _) {
+    final d = el.duration;
+    finish(d.isFinite && d > 0 ? d : 0);
+  }.toJS);
+  el.addEventListener('error', (web.Event _) {
+    finish(0);
+  }.toJS);
+  return c.future;
+}
+
+/// One shared `<audio>` element backing the whole clip library, so only one
+/// clip can ever play at a time: pressing play on a clip stops whatever was
+/// playing. A [ChangeNotifier] so each clip card can reflect its own playing
+/// state and the live playback progress (0..1).
+class ClipPlayer extends ChangeNotifier {
+  ClipPlayer() {
+    _audio = web.document.createElement('audio') as web.HTMLAudioElement
+      ..preload = 'auto';
+    _audio.addEventListener('timeupdate', (web.Event _) {
+      final d = _audio.duration;
+      if (d.isFinite && d > 0) {
+        _progress = _audio.currentTime / d;
+        notifyListeners();
+      }
+    }.toJS);
+    _audio.addEventListener('ended', (web.Event _) {
+      _playing = false;
+      _progress = 1.0;
+      notifyListeners();
+    }.toJS);
+  }
+
+  late final web.HTMLAudioElement _audio;
+  String? _currentId;
+  bool _playing = false;
+  double _progress = 0;
+
+  String? get currentId => _currentId;
+  bool get isPlaying => _playing;
+  double get progress => _progress;
+  bool isCurrent(String id) => _currentId == id;
+
+  /// Play/pause [id] (backed by blob [url]). Starting a different clip swaps the
+  /// source and stops the previous one.
+  void toggle(String id, String url) {
+    if (_currentId == id) {
+      if (_playing) {
+        _audio.pause();
+        _playing = false;
+      } else {
+        if (_audio.ended || _progress >= 1.0) {
+          _audio.currentTime = 0;
+          _progress = 0;
+        }
+        _audio.play();
+        _playing = true;
+      }
+      notifyListeners();
+      return;
+    }
+    _audio.pause();
+    _audio.src = url;
+    _audio.currentTime = 0;
+    _currentId = id;
+    _progress = 0;
+    _playing = true;
+    _audio.play();
+    notifyListeners();
+  }
+
+  /// Stop and forget [id] if it's the one currently loaded (used when a clip is
+  /// removed from the library).
+  void stopIfCurrent(String id) {
+    if (_currentId != id) return;
+    _audio.pause();
+    _audio.removeAttribute('src');
+    _currentId = null;
+    _playing = false;
+    _progress = 0;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _audio.pause();
+    _audio.removeAttribute('src');
+    super.dispose();
+  }
 }

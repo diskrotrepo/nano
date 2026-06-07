@@ -9,9 +9,8 @@ void main() {
     // request that never resolves under test.
     await tester.pump();
 
-    expect(find.text('nano'), findsOneWidget);
+    expect(find.textContaining('diskrot'), findsOneWidget);
     expect(find.text('generate'), findsWidgets);
-    expect(find.text('continue'), findsWidgets);
     expect(find.text('extend'), findsWidgets);
   });
 }

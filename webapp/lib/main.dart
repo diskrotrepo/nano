@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
@@ -5,6 +7,9 @@ import 'api.dart';
 import 'audio_web.dart';
 import 'theme.dart';
 import 'widgets.dart';
+
+/// Height of the fixed top bar the left/right panels scroll behind.
+const double _kTopBarHeight = 60;
 
 void main() => runApp(const NanoApp());
 
@@ -14,7 +19,7 @@ class NanoApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'nano',
+      title: 'diskrot///nano',
       debugShowCheckedModeBanner: false,
       theme: buildNanoTheme(),
       home: const HomePage(),
@@ -46,8 +51,9 @@ class _HomePageState extends State<HomePage> {
   HealthInfo? _health;
   bool _healthLoading = false;
 
-  NanoResult? _result;
-  AudioBlob? _blob;
+  final List<GenClip> _clips = [];
+  final ClipPlayer _player = ClipPlayer();
+  int _clipSeq = 0;
 
   @override
   void initState() {
@@ -57,7 +63,10 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
-    _blob?.revoke();
+    _player.dispose();
+    for (final clip in _clips) {
+      clip.blob?.revoke();
+    }
     for (final c in [
       _serverCtl, _promptCtl, _lyricsCtl, _negCtl,
       _perTempCtl, _perTopKCtl, _perTopPCtl,
@@ -104,21 +113,44 @@ class _HomePageState extends State<HomePage> {
       ..perCbTopK = _perTopKCtl.text
       ..perCbTopP = _perTopPCtl.text;
 
+    final clip = GenClip(
+      id: _clipSeq++,
+      mode: _mode,
+      prompt: _promptCtl.text.trim(),
+      lyrics: _lyricsCtl.text.trim(),
+    );
     setState(() {
       _busy = true;
       _error = null;
+      _clips.insert(0, clip);
     });
     try {
       final result = await _api.run(_mode, _params);
-      _blob?.revoke();
       final blob = AudioBlob.fromBytes(result.bytes, result.mime);
-      if (!mounted) return;
+      final dur = await blob.duration();
+      if (!mounted) {
+        blob.revoke();
+        return;
+      }
       setState(() {
-        _result = result;
-        _blob = blob;
+        clip
+          ..status = ClipStatus.ready
+          ..bytes = result.bytes
+          ..mime = result.mime
+          ..blob = blob
+          ..durationSeconds = dur
+          ..clapScore = result.clapScore
+          ..sweetened = result.sweetened;
       });
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      if (mounted) {
+        setState(() {
+          clip
+            ..status = ClipStatus.error
+            ..error = '$e';
+          _error = '$e';
+        });
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -127,65 +159,180 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 640),
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(20, 28, 20, 60),
-            children: [
-              _header(),
-              const SizedBox(height: 22),
-              _modeSelector(),
-              const SizedBox(height: 18),
-              _conditioningCard(),
-              _samplingCard(),
-              _modeCard(),
-              _runButton(),
-              if (_error != null) _errorBox(),
-              if (_result != null && _blob != null) _resultCard(),
-            ],
-          ),
+      body: SafeArea(
+        bottom: false,
+        // The left + right panels fill the whole area and scroll *behind* a
+        // fixed top bar (overlaid via the Stack). Each scroll view starts with
+        // top padding equal to the bar height so nothing hides under it at rest.
+        child: Stack(
+          children: [
+            Positioned.fill(child: _body()),
+            Positioned(top: 0, left: 0, right: 0, child: _topBar()),
+          ],
         ),
       ),
     );
+  }
+
+  Widget _body() {
+    // Panels scroll under the bar, so the first item sits just below it.
+    const topInset = _kTopBarHeight + 8;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= 900;
+        if (wide) {
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SizedBox(
+                width: 560,
+                child: ListView(
+                  padding: const EdgeInsets.fromLTRB(20, topInset, 20, 48),
+                  children: _controlsChildren(),
+                ),
+              ),
+              const VerticalDivider(width: 1, color: NanoColors.border),
+              Expanded(
+                child: ListView(
+                  padding: const EdgeInsets.fromLTRB(20, topInset, 20, 48),
+                  children: _libraryChildren(),
+                ),
+              ),
+            ],
+          );
+        }
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(20, topInset, 20, 48),
+          children: [
+            ..._controlsChildren(),
+            const SizedBox(height: 8),
+            const Divider(height: 1, color: NanoColors.border),
+            const SizedBox(height: 16),
+            ..._libraryChildren(),
+          ],
+        );
+      },
+    );
+  }
+
+  /// Fixed full-width bar: branding + "audio generation" tagline on the left,
+  /// the online/offline health pill on the right. The panels scroll behind it.
+  Widget _topBar() {
+    return Container(
+      height: _kTopBarHeight,
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      decoration: const BoxDecoration(
+        color: NanoColors.surface,
+        border: Border(bottom: BorderSide(color: NanoColors.border)),
+      ),
+      child: Row(
+        children: [
+          const Text.rich(
+            TextSpan(
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.w900,
+                letterSpacing: -0.5,
+                color: NanoColors.text,
+              ),
+              children: [
+                TextSpan(text: 'diskrot'),
+                WidgetSpan(child: SizedBox(width: 3)),
+                TextSpan(text: '///', style: TextStyle(color: NanoColors.pink)),
+                WidgetSpan(child: SizedBox(width: 3)),
+                TextSpan(text: 'nano'),
+              ],
+            ),
+            semanticsLabel: 'diskrot///nano',
+          ),
+          const SizedBox(width: 12),
+          const Flexible(
+            child: Text(
+              'audio generation',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: NanoColors.textDim, fontSize: 13),
+            ),
+          ),
+          const Spacer(),
+          _healthPill(),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _controlsChildren() {
+    return [
+      _header(),
+      const SizedBox(height: 22),
+      _modeSelector(),
+      const SizedBox(height: 18),
+      _conditioningCard(),
+      _samplingCard(),
+      _modeCard(),
+      _runButton(),
+      if (_error != null) _errorBox(),
+    ];
+  }
+
+  List<Widget> _libraryChildren() {
+    return [
+      Row(
+        children: [
+          const Text(
+            'LIBRARY',
+            style: TextStyle(
+              color: NanoColors.pink,
+              fontSize: 11,
+              letterSpacing: 2,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '${_clips.length}',
+            style: const TextStyle(color: NanoColors.textDim, fontSize: 11),
+          ),
+        ],
+      ),
+      const SizedBox(height: 14),
+      if (_clips.isEmpty)
+        const Padding(
+          padding: EdgeInsets.only(top: 48),
+          child: Center(
+            child: Text(
+              'generated clips will appear here',
+              style: TextStyle(color: NanoColors.textDim, fontSize: 13),
+            ),
+          ),
+        )
+      else
+        for (final clip in _clips)
+          ClipCard(
+            key: ValueKey(clip.id),
+            clip: clip,
+            player: _player,
+            onToggle: () =>
+                _player.toggle(clip.id.toString(), clip.blob!.url),
+            onDownload: () {
+              final ext = (clip.mime ?? '').contains('wav') ? 'wav' : 'mp3';
+              clip.blob?.download('nano-${clip.mode.label}-${clip.id}.$ext');
+            },
+            onDelete: () => _deleteClip(clip),
+          ),
+    ];
+  }
+
+  void _deleteClip(GenClip clip) {
+    _player.stopIfCurrent(clip.id.toString());
+    clip.blob?.revoke();
+    setState(() => _clips.remove(clip));
   }
 
   Widget _header() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.baseline,
-          textBaseline: TextBaseline.alphabetic,
-          children: [
-            const Text(
-              'nano',
-              style: TextStyle(
-                fontSize: 34,
-                fontWeight: FontWeight.w900,
-                letterSpacing: -1,
-                color: NanoColors.text,
-              ),
-            ),
-            const Text(
-              '.',
-              style: TextStyle(
-                fontSize: 34,
-                fontWeight: FontWeight.w900,
-                color: NanoColors.pink,
-              ),
-            ),
-            const SizedBox(width: 12),
-            const Padding(
-              padding: EdgeInsets.only(bottom: 6),
-              child: Text('audio generation',
-                  style: TextStyle(color: NanoColors.textDim, fontSize: 13)),
-            ),
-            const Spacer(),
-            _healthPill(),
-          ],
-        ),
-        const SizedBox(height: 14),
         Row(
           children: [
             Expanded(
@@ -291,13 +438,6 @@ class _HomePageState extends State<HomePage> {
           hint: 'what to steer away from',
           help: 'Classifier-free guidance pushes away from this prompt.',
         ),
-        ToggleRow(
-          label: 'sweeten prompt',
-          value: _params.sweeten,
-          help: 'Rewrite the tags prompt into LP-MusicCaps caption style to '
-              'strengthen CLAP adherence. On by default.',
-          onChanged: (v) => setState(() => _params.sweeten = v),
-        ),
         const SizedBox(height: 10),
         _styleAudioRow(),
         if (_params.styleAudio != null)
@@ -331,6 +471,21 @@ class _HomePageState extends State<HomePage> {
       collapsible: true,
       initiallyExpanded: false,
       children: [
+        ToggleRow(
+          label: 'sweeten prompt',
+          value: _params.sweeten,
+          help: 'Rewrite the tags prompt into LP-MusicCaps caption style to '
+              'strengthen CLAP adherence. On by default.',
+          onChanged: (v) => setState(() => _params.sweeten = v),
+        ),
+        if (_mode == NanoMode.generate)
+          ToggleRow(
+            label: 'score CLAP adherence',
+            value: _params.scoreClap,
+            help: 'Return text<->audio CLAP similarity in a response header.',
+            onChanged: (v) => setState(() => _params.scoreClap = v),
+          ),
+        const SizedBox(height: 10),
         LabeledSlider(
           label: 'creativity',
           value: _params.temperature,
@@ -491,41 +646,6 @@ class _HomePageState extends State<HomePage> {
               help: 'Single-shot generation length (max ~95s).',
               onChanged: (v) => setState(() => _params.seconds = v),
             ),
-            const SizedBox(height: 12),
-            ToggleRow(
-              label: 'score CLAP adherence',
-              value: _params.scoreClap,
-              help: 'Return text<->audio CLAP similarity in a response header.',
-              onChanged: (v) => setState(() => _params.scoreClap = v),
-            ),
-          ],
-        ),
-      NanoMode.continueAudio => SectionCard(
-          title: 'continue',
-          children: [
-            _inputAudioRow(),
-            const SizedBox(height: 8),
-            LabeledSlider(
-              label: 'add_seconds',
-              value: _params.addSeconds,
-              min: 1,
-              max: 90,
-              fractionDigits: 0,
-              suffix: 's',
-              help: 'How much new audio to generate after the prompt.',
-              onChanged: (v) => setState(() => _params.addSeconds = v),
-            ),
-            LabeledSlider(
-              label: 'prompt_seconds',
-              value: _params.promptSeconds,
-              min: 0,
-              max: 30,
-              fractionDigits: 0,
-              suffix: 's',
-              help: 'How much of the uploaded clip to use as the prompt '
-                  '(0 = use all).',
-              onChanged: (v) => setState(() => _params.promptSeconds = v),
-            ),
           ],
         ),
       NanoMode.extend => SectionCard(
@@ -671,56 +791,267 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _resultCard() {
-    final r = _result!;
-    final ext = r.mime.contains('wav') ? 'wav' : 'mp3';
-    return SectionCard(
-      title: 'output',
-      children: [
-        WaveformPlayer(
-            key: ValueKey(_blob!.url), url: _blob!.url, bytes: r.bytes),
-        const SizedBox(height: 14),
-        Row(
-          children: [
-            OutlinedButton.icon(
-              onPressed: () => _blob!.download('nano-${_mode.label}.$ext'),
-              icon: const Icon(Icons.download, size: 16),
-              label: Text('download .$ext'),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: NanoColors.pink,
-                side: const BorderSide(color: NanoColors.pink),
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(4)),
+}
+
+/// One generated clip in the library: its request (mode + prompt + lyrics) plus,
+/// once the request resolves, the audio bytes/blob, measured length, and any
+/// CLAP score / sweetened prompt the server returned.
+enum ClipStatus { generating, ready, error }
+
+class GenClip {
+  GenClip({
+    required this.id,
+    required this.mode,
+    required this.prompt,
+    required this.lyrics,
+  });
+
+  final int id;
+  final NanoMode mode;
+  final String prompt;
+  final String lyrics;
+
+  ClipStatus status = ClipStatus.generating;
+  Uint8List? bytes;
+  String? mime;
+  AudioBlob? blob;
+  double? durationSeconds;
+  double? clapScore;
+  String? sweetened;
+  String? error;
+}
+
+String _fmtLen(double? s) {
+  if (s == null || s <= 0) return '—';
+  if (s >= 60) {
+    final m = s ~/ 60;
+    final sec = (s % 60).round().toString().padLeft(2, '0');
+    return '$m:$sec';
+  }
+  return '${s.toStringAsFixed(1)}s';
+}
+
+/// A library row: play/pause (driven by the shared [ClipPlayer] so only one
+/// clip plays at a time), the prompt, the clip length, a live playback bar, and
+/// download / remove actions. Shows a spinner while generating and the error if
+/// the request failed.
+class ClipCard extends StatelessWidget {
+  const ClipCard({
+    super.key,
+    required this.clip,
+    required this.player,
+    required this.onToggle,
+    required this.onDownload,
+    required this.onDelete,
+  });
+
+  final GenClip clip;
+  final ClipPlayer player;
+  final VoidCallback onToggle;
+  final VoidCallback onDownload;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: player,
+      builder: (context, _) {
+        final ready = clip.status == ClipStatus.ready;
+        final isCurrent = player.isCurrent(clip.id.toString());
+        final isPlaying = isCurrent && player.isPlaying;
+        final progress = isCurrent ? player.progress : 0.0;
+
+        return Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: NanoColors.surface,
+            border: Border.all(
+                color: isCurrent ? NanoColors.pink : NanoColors.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _leading(isPlaying),
+                  const SizedBox(width: 12),
+                  Expanded(child: _body(ready)),
+                  const SizedBox(width: 8),
+                  _lengthChip(),
+                ],
               ),
-            ),
-            const Spacer(),
-            if (r.clapScore != null)
-              Text('CLAP ${r.clapScore!.toStringAsFixed(3)}',
+              if (ready) ...[
+                const SizedBox(height: 10),
+                _progressBar(progress),
+              ],
+              if (ready && clip.sweetened != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  clip.sweetened!,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                      color: NanoColors.pink,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 12)),
-          ],
+                    color: NanoColors.textDim,
+                    fontSize: 11,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 4),
+              _footer(ready),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _leading(bool isPlaying) {
+    if (clip.status == ClipStatus.generating) {
+      return const SizedBox(
+        width: 38,
+        height: 38,
+        child: Padding(
+          padding: EdgeInsets.all(9),
+          child: CircularProgressIndicator(
+              strokeWidth: 2, color: NanoColors.pink),
         ),
-        if (r.sweetened != null) ...[
-          const SizedBox(height: 14),
-          const _SubLabel('sweetened prompt'),
+      );
+    }
+    if (clip.status == ClipStatus.error) {
+      return Container(
+        width: 38,
+        height: 38,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: NanoColors.error),
+        ),
+        child: const Icon(Icons.error_outline,
+            color: NanoColors.error, size: 20),
+      );
+    }
+    return InkWell(
+      onTap: onToggle,
+      customBorder: const CircleBorder(),
+      child: Container(
+        width: 38,
+        height: 38,
+        alignment: Alignment.center,
+        decoration: const BoxDecoration(
+            shape: BoxShape.circle, color: NanoColors.pink),
+        child: Icon(isPlaying ? Icons.pause : Icons.play_arrow,
+            color: Colors.black, size: 22),
+      ),
+    );
+  }
+
+  Widget _body(bool ready) {
+    final primary = switch (clip.status) {
+      ClipStatus.generating => 'generating…',
+      ClipStatus.error => clip.error ?? 'failed',
+      ClipStatus.ready => clip.prompt.isEmpty ? '(no prompt)' : clip.prompt,
+    };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          primary,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: clip.status == ClipStatus.error
+                ? NanoColors.error
+                : NanoColors.text,
+            fontSize: 13,
+            height: 1.25,
+          ),
+        ),
+        if (ready && clip.lyrics.isNotEmpty) ...[
           const SizedBox(height: 4),
-          Text(r.sweetened!,
-              style: const TextStyle(
-                  color: NanoColors.textDim,
-                  fontSize: 12,
-                  fontStyle: FontStyle.italic)),
+          Row(
+            children: [
+              const Icon(Icons.music_note, size: 12, color: NanoColors.textDim),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  clip.lyrics,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: NanoColors.textDim, fontSize: 11),
+                ),
+              ),
+            ],
+          ),
         ],
       ],
     );
   }
-}
 
-class _SubLabel extends StatelessWidget {
-  const _SubLabel(this.text);
-  final String text;
-  @override
-  Widget build(BuildContext context) => Text(text,
-      style: const TextStyle(color: NanoColors.text, fontSize: 13));
+  Widget _lengthChip() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: NanoColors.surfaceAlt,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        _fmtLen(clip.durationSeconds),
+        style: const TextStyle(
+            color: NanoColors.text, fontSize: 11, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  Widget _progressBar(double progress) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(2),
+      child: Container(
+        height: 4,
+        color: NanoColors.border,
+        child: FractionallySizedBox(
+          alignment: Alignment.centerLeft,
+          widthFactor: progress.clamp(0.0, 1.0),
+          child: Container(color: NanoColors.pink),
+        ),
+      ),
+    );
+  }
+
+  Widget _footer(bool ready) {
+    return Row(
+      children: [
+        Text(clip.mode.label,
+            style: const TextStyle(color: NanoColors.textDim, fontSize: 11)),
+        if (clip.clapScore != null) ...[
+          const Text('  ·  ',
+              style: TextStyle(color: NanoColors.textDim, fontSize: 11)),
+          Text('CLAP ${clip.clapScore!.toStringAsFixed(3)}',
+              style: const TextStyle(
+                  color: NanoColors.pink,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold)),
+        ],
+        const Spacer(),
+        if (ready) _miniIcon(Icons.download, 'download', onDownload),
+        _miniIcon(Icons.close, 'remove', onDelete),
+      ],
+    );
+  }
+
+  Widget _miniIcon(IconData icon, String tip, VoidCallback onTap) {
+    return IconButton(
+      onPressed: onTap,
+      icon: Icon(icon, size: 16),
+      color: NanoColors.textDim,
+      tooltip: tip,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints(),
+      padding: const EdgeInsets.all(6),
+    );
+  }
 }
