@@ -135,6 +135,7 @@ def _build_cfg_kwargs(
     Returns a plain dict so it survives mp.spawn pickling."""
     tags_path = "/tokens/tags.json" if text_conditioned else None
     lyrics_path = "/tokens/lyrics" if text_conditioned else None
+    structure_path = "/tokens/structure" if text_conditioned else None
     return dict(
         cache_dir="/tokens",
         ckpt_dir=f"/ckpts/{ckpt_subdir}",
@@ -147,6 +148,7 @@ def _build_cfg_kwargs(
         eval_batches=eval_batches,
         tags_path=tags_path,
         lyrics_path=lyrics_path,
+        structure_path=structure_path,
         text_conditioned=text_conditioned,
         segment_seconds=segment_seconds,
         wandb_project=wandb_project,
@@ -469,6 +471,7 @@ def train_remote_multi(
         seed=_defaults.seed,
         tags_path=cfg_kwargs["tags_path"],
         lyrics_path=cfg_kwargs["lyrics_path"],
+        structure_path=cfg_kwargs["structure_path"],
     )
     tag_cache: dict = {}
     if text_conditioned and shared_bundle["tags"]:

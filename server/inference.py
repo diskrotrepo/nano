@@ -247,12 +247,20 @@ class InferenceEngine:
             if tag_emb is not None:
                 tag_emb = tag_emb.to(self._cond_dtype())
 
-        # --- Lyrics (phoneme sequence for the LyricEncoder) ---
+        # --- Lyrics (phoneme + structure-marker sequence for the LyricEncoder) ---
+        # Parses inline section tags like "[verse] ... [chorus] ..." into section
+        # markers, reproducing the dataset's train-time stream exactly (prefix +
+        # inline markers). Brackets never reach g2p; unknown labels fold to
+        # <no_section>. Plain lyrics (no brackets) get a <no_section> prefix.
         lyric_ids = lyric_mask = None
         if lyrics_str and getattr(self.model.cfg, "use_lyric_conditioning", False):
-            from model.lyric_encoder import PAD_PHONEME_ID, text_to_phoneme_ids
+            from model.lyric_encoder import (
+                PAD_PHONEME_ID, text_with_markers_to_phoneme_ids,
+            )
 
-            ids = text_to_phoneme_ids(lyrics_str, max_len=self.model.cfg.max_lyric_len)
+            ids = text_with_markers_to_phoneme_ids(
+                lyrics_str, max_len=self.model.cfg.max_lyric_len
+            )
             if ids:
                 lyric_ids = torch.tensor(ids, dtype=torch.long, device=self.device)[None]
                 lyric_mask = lyric_ids != PAD_PHONEME_ID

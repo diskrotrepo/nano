@@ -22,6 +22,7 @@ Two pieces live here:
 from __future__ import annotations
 
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -51,17 +52,57 @@ BOS_PHONEME = "<bos>"
 WORD_BOUNDARY_PHONEME = "<wb>"  # word/space/punctuation boundary
 UNK_PHONEME = "<unk>"
 
-# Frozen vocab: specials first (so PAD==0), then the ARPABET phones.
+# Song-structure markers (intro/verse/chorus/...). These ride in the SAME phoneme
+# stream as the words: the dataset injects them by section timestamp and the
+# decoder cross-attends to them, so the model learns arrangement (sing this as a
+# chorus) instead of trying to sing the literal word "chorus". The label set is
+# exactly what the allin1 structure analyzer emits (minus its start/end
+# sentinels); ``<no_section>`` is the fallback for crops/spans in a gap, so every
+# stream always carries a valid section prefix. Placed BEFORE _ARPABET so a future
+# g2p/ARPABET edit can't silently renumber the structure ids (same reasoning as
+# the frozen ARPABET ordering above). Adding/removing any of these changes
+# PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
+NO_SECTION_LABEL = "no_section"
+STRUCTURE_LABELS: tuple[str, ...] = (
+    NO_SECTION_LABEL, "intro", "verse", "chorus", "bridge",
+    "outro", "break", "inst", "solo",
+)
+_STRUCTURE_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in STRUCTURE_LABELS)
+
+# Frozen vocab: specials first (so PAD==0), then structure markers, then ARPABET.
 PHONEME_VOCAB: tuple[str, ...] = (
     PAD_PHONEME, BOS_PHONEME, WORD_BOUNDARY_PHONEME, UNK_PHONEME,
-) + _ARPABET
+) + _STRUCTURE_TOKENS + _ARPABET
 
 PHONEME_TO_ID: dict[str, int] = {p: i for i, p in enumerate(PHONEME_VOCAB)}
 PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
 BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
 WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
 UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
-PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 74
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 83 (4 specials + 9 structure + 70 ARPABET)
+
+# Structure label <-> phoneme id, the single source of truth shared by the dataset
+# (train-time injection) and inference (bracket parsing) so the two agree exactly.
+STRUCTURE_TOKEN_TO_ID: dict[str, int] = {
+    label: PHONEME_TO_ID[f"<{label}>"] for label in STRUCTURE_LABELS
+}
+ID_TO_STRUCTURE: dict[int, str] = {i: label for label, i in STRUCTURE_TOKEN_TO_ID.items()}
+NO_SECTION_ID: int = STRUCTURE_TOKEN_TO_ID[NO_SECTION_LABEL]
+STRUCTURE_IDS: frozenset[int] = frozenset(STRUCTURE_TOKEN_TO_ID.values())
+
+
+def structure_label_to_id(label: str | None) -> int:
+    """Map a structure label to its marker id, falling back to <no_section>.
+
+    Normalizes case/whitespace and folds aliases the user might type but the
+    labeler never emits (e.g. ``pre-chorus``/``prechorus`` -> no_section) so an
+    unknown bracket can never crash or leak a bogus id. The train and inference
+    paths both route section labels through this, keeping the id mapping identical.
+    """
+    if not label:
+        return NO_SECTION_ID
+    key = label.strip().lower().replace(" ", "_").replace("-", "_")
+    return STRUCTURE_TOKEN_TO_ID.get(key, NO_SECTION_ID)
 
 # Punctuation g2p_en passes through verbatim that we fold into a word boundary
 # rather than dropping (keeps phrase structure the decoder can align to).
@@ -144,6 +185,79 @@ def text_to_word_phoneme_groups(words: list[str]) -> list[list[int]]:
         [PHONEME_TO_ID[s] for s in g2p(w) if s in PHONEME_TO_ID]
         for w in words
     ]
+
+
+# --- Structure-marker stream assembly -----------------------------------------
+# The dataset (train) and the inference parser MUST build byte-identical streams.
+# Both append "units" — a section marker [id] or one word's phoneme group — under
+# a single separator rule so the encoder always sees ``<chorus> <wb> <phonemes>``.
+
+def append_unit(ids: list[int], unit: list[int]) -> None:
+    """Append a unit (one marker id, or one word's phoneme group) to ``ids``.
+
+    Inserts a WORD_BOUNDARY before the unit iff something other than the leading
+    BOS is already present (``len(ids) > 1``). This is the ONE separator rule used
+    by both the dataset injector and the inference parser; the BOS+prefix-marker
+    pair falls out of it for free (the prefix lands at ``len(ids) == 1``, so it
+    gets no boundary).
+    """
+    if not unit:
+        return
+    if len(ids) > 1:
+        ids.append(WORD_BOUNDARY_ID)
+    ids.extend(unit)
+
+
+_MARKER_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+def text_with_markers_to_phoneme_ids(
+    text: str, max_len: int | None = None, add_bos: bool = True,
+) -> list[int]:
+    """Inference-side lyric parser: ``[verse] words [chorus] words`` -> phoneme ids.
+
+    Reproduces the dataset's train-time stream exactly (see ``append_unit`` and
+    ``TokenDataset._get_segment_lyric_ids``):
+
+      ``BOS  <prefix-section>  w w  <inline-section>  w ...``
+
+    Prefix rule: if the string starts with a ``[label]`` marker it becomes the
+    section prefix (emitted once, right after BOS); otherwise the prefix is
+    ``<no_section>`` — so every stream carries a valid section, matching the dense
+    train-time prefix. Brackets are stripped here and never reach g2p (the biggest
+    train/inference footgun); unknown labels fold to ``<no_section>`` via
+    ``structure_label_to_id``. Word spans are phonemized with the same per-word
+    grouping the dataset uses (``text_to_word_phoneme_groups``).
+    """
+    parts = _MARKER_RE.split(text or "")
+    # re.split with one capture group yields: text, label, text, label, ...
+    # (even indices = text spans, odd indices = captured labels).
+    events: list[tuple[str, str]] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            events.append(("marker", part))
+        elif part.strip():
+            events.append(("text", part))
+
+    ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
+    if events and events[0][0] == "marker":
+        prefix_id = structure_label_to_id(events[0][1])
+        events = events[1:]
+    else:
+        prefix_id = NO_SECTION_ID
+    append_unit(ids, [prefix_id])
+
+    for kind, val in events:
+        if kind == "marker":
+            append_unit(ids, [structure_label_to_id(val)])
+        else:
+            for group in text_to_word_phoneme_groups(val.split()):
+                append_unit(ids, group)
+        if max_len is not None and len(ids) >= max_len:
+            break
+    if max_len is not None and len(ids) > max_len:
+        ids = ids[:max_len]
+    return ids
 
 
 # --- Encoder ------------------------------------------------------------------

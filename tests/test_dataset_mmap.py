@@ -37,9 +37,9 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     assert tokens.dtype == torch.int16
     assert tokens.shape == (9, 400)
     assert tag == ""  # no tags fixture passed
-    # no lyrics fixture → a single BOS phoneme token (see lyric_encoder)
-    from model.lyric_encoder import BOS_PHONEME_ID
-    assert lyric_ids.tolist() == [BOS_PHONEME_ID]
+    # no lyrics/structure fixture → BOS + the <no_section> prefix (see lyric_encoder)
+    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID
+    assert lyric_ids.tolist() == [BOS_PHONEME_ID, NO_SECTION_ID]
 
 
 def test_from_mmap_matches_in_memory_dataset(synth_tokens_dir):

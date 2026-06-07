@@ -55,6 +55,7 @@ class TrainConfig:
     patience: int = 20  # evals without val loss improvement before stopping (0 = disabled)
     tags_path: str | None = None  # path to tags.json for text conditioning
     lyrics_path: str | None = None  # path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning
+    structure_path: str | None = None  # path to structure (sharded dir or JSON) for section-marker conditioning
     cfg_dropout: float = 0.1  # probability of dropping text conditioning (classifier-free guidance)
 
     seed: int = 42
@@ -514,10 +515,12 @@ def train_run(
     else:
         train_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="train",
                                 val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
-                                lyrics_path=cfg.lyrics_path, max_lyric_len=cfg.model.max_lyric_len)
+                                lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
+                                max_lyric_len=cfg.model.max_lyric_len)
         val_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="val",
                               val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
-                              lyrics_path=cfg.lyrics_path, max_lyric_len=cfg.model.max_lyric_len)
+                              lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
+                              max_lyric_len=cfg.model.max_lyric_len)
 
     pin = cfg.device == "cuda"
     if use_ddp:
@@ -886,6 +889,7 @@ if __name__ == "__main__":
     p.add_argument("--ckpt-dir", default="./checkpoints")
     p.add_argument("--tags-path", type=str, default=None, help="path to tags.json for text conditioning")
     p.add_argument("--lyrics-path", type=str, default=None, help="path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning")
+    p.add_argument("--structure-path", type=str, default=None, help="path to structure (sharded dir or JSON) for section-marker conditioning")
     args = p.parse_args()
 
     # Tags drive the pooled-CLAP path (use_text_conditioning); lyrics drive the
@@ -904,6 +908,7 @@ if __name__ == "__main__":
         ckpt_dir=args.ckpt_dir,
         tags_path=args.tags_path,
         lyrics_path=args.lyrics_path,
+        structure_path=args.structure_path,
         model=model_cfg,
     )
     train_run(cfg)

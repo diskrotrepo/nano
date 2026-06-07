@@ -54,6 +54,49 @@ def _load_lyrics(lyrics_path: str | Path | None, verbose: bool = True) -> dict[s
     return lyrics
 
 
+def _load_structure(structure_path: str | Path | None, verbose: bool = True) -> dict[str, list[dict]]:
+    """Load song-structure segments keyed by song name.
+
+    Each value is a list of ``{"start","end","label"}`` segments sorted by start,
+    with allin1's non-section ``start``/``end`` sentinel labels filtered out. Songs
+    with no structure entry simply get a ``<no_section>`` prefix at crop time, so a
+    partial structure pass is fine. Mirrors ``_load_lyrics`` (sharded dir or a
+    single JSON).
+    """
+    if structure_path is None:
+        return {}
+    sp = Path(structure_path)
+    if not sp.exists():
+        return {}
+    if sp.is_dir():
+        from diskrot.structure import load_structure_shards
+        raw = load_structure_shards(sp)
+    else:
+        raw = json.loads(sp.read_text())
+    structure: dict[str, list[dict]] = {}
+    for key, val in raw.items():
+        if not isinstance(val, dict):
+            continue
+        segs = [s for s in val.get("segments", [])
+                if isinstance(s, dict) and s.get("label") not in (None, "start", "end")]
+        if segs:
+            structure[key] = sorted(segs, key=lambda s: s["start"])
+    if verbose:
+        print(f"[structure] loaded {len(structure)} entries from {sp}", flush=True)
+    return structure
+
+
+def _active_label_at(segs: list[dict] | None, t: float) -> str:
+    """Label of the segment containing time ``t``, or ``no_section`` if in a gap."""
+    from model.lyric_encoder import NO_SECTION_LABEL
+    if not segs:
+        return NO_SECTION_LABEL
+    for s in segs:
+        if s["start"] <= t < s["end"]:
+            return s["label"]
+    return NO_SECTION_LABEL
+
+
 def collate_lyrics(batch):
     """DataLoader collate for TokenDataset's (tokens, tags, lyric_ids) items.
 
@@ -125,6 +168,7 @@ def load_mmap_bundle(
     seed: int = 42,
     tags_path: str | Path | None = None,
     lyrics_path: str | Path | None = None,
+    structure_path: str | Path | None = None,
 ) -> dict:
     """Parent-process bundle for the v2 sharded mmap path.
 
@@ -148,6 +192,7 @@ def load_mmap_bundle(
         "shard_metas": shard_metas,
         "tags": _load_tags(tags_path),
         "lyrics": _load_lyrics(lyrics_path),
+        "structure": _load_structure(structure_path),
     }
 
 
@@ -161,6 +206,7 @@ class TokenDataset(Dataset):
         seed: int = 42,
         tags_path: str | Path | None = None,
         lyrics_path: str | Path | None = None,
+        structure_path: str | Path | None = None,
         max_lyric_len: int = 256,
     ):
         from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
@@ -181,6 +227,7 @@ class TokenDataset(Dataset):
             seed=seed,
             tags_path=tags_path,
             lyrics_path=lyrics_path,
+            structure_path=structure_path,
         )
         # Delegate to from_mmap and steal its state into self.
         ds = TokenDataset.from_mmap(bundle, split, segment_frames, max_lyric_len)
@@ -213,8 +260,13 @@ class TokenDataset(Dataset):
         name_set = set(ds.names)
         all_tags = bundle.get("tags", {})
         all_lyrics = bundle.get("lyrics", {})
+        all_structure = bundle.get("structure", {})
         ds._tags = {n: all_tags[n] for n in name_set if n in all_tags}
         ds._lyrics = {n: all_lyrics[n] for n in name_set if n in all_lyrics}
+        # Per-song structure segments (sorted by start), used to inject section
+        # markers into the time-aligned lyric stream. Songs without an entry get a
+        # <no_section> prefix, so a partial structure pass is fine.
+        ds._structure = {n: all_structure[n] for n in name_set if n in all_structure}
         # Per-song phoneme groups (one list[int] per word), built lazily on first
         # access and reused across crops — g2p runs once per song, not per segment.
         ds._word_phones = {}
@@ -257,30 +309,49 @@ class TokenDataset(Dataset):
         return " ".join(words)
 
     def _get_segment_lyric_ids(self, name: str, start_sec: float, end_sec: float) -> list[int]:
-        """Phoneme ids for the words overlapping [start_sec, end_sec].
+        """Phoneme + structure-marker ids for the crop window [start_sec, end_sec].
 
-        Always starts with BOS (so an empty/instrumental segment is a single valid
-        token, never a fully-padded row — which would NaN the cross-attention).
-        Words are separated by WORD_BOUNDARY; truncated to max_lyric_len.
+        Stream format (must stay byte-identical to the inference parser
+        ``text_with_markers_to_phoneme_ids``):
+
+            BOS  <active-section>  w w  <inline-section>  w ...
+
+        - Always starts with BOS, then exactly one section marker for the section
+          active at ``start_sec`` (``<no_section>`` in a gap / for songs without a
+          structure entry). This dense prefix means even a boundary-free or
+          instrumental crop carries its section, never a fully-padded row.
+        - Any section boundary that falls inside the crop is injected inline before
+          the first word at/after the boundary.
+        Markers and words are appended via the shared ``append_unit`` separator
+        rule; truncated to max_lyric_len.
         """
         from model.lyric_encoder import (
-            BOS_PHONEME_ID, WORD_BOUNDARY_ID, text_to_word_phoneme_groups,
+            BOS_PHONEME_ID, append_unit, structure_label_to_id,
+            text_to_word_phoneme_groups,
         )
+
+        segs = self._structure.get(name)
+        ids = [BOS_PHONEME_ID]
+        append_unit(ids, [structure_label_to_id(_active_label_at(segs, start_sec))])
 
         entry = self._lyrics.get(name)
         if not entry or not entry.get("words"):
-            return [BOS_PHONEME_ID]
+            return ids
         groups = self._word_phones.get(name)
         if groups is None:
             groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
             self._word_phones[name] = groups
 
-        ids = [BOS_PHONEME_ID]
+        # Boundaries strictly inside the crop, in order, injected as we reach the
+        # first word at/after each one.
+        pending = [s for s in segs if start_sec < s["start"] < end_sec] if segs else []
+        bi = 0
         for w, g in zip(entry["words"], groups):
             if w["end"] > start_sec and w["start"] < end_sec:
-                if len(ids) > 1:
-                    ids.append(WORD_BOUNDARY_ID)
-                ids.extend(g)
+                while bi < len(pending) and pending[bi]["start"] <= w["start"]:
+                    append_unit(ids, [structure_label_to_id(pending[bi]["label"])])
+                    bi += 1
+                append_unit(ids, g)
                 if len(ids) >= self.max_lyric_len:
                     ids = ids[: self.max_lyric_len]
                     break
