@@ -158,6 +158,63 @@ def test_lyrics_window_filtering(synth_tokens_dir, tmp_path):
     assert out == ""
 
 
+def test_malformed_word_entries_filtered_at_load(synth_tokens_dir, tmp_path):
+    """Malformed word entries (missing/non-numeric start/end, missing word) are
+    dropped at load so the crop builders never hit a KeyError/TypeError. A song
+    left with no valid words is treated as instrumental (no entry)."""
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
+    lyrics_path = tmp_path / "lyrics.json"
+    lyrics_path.write_text(json.dumps({
+        # song_000: mix of good and malformed words — only the good ones survive.
+        "song_000": {"gender": "female", "words": [
+            {"word": "good", "start": 0.0, "end": 1.0},
+            {"word": "no_times"},                                  # missing start/end
+            {"word": "bad_start", "start": "x", "end": 3.0},       # non-numeric start
+            {"start": 4.0, "end": 5.0},                            # missing word
+            {"word": "alsogood", "start": 6.0, "end": 7.0},
+        ]},
+        # song_001: every word malformed → dropped entirely (instrumental).
+        "song_001": {"words": [{"word": "x"}, {"start": 1.0}]},
+    }))
+    ds = TokenDataset(tokens_dir, segment_frames=500,
+                      lyrics_path=lyrics_path, val_ratio=0.5)
+    # song_000 kept only the two well-formed words; gender field preserved.
+    assert "song_000" in ds._lyrics
+    assert [w["word"] for w in ds._lyrics["song_000"]["words"]] == ["good", "alsogood"]
+    assert ds._lyrics["song_000"]["gender"] == "female"
+    # song_001 has no usable words → not loaded (treated as instrumental).
+    assert "song_001" not in ds._lyrics
+    # The hot path must not raise on the cleaned entry.
+    assert ds._get_segment_lyrics("song_000", 0.0, 10.0) == "good alsogood"
+
+
+@pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
+def test_word_phones_cache_eviction_is_lossless(synth_tokens_dir, tmp_path):
+    """The bounded LRU on _word_phones must change only WHEN g2p runs, never the
+    ids: a cache miss re-runs g2p deterministically and yields the same groups."""
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=6, T=1000))
+    lyrics_path = tmp_path / "lyrics.json"
+    # Give every song its own lyric so any two names in the loaded split have one.
+    lyrics_path.write_text(json.dumps({
+        f"song_{i:03d}": {"words": [{"word": w, "start": 0.0, "end": 1.0}]}
+        for i, w in enumerate(["hello", "world", "singing", "blues", "tonight", "yeah"])
+    }))
+    ds = TokenDataset(tokens_dir, segment_frames=500,
+                      lyrics_path=lyrics_path, val_ratio=0.34, max_lyric_len=256)
+    a, b = ds.names[0], ds.names[1]  # two songs guaranteed in this split
+    ds._word_phones_cap = 1  # force eviction between the two songs
+
+    first = ds._get_segment_lyric_ids(a, 0.0, 10.0)
+    assert a in ds._word_phones
+    # Touch the other song — with cap=1 this evicts a's cached groups.
+    ds._get_segment_lyric_ids(b, 0.0, 10.0)
+    assert a not in ds._word_phones  # evicted
+    # Recomputed from scratch → must be byte-identical to the cached result.
+    again = ds._get_segment_lyric_ids(a, 0.0, 10.0)
+    assert again == first
+    assert len(ds._word_phones) <= 1  # cap honored
+
+
 @pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
 def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
     """_get_segment_lyric_ids returns BOS + <gender> + section prefix + phonemes for

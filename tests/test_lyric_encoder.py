@@ -162,9 +162,51 @@ def test_markers_unknown_label_folds_to_no_section():
 
 
 @g2p_required
+def test_markers_malformed_brackets_never_reach_g2p():
+    # Empty [] and the stray brackets from a nested [[x]] are scrubbed; only valid
+    # phoneme/marker ids ever appear (a literal bracket reaching g2p would not).
+    for text in ("hello [] world", "[[chorus]] hello", "a [ b ] c"):
+        ids = text_with_markers_to_phoneme_ids(text)
+        assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
+    # [[chorus]] still resolves the chorus label as the section prefix.
+    nested = text_with_markers_to_phoneme_ids("[[chorus]] hello")
+    assert nested[2] == STRUCTURE_TOKEN_TO_ID["chorus"]
+    # A bare [] is a no-op: same stream as the plain text.
+    assert text_with_markers_to_phoneme_ids("hello [] world") == \
+        text_with_markers_to_phoneme_ids("hello world")
+
+
+@g2p_required
+def test_markers_stray_inline_gender_dropped():
+    # A second gender marker is prefix-only; inline it must be dropped, never
+    # emitted as a bogus <no_section> the way an unknown inline label would be.
+    ids = text_with_markers_to_phoneme_ids("[female] hello [male] world")
+    assert ids[1] == GENDER_TOKEN_TO_ID["female"]      # first gender = prefix
+    assert GENDER_TOKEN_TO_ID["male"] not in ids       # second gender dropped
+    # equals the same line with the stray inline gender simply removed
+    assert ids == text_with_markers_to_phoneme_ids("[female] hello world")
+
+
+@g2p_required
+def test_markers_wellformed_unchanged_by_hardening():
+    # The hardening must not perturb well-formed input (the equivalence contract).
+    ids = text_with_markers_to_phoneme_ids("[female] [verse] hello world [chorus] yeah")
+    assert ids[0] == BOS_PHONEME_ID
+    assert ids[1] == GENDER_TOKEN_TO_ID["female"]
+    assert ids[2] == STRUCTURE_TOKEN_TO_ID["verse"]
+    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[3:]
+    assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
+
+
+@g2p_required
 def test_markers_max_len_truncates():
     long_line = "[verse] " + "la " * 50 + "[chorus] " + "na " * 50
-    assert len(text_with_markers_to_phoneme_ids(long_line, max_len=9)) == 9
+    truncated = text_with_markers_to_phoneme_ids(long_line, max_len=9)
+    # Whole-unit truncation: never exceeds the cap, and never slices a word/marker
+    # mid-unit — so the capped stream is a prefix of the uncapped one.
+    assert len(truncated) <= 9
+    full = text_with_markers_to_phoneme_ids(long_line)
+    assert truncated == full[: len(truncated)]
 
 
 # --- g2p mapping -------------------------------------------------------------

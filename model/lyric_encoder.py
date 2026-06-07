@@ -193,7 +193,9 @@ def text_to_phoneme_ids(
 
     g2p_en emits ARPABET phones, ``' '`` between words, and raw punctuation;
     we map phones via PHONEME_TO_ID, fold spaces/sentence punctuation to a single
-    WORD_BOUNDARY token, and drop anything else (rare g2p artifacts) to UNK.
+    WORD_BOUNDARY token, and drop anything else (rare g2p artifacts). UNK_PHONEME
+    is reserved for future use but never emitted — silently dropping an artifact
+    keeps the id stream identical on both the train and inference paths.
     Deterministic for a given g2p_en version + nltk data — the contract train and
     inference both rely on. ``max_len`` truncates (after the optional BOS).
     """
@@ -211,7 +213,7 @@ def text_to_phoneme_ids(
             if not prev_boundary:  # collapse runs of space/punct
                 ids.append(WORD_BOUNDARY_ID)
                 prev_boundary = True
-        # else: unknown artifact — skip (UNK reserved but unused for now)
+        # else: unknown artifact — dropped (UNK_PHONEME reserved, never emitted)
     # Trim a trailing boundary.
     if ids and ids[-1] == WORD_BOUNDARY_ID:
         ids.pop()
@@ -241,7 +243,8 @@ def text_to_word_phoneme_groups(words: list[str]) -> list[list[int]]:
         pid = PHONEME_TO_ID.get(sym)
         if pid is not None:
             groups[-1].append(pid)
-        # non-space punctuation / artifacts: dropped (don't split the word)
+        # non-space punctuation / artifacts: dropped (don't split the word; UNK
+        # is reserved, never emitted — keeps train/inference id streams identical)
     if len(groups) == len(words):
         return groups
     # Alignment drift — phonemize each word independently (loses some context but
@@ -273,6 +276,25 @@ def append_unit(ids: list[int], unit: list[int]) -> None:
     ids.extend(unit)
 
 
+def append_unit_capped(ids: list[int], unit: list[int], max_len: int | None) -> bool:
+    """``append_unit`` with whole-unit truncation.
+
+    Appends ``unit`` (with its boundary) only if doing so keeps ``len(ids)`` at or
+    below ``max_len``; otherwise leaves ``ids`` untouched and returns ``False`` so
+    the caller stops. This avoids slicing a word's phoneme group (or a marker)
+    mid-unit at the cap. ``max_len=None`` never blocks. Used by BOTH the dataset
+    injector and the inference parser so their truncation stays byte-identical.
+    """
+    if not unit:
+        return True
+    if max_len is not None:
+        cost = len(unit) + (1 if len(ids) > 1 else 0)  # +1 for the WORD_BOUNDARY
+        if len(ids) + cost > max_len:
+            return False
+    append_unit(ids, unit)
+    return True
+
+
 _MARKER_RE = re.compile(r"\[([^\[\]]+)\]")
 
 
@@ -292,10 +314,13 @@ def text_with_markers_to_phoneme_ids(
       / ``[female]``) and one section (``[verse]`` ...), in either order. A gender
       not given defaults to ``<unknown_gender>``, a section to ``<no_section>``.
     - Gender is emitted first, then section (the train-time order).
-    Remaining markers after the leading run are inline section markers. Brackets
-    are stripped here and never reach g2p (the biggest train/inference footgun);
-    unknown labels fold to ``<no_section>`` via ``structure_label_to_id``. Word
-    spans are phonemized with the same per-word grouping the dataset uses.
+    Remaining markers after the leading run are inline section markers (a stray
+    inline gender marker is dropped — gender is prefix-only, as in training).
+    Brackets are stripped here and never reach g2p (the biggest train/inference
+    footgun); unknown labels fold to ``<no_section>`` via ``structure_label_to_id``.
+    Malformed brackets are handled defensively: an empty ``[]`` and the stray
+    ``[``/``]`` left behind by a nested ``[[x]]`` are scrubbed so they never reach
+    g2p. Word spans are phonemized with the same per-word grouping the dataset uses.
     """
     parts = _MARKER_RE.split(text or "")
     # re.split with one capture group yields: text, label, text, label, ...
@@ -303,9 +328,15 @@ def text_with_markers_to_phoneme_ids(
     events: list[tuple[str, str]] = []
     for i, part in enumerate(parts):
         if i % 2 == 1:
-            events.append(("marker", part))
-        elif part.strip():
-            events.append(("text", part))
+            label = part.strip()
+            if label:  # skip an empty/whitespace-only [] marker
+                events.append(("marker", label))
+        else:
+            # Scrub stray brackets (bare [] or the [ ] orphaned by nested [[x]])
+            # so a literal bracket never reaches g2p.
+            span = part.replace("[", " ").replace("]", " ").strip()
+            if span:
+                events.append(("text", span))
 
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
     # Consume the leading run of markers as prefixes: at most one gender + one
@@ -327,14 +358,18 @@ def text_with_markers_to_phoneme_ids(
 
     for kind, val in events:
         if kind == "marker":
-            append_unit(ids, [structure_label_to_id(val)])
+            if is_gender_label(val):
+                continue  # gender is prefix-only; ignore a stray inline gender marker
+            if not append_unit_capped(ids, [structure_label_to_id(val)], max_len):
+                break
         else:
+            stop = False
             for group in text_to_word_phoneme_groups(val.split()):
-                append_unit(ids, group)
-        if max_len is not None and len(ids) >= max_len:
-            break
-    if max_len is not None and len(ids) > max_len:
-        ids = ids[:max_len]
+                if not append_unit_capped(ids, group, max_len):
+                    stop = True
+                    break
+            if stop:
+                break
     return ids
 
 

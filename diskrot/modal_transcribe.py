@@ -84,6 +84,10 @@ class Transcriber:
 
 
 LYRICS_DIR = "/tokens/lyrics"
+LOCK_PATH = "/tokens/lyrics/.orchestrator.lock"
+# A lock older than the orchestrator's own timeout belongs to a dead run and is
+# reclaimed; matches the orchestrate() function timeout below.
+LOCK_STALE_SEC = 24 * 60 * 60
 
 
 @app.function(
@@ -165,7 +169,40 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     timeout=24 * 60 * 60,
 )
-def orchestrate(flush_every: int = 200):
+def _acquire_lock() -> bool:
+    """Best-effort single-orchestrator lease on the volume.
+
+    Returns False if a fresh lock from another orchestrator is present (refuse to
+    start so two runs don't race read-merge-write on the same shard). A lock older
+    than ``LOCK_STALE_SEC`` is a dead run and is reclaimed. Best-effort: two runs
+    that start within the same reload window can both acquire — that's a rare
+    operator double-launch, and the synchronous flush path bounds the damage.
+    """
+    from diskrot.transcribe_lyrics import _atomic_write_json
+
+    tokens_vol.reload()
+    lock = Path(LOCK_PATH)
+    if lock.exists():
+        try:
+            age = time.time() - json.loads(lock.read_text()).get("started_at", 0)
+        except Exception:
+            age = 0  # unreadable lock — treat as fresh and refuse, to be safe
+        if age < LOCK_STALE_SEC:
+            print(f"Another orchestrator holds the lock (age {age:.0f}s < "
+                  f"{LOCK_STALE_SEC}s) — refusing to start. Stop it first or wait.")
+            return False
+        print(f"Reclaiming stale lock (age {age:.0f}s).")
+    _atomic_write_json(LOCK_PATH, {"started_at": time.time()})
+    tokens_vol.commit()
+    return True
+
+
+def _release_lock() -> None:
+    Path(LOCK_PATH).unlink(missing_ok=True)
+    tokens_vol.commit()
+
+
+def orchestrate(flush_every: int = 2000):
     """Dispatch transcription and merge results into the sharded lyrics dir.
 
     Runs the ``.map()`` collect/flush loop *remotely* (not in local_entrypoint)
@@ -173,55 +210,65 @@ def orchestrate(flush_every: int = 200):
     this loop locally, so closing the terminal killed the result-collector even
     though the worker containers kept running and billing.
 
-    Flushes partial results every ``flush_every`` completions (default 200).
-    The flushing path uses synchronous ``save_results.remote(...)`` so two
-    writers never race on a shard — each flush completes (read-merge-write-
-    commit) before the next is issued. ``list_pending`` skips songs already in
-    the shards on a prior run, so re-launching just resumes.
+    Flushes partial results every ``flush_every`` completions (default 2000).
+    The flushing path uses synchronous ``save_results.remote(...)`` so two writers
+    never race on a shard — each flush completes (read-merge-write-commit) before
+    the next is issued. A larger ``flush_every`` cuts shard write-amplification
+    (each flush read-merge-writes whole JSON shards; ~256 shards fill to ~1k
+    entries, so frequent flushes rewrite most of the corpus repeatedly). The
+    trade-off: on orchestrator death, up to ``flush_every`` unflushed results are
+    redone — they stay pending via ``list_pending``, so it's recompute, not data
+    loss. A lease lock (see ``_acquire_lock``) refuses a concurrent second run.
+    ``list_pending`` skips songs already in the shards, so re-launching resumes.
     """
-    pending = list_pending.remote()
-    if not pending:
-        print("Nothing to transcribe — all files already transcribed")
+    if not _acquire_lock():
         return
+    try:
+        pending = list_pending.remote()
+        if not pending:
+            print("Nothing to transcribe — all files already transcribed")
+            return
 
-    print(f"Dispatching {len(pending)} files across parallel containers "
-          f"(flush_every={flush_every})...")
-    transcriber = Transcriber()
-    batch: list = []
-    n_seen = 0
-    n_errors = 0
-    # order_outputs=False: a preempted file must not head-of-line-block the
-    # in-order yield (that idles the other containers while they still bill).
-    # Results are flushed into shards by key, so order doesn't matter.
-    # return_exceptions=True: a single file raising (e.g. a worker that hard-
-    # crashes on a poison file) must NOT crash the orchestrator and lose the
-    # run — count it and continue. The file stays pending (not in the shards)
-    # and is picked up on the next launch via list_pending.
-    for result in transcriber.transcribe_file.map(
-        pending, order_outputs=False, return_exceptions=True
-    ):
-        n_seen += 1
-        if isinstance(result, Exception):
-            n_errors += 1
-            if n_errors <= 20:
-                print(f"FILE FAILED (stays pending, redone next run): "
-                      f"{type(result).__name__}: {str(result)[:140]}")
-            continue
-        batch.append(result)
-        if len(batch) >= flush_every:
-            print(f"flushing {len(batch)} results ({n_seen}/{len(pending)} done)")
+        print(f"Dispatching {len(pending)} files across parallel containers "
+              f"(flush_every={flush_every})...")
+        transcriber = Transcriber()
+        batch: list = []
+        n_seen = 0
+        n_errors = 0
+        # order_outputs=False: a preempted file must not head-of-line-block the
+        # in-order yield (that idles the other containers while they still bill).
+        # Results are flushed into shards by key, so order doesn't matter.
+        # return_exceptions=True: a single file raising (e.g. a worker that hard-
+        # crashes on a poison file) must NOT crash the orchestrator and lose the
+        # run — count it and continue. The file stays pending (not in the shards)
+        # and is picked up on the next launch via list_pending.
+        for result in transcriber.transcribe_file.map(
+            pending, order_outputs=False, return_exceptions=True
+        ):
+            n_seen += 1
+            if isinstance(result, Exception):
+                n_errors += 1
+                if n_errors <= 20:
+                    print(f"FILE FAILED (stays pending, redone next run): "
+                          f"{type(result).__name__}: {str(result)[:140]}")
+                continue
+            batch.append(result)
+            if len(batch) >= flush_every:
+                print(f"flushing {len(batch)} results ({n_seen}/{len(pending)} done)")
+                save_results.remote(batch)
+                batch = []
+        if batch:
+            print(f"final flush of {len(batch)} results ({n_seen}/{len(pending)} done)")
             save_results.remote(batch)
-            batch = []
-    if batch:
-        print(f"final flush of {len(batch)} results ({n_seen}/{len(pending)} done)")
-        save_results.remote(batch)
-    if n_errors:
-        print(f"file errors: {n_errors} "
-              f"(transient — affected files stay pending; re-run to finish them)")
+        if n_errors:
+            print(f"file errors: {n_errors} "
+                  f"(transient — affected files stay pending; re-run to finish them)")
+    finally:
+        _release_lock()
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 200):
+def main(flush_every: int = 2000):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are

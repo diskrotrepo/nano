@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import random
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,19 @@ def _load_tags(tags_path: str | Path | None, verbose: bool = True) -> dict[str, 
     return tags
 
 
+def _is_valid_word(w) -> bool:
+    """A word entry usable by the crop builders: dict with a string ``word`` and
+    numeric ``start``/``end`` (bools rejected). Guards the hot paths
+    ``_get_segment_lyrics``/``_get_segment_lyric_ids`` against a malformed entry
+    raising KeyError/TypeError mid-training — we filter once at load instead."""
+    return (
+        isinstance(w, dict)
+        and isinstance(w.get("word"), str)
+        and isinstance(w.get("start"), (int, float)) and not isinstance(w["start"], bool)
+        and isinstance(w.get("end"), (int, float)) and not isinstance(w["end"], bool)
+    )
+
+
 def _load_lyrics(lyrics_path: str | Path | None, verbose: bool = True) -> dict[str, dict]:
     if lyrics_path is None:
         return {}
@@ -47,10 +61,22 @@ def _load_lyrics(lyrics_path: str | Path | None, verbose: bool = True) -> dict[s
         raw = load_lyrics_shards(lp)
     else:
         raw = json.loads(lp.read_text())
-    lyrics = {key: val for key, val in raw.items()
-              if isinstance(val, dict) and val.get("words")}
+    lyrics: dict[str, dict] = {}
+    n_dropped_words = 0
+    for key, val in raw.items():
+        if not isinstance(val, dict) or not val.get("words"):
+            continue
+        words = val["words"]
+        clean = [w for w in words if _is_valid_word(w)] if isinstance(words, list) else []
+        n_dropped_words += len(words) - len(clean) if isinstance(words, list) else 0
+        if not clean:
+            continue  # no usable words — treat as instrumental/unlyriced
+        lyrics[key] = {**val, "words": clean} if len(clean) != len(words) else val
     if verbose:
-        print(f"[lyrics] loaded {len(lyrics)} entries from {lp}", flush=True)
+        msg = f"[lyrics] loaded {len(lyrics)} entries from {lp}"
+        if n_dropped_words:
+            msg += f" (dropped {n_dropped_words} malformed word entries)"
+        print(msg, flush=True)
     return lyrics
 
 
@@ -268,8 +294,13 @@ class TokenDataset(Dataset):
         # <no_section> prefix, so a partial structure pass is fine.
         ds._structure = {n: all_structure[n] for n in name_set if n in all_structure}
         # Per-song phoneme groups (one list[int] per word), built lazily on first
-        # access and reused across crops — g2p runs once per song, not per segment.
-        ds._word_phones = {}
+        # access and reused across crops — g2p runs once per song while it stays
+        # hot. Bounded LRU (OrderedDict): each forked DataLoader worker fills its
+        # own copy, so an unbounded dict would grow to ~corpus-size per worker
+        # over a long random-sampled run. The cap trades bounded recompute (a
+        # cache miss re-runs g2p, deterministically — same ids) for bounded mem.
+        ds._word_phones = OrderedDict()
+        ds._word_phones_cap = min(len(ds.names), 4096) or 1
         ds.has_tags = len(ds._tags) > 0 or len(ds._lyrics) > 0
         return ds
 
@@ -328,7 +359,7 @@ class TokenDataset(Dataset):
         rule; truncated to max_lyric_len.
         """
         from model.lyric_encoder import (
-            BOS_PHONEME_ID, append_unit, gender_label_to_id,
+            BOS_PHONEME_ID, append_unit, append_unit_capped, gender_label_to_id,
             structure_label_to_id, text_to_word_phoneme_groups,
         )
 
@@ -348,6 +379,10 @@ class TokenDataset(Dataset):
         if groups is None:
             groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
             self._word_phones[name] = groups
+            if len(self._word_phones) > self._word_phones_cap:
+                self._word_phones.popitem(last=False)  # evict least-recently-used
+        else:
+            self._word_phones.move_to_end(name)  # mark as recently used
 
         # Boundaries strictly inside the crop, in order, injected as we reach the
         # first word at/after each one.
@@ -355,13 +390,15 @@ class TokenDataset(Dataset):
         bi = 0
         for w, g in zip(entry["words"], groups):
             if w["end"] > start_sec and w["start"] < end_sec:
+                stop = False
                 while bi < len(pending) and pending[bi]["start"] <= w["start"]:
-                    append_unit(ids, [structure_label_to_id(pending[bi]["label"])])
+                    marker = [structure_label_to_id(pending[bi]["label"])]
+                    if not append_unit_capped(ids, marker, self.max_lyric_len):
+                        stop = True
+                        break
                     bi += 1
-                append_unit(ids, g)
-                if len(ids) >= self.max_lyric_len:
-                    ids = ids[: self.max_lyric_len]
-                    break
+                if stop or not append_unit_capped(ids, g, self.max_lyric_len):
+                    break  # whole-unit truncation — never slice a word/marker mid-unit
         return ids
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, torch.Tensor]:
