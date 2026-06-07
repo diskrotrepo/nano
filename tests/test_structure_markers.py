@@ -17,6 +17,7 @@ from model.lyric_encoder import (
     BOS_PHONEME_ID,
     NO_SECTION_ID,
     STRUCTURE_TOKEN_TO_ID,
+    UNKNOWN_GENDER_ID,
     text_with_markers_to_phoneme_ids,
 )
 
@@ -71,10 +72,10 @@ def test_prefix_marker_for_active_section(synth_tokens_dir, tmp_path):
     ds = _make_ds(synth_tokens_dir, tmp_path,
                   [{"word": "hello", "start": 0.5, "end": 1.5}], segments)
     ids = ds._get_segment_lyric_ids("song_000", 0.0, 5.0)
-    assert ids[:2] == [BOS_PHONEME_ID, STRUCTURE_TOKEN_TO_ID["verse"]]
+    assert ids[:3] == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, STRUCTURE_TOKEN_TO_ID["verse"]]
     # A crop starting inside the chorus gets the chorus prefix.
     ids2 = ds._get_segment_lyric_ids("song_000", 12.0, 18.0)
-    assert ids2[:2] == [BOS_PHONEME_ID, STRUCTURE_TOKEN_TO_ID["chorus"]]
+    assert ids2[:3] == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, STRUCTURE_TOKEN_TO_ID["chorus"]]
 
 
 @g2p_required
@@ -84,7 +85,7 @@ def test_prefix_no_section_in_gap(synth_tokens_dir, tmp_path):
     ds = _make_ds(synth_tokens_dir, tmp_path,
                   [{"word": "hi", "start": 0.0, "end": 1.0}], segments)
     ids = ds._get_segment_lyric_ids("song_000", 6.0, 9.0)  # gap [5,10)
-    assert ids[:2] == [BOS_PHONEME_ID, NO_SECTION_ID]
+    assert ids[:3] == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, NO_SECTION_ID]
 
 
 @g2p_required
@@ -96,11 +97,12 @@ def test_inline_boundary_injected(synth_tokens_dir, tmp_path):
              {"word": "yeah", "start": 11.0, "end": 12.0}]
     ds = _make_ds(synth_tokens_dir, tmp_path, words, segments)
     ids = ds._get_segment_lyric_ids("song_000", 0.0, 30.0)
-    assert ids[1] == STRUCTURE_TOKEN_TO_ID["verse"]       # prefix
+    assert ids[1] == UNKNOWN_GENDER_ID                    # dense gender prefix
+    assert ids[2] == STRUCTURE_TOKEN_TO_ID["verse"]       # section prefix
     chorus = STRUCTURE_TOKEN_TO_ID["chorus"]
     assert chorus in ids                                  # inline boundary present
     # chorus marker comes after the verse words, before the chorus word's phonemes
-    assert ids.index(chorus) > 2
+    assert ids.index(chorus) > 3
 
 
 # --- train == inference equivalence (the critical guard) ---------------------

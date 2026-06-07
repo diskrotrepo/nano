@@ -85,10 +85,11 @@ def test_getitem_shape_and_dtype(synth_tokens_dir):
     # for the correctness contract.
     assert tokens.dtype == torch.int16
     assert tags == ""
-    # No lyrics/structure path → BOS + the <no_section> prefix marker (never an
-    # empty/fully-padded sequence, which would NaN the lyric cross-attention).
-    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID
-    assert lyric_ids.tolist() == [BOS_PHONEME_ID, NO_SECTION_ID]
+    # No lyrics/structure path → BOS + the dense <unknown_gender> + <no_section>
+    # prefixes (never an empty/fully-padded sequence, which would NaN the lyric
+    # cross-attention).
+    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID
+    assert lyric_ids.tolist() == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, NO_SECTION_ID]
 
 
 def test_getitem_uses_random_crop_within_bounds(synth_tokens_dir):
@@ -159,11 +160,13 @@ def test_lyrics_window_filtering(synth_tokens_dir, tmp_path):
 
 @pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
 def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
-    """_get_segment_lyric_ids returns BOS + section prefix + phonemes for
-    overlapping words, and BOS + <no_section> when nothing overlaps or the song is
-    instrumental (no structure entry here → the prefix is always <no_section>)."""
-    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID
+    """_get_segment_lyric_ids returns BOS + <gender> + section prefix + phonemes for
+    overlapping words, and BOS + dense prefixes when nothing overlaps or the song is
+    instrumental (no structure entry / no gender field here → <unknown_gender> +
+    <no_section>)."""
+    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID
 
+    prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, NO_SECTION_ID]
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({
@@ -176,12 +179,39 @@ def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
                       lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
 
     full = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
-    assert full[:2] == [BOS_PHONEME_ID, NO_SECTION_ID]  # BOS + <no_section> prefix
-    assert len(full) > 2  # phonemes present
-    # No overlap → BOS + <no_section> prefix (dense prefix, never a lone BOS).
-    assert ds._get_segment_lyric_ids("song_000", 10.0, 11.0) == [BOS_PHONEME_ID, NO_SECTION_ID]
-    # Instrumental / missing → BOS + <no_section> prefix.
-    assert ds._get_segment_lyric_ids("nonexistent", 0.0, 10.0) == [BOS_PHONEME_ID, NO_SECTION_ID]
+    assert full[:3] == prefix  # BOS + <unknown_gender> + <no_section> prefix
+    assert len(full) > 3  # phonemes present
+    # No overlap → dense prefix only (never a lone BOS).
+    assert ds._get_segment_lyric_ids("song_000", 10.0, 11.0) == prefix
+    # Instrumental / missing → dense prefix only.
+    assert ds._get_segment_lyric_ids("nonexistent", 0.0, 10.0) == prefix
+
+
+@pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
+def test_segment_lyric_ids_gender_prefix(synth_tokens_dir, tmp_path):
+    """A song's F0-labeled ``gender`` field becomes the dense gender prefix, and
+    the train-time stream matches the inference parser's bracketed equivalent."""
+    from model.lyric_encoder import (
+        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID, NO_SECTION_ID,
+        text_with_markers_to_phoneme_ids,
+    )
+
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
+    lyrics_path = tmp_path / "lyrics.json"
+    lyrics_path.write_text(json.dumps({
+        "song_000": {"gender": "female", "words": [
+            {"word": "hello", "start": 0.0, "end": 1.0},
+            {"word": "world", "start": 2.0, "end": 3.0},
+        ]},
+    }))
+    ds = TokenDataset(tokens_dir, segment_frames=500,
+                      lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
+
+    train_ids = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
+    assert train_ids[:3] == [BOS_PHONEME_ID, GENDER_TOKEN_TO_ID["female"], NO_SECTION_ID]
+    # train-time stream == inference parser for the equivalent bracketed string
+    infer_ids = text_with_markers_to_phoneme_ids("[female] hello world")
+    assert train_ids == infer_ids
 
 
 def test_collate_lyrics_pads_and_masks(synth_tokens_dir):

@@ -61,6 +61,9 @@ class GenParams {
   AudioFile? inputAudio;
   double addSeconds = 20.0;
   double overlapSeconds = 8.0;
+  // Cut point: where the extension begins. -1.0 = clip tail (seamless append,
+  // lossless). A value >= 0 discards audio after it and regenerates from there.
+  double fromSeconds = -1.0;
 }
 
 class NanoResult {
@@ -143,6 +146,7 @@ class NanoApi {
         _requireInput(p);
         f['add_seconds'] = p.addSeconds.toString();
         f['overlap_seconds'] = p.overlapSeconds.toString();
+        f['from_seconds'] = p.fromSeconds.toString();
         req.files.add(http.MultipartFile.fromBytes(
           'audio', p.inputAudio!.bytes,
           filename: p.inputAudio!.name,

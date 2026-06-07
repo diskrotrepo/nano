@@ -78,13 +78,26 @@ class _BlobAudioPlayerState extends State<BlobAudioPlayer> {
 /// drawing a waveform. Uses the browser's Web Audio decoder, so it handles any
 /// format `<audio>` can play. Channel 0 only; max-abs per bucket; normalized so
 /// quiet clips still fill the height. Returns `[]` if decoding yields no samples.
-Future<List<double>> decodeWaveformPeaks(Uint8List bytes, int buckets) async {
+Future<List<double>> decodeWaveformPeaks(Uint8List bytes, int buckets) async =>
+    (await decodeWaveform(bytes, buckets)).peaks;
+
+/// Decode `bytes` into `buckets` normalized peaks (0..1) **and** the clip's true
+/// duration in seconds (read from the decoded buffer, so callers don't have to
+/// trust a separately-measured length). Returns empty peaks / 0 duration if
+/// decoding yields no samples.
+Future<({List<double> peaks, double duration})> decodeWaveform(
+    Uint8List bytes, int buckets) async {
   final ctx = web.AudioContext();
   try {
-    final audioBuf = await ctx.decodeAudioData(bytes.buffer.toJS).toDart;
+    // decodeAudioData *detaches* the input ArrayBuffer, so decoding the same
+    // clip.bytes twice (mini-waveform + extend waveform) would fail the second
+    // time. Hand it a fresh copy and leave the caller's bytes intact.
+    final copy = Uint8List.fromList(bytes);
+    final audioBuf = await ctx.decodeAudioData(copy.buffer.toJS).toDart;
+    final duration = audioBuf.duration.toDouble();
     final channel = audioBuf.getChannelData(0).toDart; // Float32List
     final n = channel.length;
-    if (n == 0) return const [];
+    if (n == 0) return (peaks: const <double>[], duration: duration);
     final out = List<double>.filled(buckets, 0);
     final per = (n / buckets).ceil();
     var peak = 0.0;
@@ -105,7 +118,7 @@ Future<List<double>> decodeWaveformPeaks(Uint8List bytes, int buckets) async {
         out[b] = out[b] / peak;
       }
     }
-    return out;
+    return (peaks: out, duration: duration);
   } finally {
     ctx.close();
   }
@@ -226,7 +239,7 @@ class _WaveformPlayerState extends State<WaveformPlayer> {
                   valueListenable: _progress,
                   builder: (context, progress, _) => CustomPaint(
                     size: Size.infinite,
-                    painter: _WaveformPainter(_peaks, progress),
+                    painter: WaveformBarsPainter(peaks: _peaks, progress: progress),
                   ),
                 ),
               );
@@ -283,16 +296,25 @@ class _TransportButton extends StatelessWidget {
   }
 }
 
-class _WaveformPainter extends CustomPainter {
-  _WaveformPainter(this.peaks, this.progress);
+/// Shared waveform bar painter, reused by [WaveformPlayer], the clip-card
+/// scrubber, and the extend cut widget. Two display modes:
+///   - playback: pass [progress] (0..1) — bars before the playhead are pink,
+///     after are dim; a playhead line is drawn.
+///   - cut: pass [cut] (0..1) — bars before the cut are pink ("kept"), after
+///     are greyed ("discarded / regenerated"); a pink cut marker is drawn.
+/// Either or both may be supplied; pass neither for a static dim waveform.
+class WaveformBarsPainter extends CustomPainter {
+  WaveformBarsPainter({this.peaks, this.progress, this.cut});
   final List<double>? peaks;
-  final double progress;
+  final double? progress;
+  final double? cut;
 
   @override
   void paint(Canvas canvas, Size size) {
     final mid = size.height / 2;
     final p = peaks;
-    final progressX = size.width * progress;
+    final progressX = progress == null ? null : size.width * progress!;
+    final cutX = cut == null ? null : (size.width * cut!).clamp(0.0, size.width);
 
     if (p == null || p.isEmpty) {
       // Loading / undecodable: a dim centerline so the area isn't empty.
@@ -301,6 +323,7 @@ class _WaveformPainter extends CustomPainter {
     } else {
       final played = Paint()..color = NanoColors.pink;
       final unplayed = Paint()..color = NanoColors.pinkDim;
+      final discarded = Paint()..color = NanoColors.border;
       final n = p.length;
       final slot = size.width / n;
       final barW = (slot * 0.6).clamp(1.0, slot);
@@ -308,28 +331,51 @@ class _WaveformPainter extends CustomPainter {
         final cx = i * slot + slot / 2;
         final h = (p[i] * size.height * 0.95).clamp(2.0, size.height);
         final rect = Rect.fromLTWH(cx - barW / 2, mid - h / 2, barW, h);
+        final Paint paint;
+        if (cutX != null) {
+          paint = cx <= cutX ? played : discarded;
+        } else if (progressX != null) {
+          paint = cx <= progressX ? played : unplayed;
+        } else {
+          paint = unplayed;
+        }
         canvas.drawRRect(
           RRect.fromRectAndRadius(rect, const Radius.circular(1)),
-          cx <= progressX ? played : unplayed,
+          paint,
         );
       }
     }
 
-    // Draggable playhead.
-    canvas.drawLine(
-      Offset(progressX, 0),
-      Offset(progressX, size.height),
-      Paint()
-        ..color = NanoColors.text
-        ..strokeWidth = 1.5,
-    );
-    canvas.drawCircle(
-        Offset(progressX, 0), 3, Paint()..color = NanoColors.text);
+    // Playback playhead.
+    if (progressX != null) {
+      canvas.drawLine(
+        Offset(progressX, 0),
+        Offset(progressX, size.height),
+        Paint()
+          ..color = NanoColors.text
+          ..strokeWidth = 1.5,
+      );
+      canvas.drawCircle(
+          Offset(progressX, 0), 3, Paint()..color = NanoColors.text);
+    }
+
+    // Cut marker — where the extension begins.
+    if (cutX != null) {
+      final paint = Paint()
+        ..color = NanoColors.pink
+        ..strokeWidth = 2;
+      canvas.drawLine(Offset(cutX, 0), Offset(cutX, size.height), paint);
+      canvas.drawCircle(Offset(cutX, 0), 4, Paint()..color = NanoColors.pink);
+      canvas.drawCircle(
+          Offset(cutX, size.height), 4, Paint()..color = NanoColors.pink);
+    }
   }
 
   @override
-  bool shouldRepaint(_WaveformPainter old) =>
-      old.progress != progress || !identical(old.peaks, peaks);
+  bool shouldRepaint(WaveformBarsPainter old) =>
+      old.progress != progress ||
+      old.cut != cut ||
+      !identical(old.peaks, peaks);
 }
 
 /// Read an audio clip's duration (seconds) from its blob URL via a detached
@@ -373,12 +419,26 @@ class ClipPlayer extends ChangeNotifier {
       _progress = 1.0;
       notifyListeners();
     }.toJS);
+    // A seek requested before the (possibly just-swapped) source has metadata
+    // can't set currentTime yet — apply the stashed fraction once it loads.
+    _audio.addEventListener('loadedmetadata', (web.Event _) {
+      final f = _pendingSeek;
+      if (f == null) return;
+      _pendingSeek = null;
+      final d = _audio.duration;
+      if (d.isFinite && d > 0) {
+        _audio.currentTime = f * d;
+        _progress = f;
+        notifyListeners();
+      }
+    }.toJS);
   }
 
   late final web.HTMLAudioElement _audio;
   String? _currentId;
   bool _playing = false;
   double _progress = 0;
+  double? _pendingSeek;
 
   String? get currentId => _currentId;
   bool get isPlaying => _playing;
@@ -411,6 +471,31 @@ class ClipPlayer extends ChangeNotifier {
     _playing = true;
     _audio.play();
     notifyListeners();
+  }
+
+  /// Seek clip [id] (backed by blob [url]) to [fraction] (0..1) of its length.
+  /// If it isn't the loaded clip, load it (paused) and apply the seek once its
+  /// metadata arrives. Drives the clip-card waveform scrubber.
+  void seek(String id, String url, double fraction) {
+    final f = fraction.clamp(0.0, 1.0);
+    if (_currentId != id) {
+      _audio.pause();
+      _audio.src = url;
+      _currentId = id;
+      _playing = false;
+      _progress = f;
+      _pendingSeek = f; // applied on loadedmetadata
+      notifyListeners();
+      return;
+    }
+    final d = _audio.duration;
+    if (d.isFinite && d > 0) {
+      _audio.currentTime = f * d;
+      _progress = f;
+      notifyListeners();
+    } else {
+      _pendingSeek = f;
+    }
   }
 
   /// Stop and forget [id] if it's the one currently loaded (used when a clip is

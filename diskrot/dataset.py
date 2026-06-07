@@ -314,27 +314,34 @@ class TokenDataset(Dataset):
         Stream format (must stay byte-identical to the inference parser
         ``text_with_markers_to_phoneme_ids``):
 
-            BOS  <active-section>  w w  <inline-section>  w ...
+            BOS  <gender>  <active-section>  w w  <inline-section>  w ...
 
-        - Always starts with BOS, then exactly one section marker for the section
-          active at ``start_sec`` (``<no_section>`` in a gap / for songs without a
-          structure entry). This dense prefix means even a boundary-free or
-          instrumental crop carries its section, never a fully-padded row.
+        - Always starts with BOS, then exactly one gender marker (the song's
+          F0-labeled vocal gender, ``<unknown_gender>`` if instrumental /
+          unlabeled) and exactly one section marker for the section active at
+          ``start_sec`` (``<no_section>`` in a gap / for songs without a structure
+          entry). This dense prefix means even a boundary-free or instrumental crop
+          carries both slots, never a fully-padded row.
         - Any section boundary that falls inside the crop is injected inline before
-          the first word at/after the boundary.
+          the first word at/after the boundary. (Gender is per-song, prefix-only.)
         Markers and words are appended via the shared ``append_unit`` separator
         rule; truncated to max_lyric_len.
         """
         from model.lyric_encoder import (
-            BOS_PHONEME_ID, append_unit, structure_label_to_id,
-            text_to_word_phoneme_groups,
+            BOS_PHONEME_ID, append_unit, gender_label_to_id,
+            structure_label_to_id, text_to_word_phoneme_groups,
         )
 
         segs = self._structure.get(name)
-        ids = [BOS_PHONEME_ID]
-        append_unit(ids, [structure_label_to_id(_active_label_at(segs, start_sec))])
-
         entry = self._lyrics.get(name)
+        gender = entry.get("gender") if isinstance(entry, dict) else None
+        # Compact 2-marker header (no internal word-boundary): BOS <gender> <section>.
+        ids = [BOS_PHONEME_ID]
+        append_unit(ids, [
+            gender_label_to_id(gender),
+            structure_label_to_id(_active_label_at(segs, start_sec)),
+        ])
+
         if not entry or not entry.get("words"):
             return ids
         groups = self._word_phones.get(name)

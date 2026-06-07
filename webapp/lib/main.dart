@@ -35,7 +35,14 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _params = GenParams();
-  NanoMode _mode = NanoMode.generate;
+
+  /// Mode is derived, not toggled: extend whenever a source clip has been
+  /// dropped onto the create area (sets `inputAudio`), otherwise generate.
+  NanoMode get _mode =>
+      _params.inputAudio != null ? NanoMode.extend : NanoMode.generate;
+
+  /// The library clip dropped as the extend source (for its name + waveform).
+  GenClip? _extendSource;
 
   final _serverCtl = TextEditingController(text: 'http://127.0.0.1:8000');
   final _promptCtl = TextEditingController();
@@ -177,6 +184,7 @@ class _HomePageState extends State<HomePage> {
   Widget _body() {
     // Panels scroll under the bar, so the first item sits just below it.
     const topInset = _kTopBarHeight + 8;
+    const pad = EdgeInsets.fromLTRB(20, topInset, 20, 48);
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 900;
@@ -186,29 +194,45 @@ class _HomePageState extends State<HomePage> {
             children: [
               SizedBox(
                 width: 560,
-                child: ListView(
-                  padding: const EdgeInsets.fromLTRB(20, topInset, 20, 48),
-                  children: _controlsChildren(),
-                ),
+                child: _controlsArea(_controlsChildren(), pad),
               ),
               const VerticalDivider(width: 1, color: NanoColors.border),
               Expanded(
-                child: ListView(
-                  padding: const EdgeInsets.fromLTRB(20, topInset, 20, 48),
-                  children: _libraryChildren(),
-                ),
+                child: ListView(padding: pad, children: _libraryChildren()),
               ),
             ],
           );
         }
-        return ListView(
-          padding: const EdgeInsets.fromLTRB(20, topInset, 20, 48),
+        return _controlsArea([
+          ..._controlsChildren(),
+          const SizedBox(height: 8),
+          const Divider(height: 1, color: NanoColors.border),
+          const SizedBox(height: 16),
+          ..._libraryChildren(),
+        ], pad);
+      },
+    );
+  }
+
+  /// The create/controls column, made a drop target: dragging a ready library
+  /// clip over it shows a "drop to extend track" overlay; dropping sets it as
+  /// the extend source.
+  Widget _controlsArea(List<Widget> children, EdgeInsets padding) {
+    return DragTarget<GenClip>(
+      onWillAcceptWithDetails: (d) =>
+          d.data.status == ClipStatus.ready && d.data.bytes != null,
+      onAcceptWithDetails: (d) => _acceptExtendSource(d.data),
+      builder: (context, candidate, rejected) {
+        return Stack(
           children: [
-            ..._controlsChildren(),
-            const SizedBox(height: 8),
-            const Divider(height: 1, color: NanoColors.border),
-            const SizedBox(height: 16),
-            ..._libraryChildren(),
+            ListView(padding: padding, children: children),
+            if (candidate.isNotEmpty)
+              const Positioned.fill(
+                child: Padding(
+                  padding: EdgeInsets.all(12),
+                  child: DropOverlay(label: 'drop to extend track'),
+                ),
+              ),
           ],
         );
       },
@@ -246,7 +270,7 @@ class _HomePageState extends State<HomePage> {
             semanticsLabel: 'diskrot///nano',
           ),
           const SizedBox(width: 12),
-          const Flexible(
+          const Expanded(
             child: Text(
               'audio generation',
               maxLines: 1,
@@ -254,7 +278,7 @@ class _HomePageState extends State<HomePage> {
               style: TextStyle(color: NanoColors.textDim, fontSize: 13),
             ),
           ),
-          const Spacer(),
+          const SizedBox(width: 12),
           _healthPill(),
         ],
       ),
@@ -264,8 +288,6 @@ class _HomePageState extends State<HomePage> {
   List<Widget> _controlsChildren() {
     return [
       _header(),
-      const SizedBox(height: 22),
-      _modeSelector(),
       const SizedBox(height: 18),
       _conditioningCard(),
       _samplingCard(),
@@ -307,20 +329,22 @@ class _HomePageState extends State<HomePage> {
           ),
         )
       else
-        for (final clip in _clips)
-          ClipCard(
-            key: ValueKey(clip.id),
-            clip: clip,
-            player: _player,
-            onToggle: () =>
-                _player.toggle(clip.id.toString(), clip.blob!.url),
-            onDownload: () {
-              final ext = (clip.mime ?? '').contains('wav') ? 'wav' : 'mp3';
-              clip.blob?.download('nano-${clip.mode.label}-${clip.id}.$ext');
-            },
-            onDelete: () => _deleteClip(clip),
-          ),
+        for (final clip in _clips) _clipCardFor(clip),
     ];
+  }
+
+  Widget _clipCardFor(GenClip clip) {
+    return ClipCard(
+      key: ValueKey(clip.id),
+      clip: clip,
+      player: _player,
+      onToggle: () => _player.toggle(clip.id.toString(), clip.blob!.url),
+      onDownload: () {
+        final ext = (clip.mime ?? '').contains('wav') ? 'wav' : 'mp3';
+        clip.blob?.download('nano-${clip.mode.label}-${clip.id}.$ext');
+      },
+      onDelete: () => _deleteClip(clip),
+    );
   }
 
   void _deleteClip(GenClip clip) {
@@ -402,13 +426,25 @@ class _HomePageState extends State<HomePage> {
         style: const TextStyle(color: NanoColors.textDim, fontSize: 11));
   }
 
-  Widget _modeSelector() {
-    return SegmentedRow<NanoMode>(
-      options: NanoMode.values,
-      selected: _mode,
-      labelOf: (m) => m.label,
-      onSelect: (m) => setState(() => _mode = m),
-    );
+  /// Set the dropped library clip as the extend source — flips the derived mode
+  /// to extend and seeds the cut marker at the tail.
+  void _acceptExtendSource(GenClip clip) {
+    if (clip.status != ClipStatus.ready || clip.bytes == null) return;
+    final ext = (clip.mime ?? '').contains('wav') ? 'wav' : 'mp3';
+    setState(() {
+      _extendSource = clip;
+      _params.inputAudio = AudioFile('nano-clip-${clip.id}.$ext', clip.bytes!);
+      _params.fromSeconds = -1.0; // default: append at the tail
+    });
+  }
+
+  /// Clear the extend source — back to generate.
+  void _clearExtendSource() {
+    setState(() {
+      _extendSource = null;
+      _params.inputAudio = null;
+      _params.fromSeconds = -1.0;
+    });
   }
 
   Widget _conditioningCard() {
@@ -651,8 +687,16 @@ class _HomePageState extends State<HomePage> {
       NanoMode.extend => SectionCard(
           title: 'extend',
           children: [
-            _inputAudioRow(),
-            const SizedBox(height: 8),
+            _extendSourceRow(),
+            const SizedBox(height: 10),
+            if (_extendSource?.bytes != null)
+              ExtendWaveform(
+                bytes: _extendSource!.bytes!,
+                durationSeconds: _extendSource!.durationSeconds ?? 0,
+                fromSeconds: _params.fromSeconds,
+                onChanged: (v) => setState(() => _params.fromSeconds = v),
+              ),
+            const SizedBox(height: 12),
             LabeledSlider(
               label: 'add_seconds',
               value: _params.addSeconds,
@@ -678,15 +722,28 @@ class _HomePageState extends State<HomePage> {
     };
   }
 
-  Widget _inputAudioRow() {
-    return _filePickRow(
-      label: 'input audio (required)',
-      file: _params.inputAudio,
-      onPick: () async {
-        final f = await _pickAudio();
-        if (f != null) setState(() => _params.inputAudio = f);
-      },
-      onClear: () => setState(() => _params.inputAudio = null),
+  Widget _extendSourceRow() {
+    final name = _extendSource?.prompt.isNotEmpty == true
+        ? _extendSource!.prompt
+        : (_params.inputAudio?.name ?? 'dropped track');
+    return Row(
+      children: [
+        const Icon(Icons.link, size: 16, color: NanoColors.pink),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            name,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: NanoColors.text, fontSize: 12),
+          ),
+        ),
+        IconButton(
+          onPressed: _clearExtendSource,
+          icon: const Icon(Icons.close, size: 16, color: NanoColors.textDim),
+          tooltip: 'clear — back to generate',
+          visualDensity: VisualDensity.compact,
+        ),
+      ],
     );
   }
 
@@ -859,7 +916,6 @@ class ClipCard extends StatelessWidget {
         final ready = clip.status == ClipStatus.ready;
         final isCurrent = player.isCurrent(clip.id.toString());
         final isPlaying = isCurrent && player.isPlaying;
-        final progress = isCurrent ? player.progress : 0.0;
 
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
@@ -885,7 +941,12 @@ class ClipCard extends StatelessWidget {
               ),
               if (ready) ...[
                 const SizedBox(height: 10),
-                _progressBar(progress),
+                ClipWaveform(
+                  id: clip.id.toString(),
+                  url: clip.blob!.url,
+                  bytes: clip.bytes!,
+                  player: player,
+                ),
               ],
               if (ready && clip.sweetened != null) ...[
                 const SizedBox(height: 8),
@@ -1007,24 +1068,13 @@ class ClipCard extends StatelessWidget {
     );
   }
 
-  Widget _progressBar(double progress) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(2),
-      child: Container(
-        height: 4,
-        color: NanoColors.border,
-        child: FractionallySizedBox(
-          alignment: Alignment.centerLeft,
-          widthFactor: progress.clamp(0.0, 1.0),
-          child: Container(color: NanoColors.pink),
-        ),
-      ),
-    );
-  }
-
   Widget _footer(bool ready) {
     return Row(
       children: [
+        if (ready) ...[
+          _dragHandle(),
+          const SizedBox(width: 10),
+        ],
         Text(clip.mode.label,
             style: const TextStyle(color: NanoColors.textDim, fontSize: 11)),
         if (clip.clapScore != null) ...[
@@ -1052,6 +1102,62 @@ class ClipCard extends StatelessWidget {
       visualDensity: VisualDensity.compact,
       constraints: const BoxConstraints(),
       padding: const EdgeInsets.all(6),
+    );
+  }
+
+  /// Visible, immediate-drag handle: click-drag it onto the create panel to set
+  /// this clip as the extend source. A plain [Draggable] (not long-press) so a
+  /// normal mouse drag starts it; the small handle target keeps it from fighting
+  /// the list's vertical scroll.
+  Widget _dragHandle() {
+    return Draggable<GenClip>(
+      data: clip,
+      dragAnchorStrategy: pointerDragAnchorStrategy,
+      feedback: _dragFeedback(),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.grab,
+        child: Tooltip(
+          message: 'drag onto the create panel to extend',
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: const [
+              Icon(Icons.drag_indicator, size: 15, color: NanoColors.pink),
+              SizedBox(width: 2),
+              Text(
+                'extend',
+                style: TextStyle(
+                  color: NanoColors.pink,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _dragFeedback() {
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: NanoColors.pink,
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(
+          clip.prompt.isEmpty ? 'nano-clip-${clip.id}' : clip.prompt,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.black,
+            fontWeight: FontWeight.bold,
+            fontSize: 12,
+          ),
+        ),
+      ),
     );
   }
 }

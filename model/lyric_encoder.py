@@ -69,17 +69,32 @@ STRUCTURE_LABELS: tuple[str, ...] = (
 )
 _STRUCTURE_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in STRUCTURE_LABELS)
 
-# Frozen vocab: specials first (so PAD==0), then structure markers, then ARPABET.
+# Vocal-gender markers — ride the SAME phoneme stream as the structure markers,
+# for the same reason: gender is a (per-song, occasionally per-section) attribute
+# of the *vocals*, so emitting it as a marker the decoder cross-attends to
+# conditions vocal timbre with no new module, and it CFG-drops with the lyric
+# stream. The F0 labeler (diskrot.transcribe_lyrics) writes "male"/"female" per
+# song; ``<unknown_gender>`` is the fallback for instrumental / unlabeled /
+# ambiguous crops, so every stream always carries a valid gender slot (the same
+# dense-prefix discipline as ``<no_section>``). Placed between the structure
+# markers and _ARPABET so an ARPABET edit can't silently renumber them. Adding/
+# removing any of these changes PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
+UNKNOWN_GENDER_LABEL = "unknown_gender"
+GENDER_LABELS: tuple[str, ...] = (UNKNOWN_GENDER_LABEL, "male", "female")
+_GENDER_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in GENDER_LABELS)
+
+# Frozen vocab: specials first (so PAD==0), then structure markers, then gender
+# markers, then ARPABET.
 PHONEME_VOCAB: tuple[str, ...] = (
     PAD_PHONEME, BOS_PHONEME, WORD_BOUNDARY_PHONEME, UNK_PHONEME,
-) + _STRUCTURE_TOKENS + _ARPABET
+) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _ARPABET
 
 PHONEME_TO_ID: dict[str, int] = {p: i for i, p in enumerate(PHONEME_VOCAB)}
 PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
 BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
 WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
 UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
-PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 83 (4 specials + 9 structure + 70 ARPABET)
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 86 (4 specials + 9 structure + 3 gender + 70 ARPABET)
 
 # Structure label <-> phoneme id, the single source of truth shared by the dataset
 # (train-time injection) and inference (bracket parsing) so the two agree exactly.
@@ -103,6 +118,56 @@ def structure_label_to_id(label: str | None) -> int:
         return NO_SECTION_ID
     key = label.strip().lower().replace(" ", "_").replace("-", "_")
     return STRUCTURE_TOKEN_TO_ID.get(key, NO_SECTION_ID)
+
+
+# Gender label <-> phoneme id, parallel to the structure mapping above. Shared by
+# the dataset (train-time prefix injection) and inference (bracket parsing) so the
+# two agree exactly.
+GENDER_TOKEN_TO_ID: dict[str, int] = {
+    label: PHONEME_TO_ID[f"<{label}>"] for label in GENDER_LABELS
+}
+ID_TO_GENDER: dict[int, str] = {i: label for label, i in GENDER_TOKEN_TO_ID.items()}
+UNKNOWN_GENDER_ID: int = GENDER_TOKEN_TO_ID[UNKNOWN_GENDER_LABEL]
+GENDER_IDS: frozenset[int] = frozenset(GENDER_TOKEN_TO_ID.values())
+
+# Aliases a user (or a labeler) might type for the two canonical labels. Kept
+# explicit so ``gender_label_to_id`` can both map AND recognize them (an unknown
+# label maps to <unknown_gender>, so mapping alone can't tell "unknown" apart
+# from "unrecognized" — ``is_gender_label`` needs this set to classify brackets).
+_GENDER_ALIASES: dict[str, str] = {
+    "m": "male", "man": "male", "men": "male", "boy": "male", "guy": "male",
+    "f": "female", "woman": "female", "women": "female", "girl": "female",
+    "unknown": UNKNOWN_GENDER_LABEL, "none": UNKNOWN_GENDER_LABEL,
+}
+_RECOGNIZED_GENDER_KEYS: frozenset[str] = frozenset(GENDER_TOKEN_TO_ID) | frozenset(_GENDER_ALIASES)
+
+
+def _normalize_label(label: str) -> str:
+    return label.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def gender_label_to_id(label: str | None) -> int:
+    """Map a gender label to its marker id, falling back to <unknown_gender>.
+
+    Normalizes case/whitespace and folds common aliases (``m``/``man`` -> male,
+    ``f``/``woman`` -> female). The train and inference paths both route gender
+    labels through this so the id mapping stays identical."""
+    if not label:
+        return UNKNOWN_GENDER_ID
+    key = _normalize_label(label)
+    key = _GENDER_ALIASES.get(key, key)
+    return GENDER_TOKEN_TO_ID.get(key, UNKNOWN_GENDER_ID)
+
+
+def is_gender_label(label: str | None) -> bool:
+    """True if ``label`` names a gender (canonical or alias).
+
+    Used by the inference bracket parser to route ``[male]`` to the gender prefix
+    slot vs ``[chorus]`` to the section slot. Distinct from ``gender_label_to_id``
+    because that folds *unrecognized* labels to <unknown_gender> too."""
+    if not label:
+        return False
+    return _normalize_label(label) in _RECOGNIZED_GENDER_KEYS
 
 # Punctuation g2p_en passes through verbatim that we fold into a word boundary
 # rather than dropping (keeps phrase structure the decoder can align to).
@@ -214,20 +279,23 @@ _MARKER_RE = re.compile(r"\[([^\[\]]+)\]")
 def text_with_markers_to_phoneme_ids(
     text: str, max_len: int | None = None, add_bos: bool = True,
 ) -> list[int]:
-    """Inference-side lyric parser: ``[verse] words [chorus] words`` -> phoneme ids.
+    """Inference-side lyric parser: ``[female] [verse] words [chorus] words`` -> ids.
 
     Reproduces the dataset's train-time stream exactly (see ``append_unit`` and
     ``TokenDataset._get_segment_lyric_ids``):
 
-      ``BOS  <prefix-section>  w w  <inline-section>  w ...``
+      ``BOS  <prefix-gender>  <prefix-section>  w w  <inline-section>  w ...``
 
-    Prefix rule: if the string starts with a ``[label]`` marker it becomes the
-    section prefix (emitted once, right after BOS); otherwise the prefix is
-    ``<no_section>`` — so every stream carries a valid section, matching the dense
-    train-time prefix. Brackets are stripped here and never reach g2p (the biggest
-    train/inference footgun); unknown labels fold to ``<no_section>`` via
-    ``structure_label_to_id``. Word spans are phonemized with the same per-word
-    grouping the dataset uses (``text_to_word_phoneme_groups``).
+    Prefix rules — every stream carries BOTH a gender slot and a section slot,
+    always, matching the dense train-time prefix:
+    - Leading ``[label]`` markers are consumed as prefixes: one gender (``[male]``
+      / ``[female]``) and one section (``[verse]`` ...), in either order. A gender
+      not given defaults to ``<unknown_gender>``, a section to ``<no_section>``.
+    - Gender is emitted first, then section (the train-time order).
+    Remaining markers after the leading run are inline section markers. Brackets
+    are stripped here and never reach g2p (the biggest train/inference footgun);
+    unknown labels fold to ``<no_section>`` via ``structure_label_to_id``. Word
+    spans are phonemized with the same per-word grouping the dataset uses.
     """
     parts = _MARKER_RE.split(text or "")
     # re.split with one capture group yields: text, label, text, label, ...
@@ -240,12 +308,22 @@ def text_with_markers_to_phoneme_ids(
             events.append(("text", part))
 
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
-    if events and events[0][0] == "marker":
-        prefix_id = structure_label_to_id(events[0][1])
+    # Consume the leading run of markers as prefixes: at most one gender + one
+    # section. Stop at the first text span or once both slots are filled.
+    gender_id = UNKNOWN_GENDER_ID
+    section_id = NO_SECTION_ID
+    gender_set = section_set = False
+    while events and events[0][0] == "marker":
+        label = events[0][1]
+        if is_gender_label(label) and not gender_set:
+            gender_id, gender_set = gender_label_to_id(label), True
+        elif not section_set and not is_gender_label(label):
+            section_id, section_set = structure_label_to_id(label), True
+        else:
+            break
         events = events[1:]
-    else:
-        prefix_id = NO_SECTION_ID
-    append_unit(ids, [prefix_id])
+    # Compact 2-marker header (no internal word-boundary): BOS <gender> <section>.
+    append_unit(ids, [gender_id, section_id])
 
     for kind, val in events:
         if kind == "marker":

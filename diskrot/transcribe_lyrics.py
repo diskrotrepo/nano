@@ -86,8 +86,51 @@ def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str
     return vocals_mono
 
 
+# Vocal-gender labeling (F0 heuristic) ----------------------------------------
+# Median voiced pitch of the isolated vocal stem splits male vs female robustly
+# enough for a conditioning marker: male singing F0 clusters well below female.
+# We estimate on the Demucs vocal stem (already a clean signal), take the median
+# of the voiced frames, and threshold. Ambiguous / too-little-voiced -> None, so
+# the dataset falls back to <unknown_gender> rather than committing a bad guess.
+# This is a coarse label by design — it feeds the gender markers in
+# model/lyric_encoder.py, which are robust to some label noise.
+_GENDER_F0_THRESHOLD_HZ = 165.0   # ~E3; >= -> female, < -> male
+_GENDER_MIN_VOICED_FRAMES = 50    # need enough voiced pitch to trust the median
+_GENDER_MAX_ANALYSIS_SEC = 90     # cap pYIN cost; plenty for a stable median
+
+
+def estimate_vocal_gender(vocals: np.ndarray, sr: int) -> str | None:
+    """Estimate "male"/"female" from an isolated vocal stem via median voiced F0.
+
+    Returns None when the stem has too little voiced content to trust (e.g. a
+    near-instrumental Demucs mis-route) — the caller leaves gender unset and the
+    model sees <unknown_gender>."""
+    import librosa
+
+    if vocals.size == 0:
+        return None
+    clip = vocals[: int(_GENDER_MAX_ANALYSIS_SEC * sr)]
+    try:
+        f0, _, _ = librosa.pyin(
+            clip, sr=sr,
+            fmin=float(librosa.note_to_hz("C2")),  # ~65 Hz
+            fmax=float(librosa.note_to_hz("C6")),  # ~1047 Hz
+        )
+    except Exception:
+        return None
+    voiced = f0[np.isfinite(f0)]
+    if voiced.size < _GENDER_MIN_VOICED_FRAMES:
+        return None
+    median_f0 = float(np.median(voiced))
+    return "female" if median_f0 >= _GENDER_F0_THRESHOLD_HZ else "male"
+
+
 def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
-    """Transcribe vocals array at 44100Hz. Returns {text, words} or None if empty."""
+    """Transcribe vocals array at 44100Hz. Returns {text, words, gender} or None.
+
+    ``gender`` is the F0-estimated vocal gender ("male"/"female"/None); it rides
+    in the same per-song entry the dataset reads, so the gender marker is wired
+    with no extra store. None entries (instrumental) carry no gender at all."""
     # faster-whisper expects 16kHz
     import librosa
 
@@ -112,7 +155,9 @@ def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
     if not full_text:
         return None
 
-    return {"text": full_text, "words": words}
+    # Estimate on the 16 kHz vocals (Nyquist 8 kHz >> vocal F0; cheaper than 44.1).
+    gender = estimate_vocal_gender(vocals_16k, sr=16000)
+    return {"text": full_text, "words": words, "gender": gender}
 
 
 def _flush_shards(lyrics_dir: Path, lyrics: dict, dirty: set[int]) -> None:

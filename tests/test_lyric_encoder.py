@@ -14,14 +14,19 @@ import torch
 
 from model.lyric_encoder import (
     BOS_PHONEME_ID,
+    GENDER_LABELS,
+    GENDER_TOKEN_TO_ID,
     NO_SECTION_ID,
     PAD_PHONEME_ID,
     PHONEME_VOCAB,
     PHONEME_VOCAB_SIZE,
     STRUCTURE_LABELS,
     STRUCTURE_TOKEN_TO_ID,
+    UNKNOWN_GENDER_ID,
     WORD_BOUNDARY_ID,
     LyricEncoder,
+    gender_label_to_id,
+    is_gender_label,
     structure_label_to_id,
     text_to_phoneme_ids,
     text_with_markers_to_phoneme_ids,
@@ -52,18 +57,48 @@ def test_vocab_specials_at_low_ids():
 def test_vocab_size_and_uniqueness():
     assert PHONEME_VOCAB_SIZE == len(PHONEME_VOCAB)
     assert len(set(PHONEME_VOCAB)) == PHONEME_VOCAB_SIZE  # no dup ids
-    assert PHONEME_VOCAB_SIZE == 83  # 4 specials + 9 structure + 70 ARPABET
+    assert PHONEME_VOCAB_SIZE == 86  # 4 specials + 9 structure + 3 gender + 70 ARPABET
 
 
 # --- structure markers -------------------------------------------------------
 def test_structure_tokens_present_contiguous_below_arpabet():
     assert len(STRUCTURE_LABELS) == 9
     ids = [STRUCTURE_TOKEN_TO_ID[label] for label in STRUCTURE_LABELS]
-    # sit right after the 4 specials, contiguous, before ARPABET (the rest)
+    # sit right after the 4 specials, contiguous, before gender + ARPABET
     assert ids == list(range(4, 4 + len(STRUCTURE_LABELS)))
-    arpabet_start = 4 + len(STRUCTURE_LABELS)
+    arpabet_start = 4 + len(STRUCTURE_LABELS) + len(GENDER_LABELS)
     assert all(i < arpabet_start for i in ids)
     assert PHONEME_VOCAB[NO_SECTION_ID] == "<no_section>"
+
+
+# --- gender markers ----------------------------------------------------------
+def test_gender_tokens_present_after_structure_below_arpabet():
+    assert GENDER_LABELS == ("unknown_gender", "male", "female")
+    ids = [GENDER_TOKEN_TO_ID[label] for label in GENDER_LABELS]
+    # sit right after the 9 structure markers, contiguous, before ARPABET
+    start = 4 + len(STRUCTURE_LABELS)
+    assert ids == list(range(start, start + len(GENDER_LABELS)))
+    assert PHONEME_VOCAB[UNKNOWN_GENDER_ID] == "<unknown_gender>"
+
+
+def test_gender_label_to_id_folds_aliases_and_unknown():
+    assert gender_label_to_id("male") == GENDER_TOKEN_TO_ID["male"]
+    assert gender_label_to_id("FEMALE") == GENDER_TOKEN_TO_ID["female"]
+    assert gender_label_to_id(" Man ") == GENDER_TOKEN_TO_ID["male"]
+    assert gender_label_to_id("woman") == GENDER_TOKEN_TO_ID["female"]
+    assert gender_label_to_id("f") == GENDER_TOKEN_TO_ID["female"]
+    # unrecognized / empty -> unknown_gender (never crashes, never bogus id)
+    assert gender_label_to_id("robot") == UNKNOWN_GENDER_ID
+    assert gender_label_to_id(None) == UNKNOWN_GENDER_ID
+    assert gender_label_to_id("") == UNKNOWN_GENDER_ID
+
+
+def test_is_gender_label_classifies_brackets():
+    assert is_gender_label("male") and is_gender_label("WOMAN") and is_gender_label("f")
+    # section labels and junk are NOT gender (so the parser routes them to section)
+    assert not is_gender_label("chorus")
+    assert not is_gender_label("robot")
+    assert not is_gender_label(None)
 
 
 def test_structure_label_to_id_folds_unknown_and_normalizes():
@@ -81,10 +116,25 @@ def test_structure_label_to_id_folds_unknown_and_normalizes():
 def test_markers_parse_prefix_and_inline():
     ids = text_with_markers_to_phoneme_ids("[verse] hello [chorus] world")
     assert ids[0] == BOS_PHONEME_ID
-    assert ids[1] == STRUCTURE_TOKEN_TO_ID["verse"]  # leading marker is the prefix
-    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[2:]  # inline marker
+    assert ids[1] == UNKNOWN_GENDER_ID  # dense gender slot (none given)
+    assert ids[2] == STRUCTURE_TOKEN_TO_ID["verse"]  # leading section marker = prefix
+    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[3:]  # inline marker
     # verse appears once (prefix only, not re-emitted)
     assert ids.count(STRUCTURE_TOKEN_TO_ID["verse"]) == 1
+
+
+@g2p_required
+def test_markers_parse_gender_prefix_order_independent():
+    # gender given before OR after the section both land in the gender slot;
+    # the emitted prefix order is always <gender> <section>.
+    a = text_with_markers_to_phoneme_ids("[female] [chorus] hello")
+    b = text_with_markers_to_phoneme_ids("[chorus] [female] hello")
+    assert a == b
+    assert a[0] == BOS_PHONEME_ID
+    assert a[1] == GENDER_TOKEN_TO_ID["female"]
+    assert a[2] == STRUCTURE_TOKEN_TO_ID["chorus"]
+    # gender appears once (prefix only, never inline)
+    assert a.count(GENDER_TOKEN_TO_ID["female"]) == 1
 
 
 @g2p_required
@@ -93,20 +143,22 @@ def test_markers_no_bracket_artifact_reaches_g2p():
     ids = text_with_markers_to_phoneme_ids("[chorus] singing the blues")
     assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
     plain = text_to_phoneme_ids("singing the blues", add_bos=False)
-    # the phoneme tail (after BOS + chorus prefix + leading WB) equals plain g2p
-    assert ids[3:] == plain
+    # tail after BOS + <gender> + <chorus> prefixes + leading WB equals plain g2p
+    assert ids[4:] == plain
 
 
 @g2p_required
-def test_markers_default_prefix_is_no_section():
+def test_markers_default_prefixes_are_unknown_gender_and_no_section():
     ids = text_with_markers_to_phoneme_ids("hello world")
-    assert ids[1] == NO_SECTION_ID  # no leading marker -> no_section prefix
+    assert ids[1] == UNKNOWN_GENDER_ID  # no gender marker -> unknown_gender
+    assert ids[2] == NO_SECTION_ID      # no section marker -> no_section
 
 
 @g2p_required
 def test_markers_unknown_label_folds_to_no_section():
     ids = text_with_markers_to_phoneme_ids("[prechorus] hello")
-    assert ids[1] == NO_SECTION_ID  # unknown label as prefix
+    assert ids[1] == UNKNOWN_GENDER_ID  # gender slot still dense
+    assert ids[2] == NO_SECTION_ID      # unknown label as section prefix
 
 
 @g2p_required
