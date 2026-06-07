@@ -127,11 +127,12 @@ def test_evaluate_restores_train_mode_on_exception():
     assert model.training is True
 
     # Minimal loader — yields one bogus batch then stops.
-    # collate_lyrics shape: (tokens, tags, lyric_ids, lyric_mask).
+    # collate_lyrics shape: (tokens, tags, lyric_ids, lyric_mask, melody).
     def loader_iter():
         yield (
             torch.zeros(1, 9, 10, dtype=torch.long), [""],
             torch.ones(1, 1, dtype=torch.long), torch.ones(1, 1, dtype=torch.bool),
+            None,  # melody (no melody conditioning in this audit)
         )
 
     cfg = TrainConfig(device="cpu")
@@ -266,7 +267,7 @@ def test_dataset_storage_is_int16_not_int64(synth_tokens_dir):
     tokens_dir = synth_tokens_dir(n_files=5, T=1000)
     pack(tokens_dir, verbose=False)
     ds = TokenDataset(tokens_dir, segment_frames=500)
-    sample, _, _ = ds[0]
+    sample, *_ = ds[0]
     assert sample.dtype == torch.int16, (
         f"P3: dataset must keep int16 on host (got {sample.dtype}). "
         "Cast to int64 happens on GPU at batch time."
@@ -283,7 +284,7 @@ def test_int16_storage_round_trips_through_embedding(synth_tokens_dir):
     tokens_dir = synth_tokens_dir(n_files=3, T=600, vocab=1024)
     pack(tokens_dir, verbose=False)
     ds = TokenDataset(tokens_dir, segment_frames=500)
-    sample16, _, _ = ds[0]  # [K=9, T=500] int16
+    sample16, *_ = ds[0]  # [K=9, T=500] int16
 
     # An int64 "oracle" via explicit cast
     sample64 = sample16.to(torch.int64)

@@ -435,8 +435,9 @@ def _evaluate(
     model.eval()
     try:
         use_lyrics = cfg.model.use_lyric_conditioning
+        use_melody = cfg.model.use_melody_conditioning
         losses, per_cb_sums = [], None
-        for i, (batch, tags, lyric_ids, lyric_mask) in enumerate(loader):
+        for i, (batch, tags, lyric_ids, lyric_mask, melody) in enumerate(loader):
             if i >= n_batches:
                 break
             # int16 on host (P3 — saves ~24 GB shared RAM at the production
@@ -452,9 +453,13 @@ def _evaluate(
             if use_lyrics:
                 l_ids = lyric_ids.to(cfg.device, non_blocking=True)
                 l_mask = lyric_mask.to(cfg.device, non_blocking=True)
+            mel = None
+            if use_melody and melody is not None:
+                mel = melody.to(cfg.device, non_blocking=True)
 
             with torch.amp.autocast(cfg.device, enabled=amp_enabled):
-                logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids, lyric_mask=l_mask)
+                logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
+                               lyric_mask=l_mask, melody=mel)
                 _, per_cb = _loss_fn(logits, targets, pad_id)
             if per_cb_sums is None:
                 per_cb_sums = per_cb.clone()
@@ -608,6 +613,15 @@ def train_run(
         print(f"lyric (phoneme) conditioning enabled: {n_lyrics} songs with lyrics "
               f"(max_lyric_len={cfg.model.max_lyric_len}, cfg_dropout={cfg.cfg_dropout})")
 
+    if cfg.model.use_melody_conditioning and main:
+        if getattr(train_ds, "_has_melody", False):
+            print(f"melody (chroma) conditioning enabled (n_bins={cfg.model.melody_n_bins}, "
+                  f"cfg_dropout={cfg.cfg_dropout})")
+        else:
+            print("WARNING: use_melody_conditioning=True but the pack has NO chroma "
+                  "sidecar — repack with --mel-cache-dir. Training will add only the "
+                  "learned null (no melody signal).")
+
     # Wrap in DDP *before* torch.compile so the compiled graph includes the
     # DDP comm hooks. device_ids selects this rank's GPU.
     if use_ddp:
@@ -684,13 +698,13 @@ def train_run(
     while step < cfg.steps:
         t_io = time.time()
         try:
-            batch, tags, lyric_ids, lyric_mask = next(train_iter)
+            batch, tags, lyric_ids, lyric_mask, melody = next(train_iter)
         except StopIteration:
             epoch += 1
             if use_ddp and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
-            batch, tags, lyric_ids, lyric_mask = next(train_iter)
+            batch, tags, lyric_ids, lyric_mask, melody = next(train_iter)
         dataloader_wait_s += time.time() - t_io
 
         # int16 on host (P3 — saves ~24 GB shared RAM). Cast to int64 on
@@ -709,12 +723,20 @@ def train_run(
         if cfg.model.use_lyric_conditioning and _rng.random() >= cfg.cfg_dropout:
             l_ids = lyric_ids.to(cfg.device, non_blocking=True)
             l_mask = lyric_mask.to(cfg.device, non_blocking=True)
+        # Melody dropped INDEPENDENTLY too (its own Bernoulli). "Drop melody" =
+        # pass None so forward adds the learned null instead of the chroma — the
+        # unconditional state inference's CFG baseline also uses.
+        mel = None
+        if (cfg.model.use_melody_conditioning and melody is not None
+                and _rng.random() >= cfg.cfg_dropout):
+            mel = melody.to(cfg.device, non_blocking=True)
 
         for g in optim.param_groups:
             g["lr"] = _cosine_lr(step, cfg)
 
         with torch.amp.autocast(cfg.device, enabled=amp_enabled):
-            logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids, lyric_mask=l_mask)
+            logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
+                           lyric_mask=l_mask, melody=mel)
             loss, per_cb = _loss_fn(logits, targets, pad_id)
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -890,13 +912,18 @@ if __name__ == "__main__":
     p.add_argument("--tags-path", type=str, default=None, help="path to tags.json for text conditioning")
     p.add_argument("--lyrics-path", type=str, default=None, help="path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning")
     p.add_argument("--structure-path", type=str, default=None, help="path to structure (sharded dir or JSON) for section-marker conditioning")
+    p.add_argument("--melody", action="store_true",
+                   help="enable melody (chroma) conditioning — requires the pack to "
+                        "have been built with --mel-cache-dir (parallel .mel.bin)")
     args = p.parse_args()
 
     # Tags drive the pooled-CLAP path (use_text_conditioning); lyrics drive the
     # phoneme LyricEncoder path (use_lyric_conditioning) — independent flags now.
+    # Melody drives the additive chroma path (use_melody_conditioning).
     model_cfg = GPTConfig(
         use_text_conditioning=args.tags_path is not None,
         use_lyric_conditioning=args.lyrics_path is not None,
+        use_melody_conditioning=args.melody,
     )
     cfg = TrainConfig(
         device=args.device,

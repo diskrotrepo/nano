@@ -7,10 +7,13 @@ Endpoints:
     GET  /health
     POST /generate       from scratch — random seed → fresh clip
     POST /extend         continue forward from a point T → [original 0→T | new]
+    POST /cover          re-render a hummed melody (chroma) in the prompt's timbre
 
-Both accept optional text (tags), lyrics, and style_audio conditioning. /extend
-seeds from the overlap_seconds before a cut point T, keeps the original up to T,
-and generates forward (T defaults to the clip end, a seamless grow-the-clip).
+    /generate, /extend accept optional text (tags), lyrics, and style_audio
+conditioning. /extend seeds from the overlap_seconds before a cut point T, keeps
+the original up to T, and generates forward (T defaults to the clip end, a
+seamless grow-the-clip). /cover conditions on the uploaded melody's chromagram
+(its audio never appears in the output) and needs a melody-trained checkpoint.
 See each endpoint's docstring (surfaced in /docs).
 """
 from __future__ import annotations
@@ -236,5 +239,56 @@ async def extend_endpoint(
             lyric_cfg_scale=lyric_cfg_scale or None,
         )
     except ValueError as e:
+        raise HTTPException(400, str(e))
+    return Response(content=body, media_type=mime, headers=sweet_headers)
+
+
+@app.post("/cover")
+async def cover_endpoint(
+    melody_audio: UploadFile = File(...),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form(""),
+    per_cb_top_k: str = Form(""),
+    per_cb_top_p: str = Form(""),
+    cfg_scale: float = Form(3.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    negative_prompt: str = Form(""),
+    sweeten: bool = Form(True),
+    melody_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(0.0),
+) -> Response:
+    """Cover a hummed/uploaded melody in the prompt's timbre.
+
+    `melody_audio` is the melody to follow (a hum, whistle, or any clip). It is
+    converted to a chromagram and used to condition generation — its audio/tokens
+    never appear in the output. `prompt` (tags) drives the timbre/instrumentation
+    (e.g. "solo violin") and `lyrics` the words to sing; the hum's length sets the
+    output length. `melody_cfg_scale` (>0) pushes melody adherence with its own
+    guidance scale, independent of `cfg_scale`.
+
+    Requires a checkpoint trained with melody conditioning (use_melody_conditioning).
+    """
+    assert engine is not None
+    data = await melody_audio.read()
+    if not data:
+        raise HTTPException(400, "empty melody_audio upload")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    combined = _combine_text_lyrics(prompt, lyrics)
+    try:
+        body, mime = engine.cover_audio(
+            data,
+            temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+            top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+            top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+            cfg_scale=cfg_scale,
+            text=combined,
+            negative_text=negative_prompt.strip() or None,
+            melody_cfg_scale=melody_cfg_scale or None,
+            lyric_cfg_scale=lyric_cfg_scale or None,
+        )
+    except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
     return Response(content=body, media_type=mime, headers=sweet_headers)

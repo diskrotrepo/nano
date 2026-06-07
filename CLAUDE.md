@@ -12,8 +12,8 @@ Audio generation model. Decoder-only transformer trained on DAC-tokenized audio 
 ```
 MP3 corpus → DAC tokenizer → [9 codebooks, 1024 vocab, 86 Hz] → Transformer → audio
                                                                       ↑
-                                                        optional CLAP conditioning
-                                                        (tags, lyrics, style audio)
+                                              tags (pooled CLAP) + lyrics (phonemes)
+                                              + melody (time-aligned chromagram)
 ```
 
 **Model**: Decoder-only transformer with 9 codebook prediction heads. Trains on 30-second segments. Max single-shot generation ~95 seconds (max_seq_len=8192, RoPE). Shape is configured at launch via `GPTConfig` — `DEFAULTS` in [diskrot/modal_train.py](diskrot/modal_train.py) is the source of truth (currently d_model=2048, n_layers=22, n_heads=16, d_ff=8192 → ~1.5B).
@@ -27,7 +27,9 @@ MP3 corpus → DAC tokenizer → [9 codebooks, 1024 vocab, 86 Hz] → Transforme
 
   **Markers in the lyric stream** — the phoneme stream also carries non-word **marker tokens** the decoder cross-attends to (frozen in `PHONEME_VOCAB`): *song-structure* markers (`<verse>`, `<chorus>`, …, from the allin1 analyzer) and *vocal-gender* markers (`<male>`/`<female>`/`<unknown_gender>`, from an F0 heuristic on the Demucs vocal stem — see `transcribe_lyrics.estimate_vocal_gender`). Every stream opens with a compact dense header `BOS <gender> <section>` (with `<unknown_gender>`/`<no_section>` fallbacks so no row is fully padded); structure boundaries inside a crop are injected inline. The train-time injector (`TokenDataset._get_segment_lyric_ids`) and the inference parser (`text_with_markers_to_phoneme_ids`, which accepts `[female] [chorus] …` brackets) MUST build byte-identical streams — `tests/test_structure_markers.py` is the guard. Adding/removing any marker changes `PHONEME_VOCAB_SIZE` and is checkpoint-incompatible.
 
-Each stream drops independently for classifier-free guidance (10% each during training); at inference `cfg_scale` guides them jointly, or an optional `lyric_cfg_scale` pushes the lyric axis harder via composed guidance. The phoneme `LyricEncoder` is a submodule of the model, so it saves/restores in the `model` state_dict (no sidecar key like CLAP's `text_proj`). Checkpoints from before the lyric encoder (v7) are incompatible — `ckpt_subdir` is now `v8_sing`.
+**Melody conditioning** (the `/cover` path) — a third axis, separate again from tags and lyrics. A hummed/uploaded melody is encoded as a **time-aligned 12-bin chromagram** (octave-invariant `chroma_cqt` at the 86 Hz DAC frame rate; `diskrot/melody.py:extract_chroma` is the single train==inference contract). Because the signal is dense and frame-aligned (unlike the ragged phoneme sequence), it is conditioned **additively, not via cross-attention**: `MelodyEncoder` ([model/melody_encoder.py](model/melody_encoder.py), a submodule of `NanoAudioGPT`) projects the chroma and the decoder adds it to the per-frame token-sum input at the **cb0 anchor** (delayed position p ↔ frame p; the K-1 delay tail and any prompt prefix get a learned `null`). This lets the model regenerate a melodic contour in whatever timbre the tags ask for (e.g. hum → solo violin) while the octave stays free. Per-song chroma is stored in a parallel `packed_NNN.mel.bin` sidecar at the same offsets as the tokens, so the dataset co-crops it with the identical crop window — `tests/test_melody.py` guards the equivalence.
+
+Each stream drops independently for classifier-free guidance (10% each during training; melody drops to its learned null); at inference `cfg_scale` guides them jointly, or an optional `lyric_cfg_scale` / `melody_cfg_scale` pushes that axis harder via composed guidance. The `LyricEncoder` and `MelodyEncoder` are submodules of the model, so they save/restore in the `model` state_dict (no sidecar key like CLAP's `text_proj`). Checkpoints from before the lyric encoder (v7) are incompatible; v8 (`ckpt_subdir="v8_sing"`) ships both the lyric and melody encoders in one fresh start — adding the melody encoder is itself checkpoint-incompatible and requires the pack to carry the chroma sidecar.
 
 ## Key Files
 
@@ -37,26 +39,29 @@ Each stream drops independently for classifier-free guidance (10% each during tr
 - `delay_pattern.py` — apply_delay(), revert_delay(), build_train_inputs(). MusicGen delay logic.
 - `text_encoder.py` — CLAPTextEncoder. Frozen CLAP + learned projection. encode() for **tags**, encode_audio() for style references. (Lyrics no longer go through CLAP.)
 - `lyric_encoder.py` — phoneme lyric conditioning. Frozen `PHONEME_VOCAB` (4 specials + structure markers + gender markers + ARPABET) + `text_to_phoneme_ids`/`text_to_word_phoneme_groups` (g2p_en, the single train==inference id mapping) + `structure_label_to_id`/`gender_label_to_id` + `text_with_markers_to_phoneme_ids` (inference `[chorus]`/`[female]` bracket parser) + `LyricEncoder` (small bidirectional transformer, a submodule of NanoAudioGPT). The token-sequence path that lets the model sing words (and carries the structure/gender markers it conditions on).
+- `melody_encoder.py` — chromagram melody conditioning. `MelodyEncoder` (12→d_model conv/linear stack + a learned `null`), a submodule of NanoAudioGPT. Unlike tags/lyrics (cross-attention), melody is **dense and time-aligned**, so it's added to the decoder's per-frame input at the cb0 anchor. The additive path that lets a hummed melody be re-rendered in the prompt's timbre (`/cover`).
 - `captioner.py` — Vendored LP-MusicCaps (BART-based audio captioner). load_captioner() for inference.
 
 ### Training (`diskrot/`)
 - `train.py` — TrainConfig + train_run(). Device-agnostic training loop. Cosine LR with warmup, AdamW, early stopping, per-codebook loss logging. CLI: `python -m diskrot.train`.
-- `dataset.py` — TokenDataset. Mmap-backed sharded dataset via `load_mmap_bundle()`. Serves random 30s crops. `__getitem__` returns `(tokens, tags, lyric_ids)` (time-aligned phoneme ids for the crop window, BOS-seeded); `collate_lyrics` pads the ragged lyric sequences + builds the mask. g2p runs once per song (cached, sliced by word).
+- `dataset.py` — TokenDataset. Mmap-backed sharded dataset via `load_mmap_bundle()`. Serves random 30s crops. `__getitem__` returns `(tokens, tags, lyric_ids, melody)` — time-aligned phoneme ids (BOS-seeded) and the chroma crop (`[seg,12]` or `None`) co-cropped with the identical window; `collate_lyrics` pads the ragged lyric sequences + builds the mask + stacks the melody. g2p runs once per song (cached, sliced by word).
+- `melody.py` — `extract_chroma()`: the shared train==inference chromagram extractor (octave-invariant `chroma_cqt`, hop=512 → 86 Hz, L2-normalized, frame count forced to the DAC `ceil(samples/512)`). Used by the packer (train) and the server cover path (inference).
 - `tokenize.py` — Converts MP3 corpus to cached DAC .pt files. CLI: `python -m diskrot.tokenize`.
 - `auto_tag.py` — LP-MusicCaps audio captioning. Generates natural-language descriptions from audio. CLI: `python -m diskrot.auto_tag`.
 - `transcribe_lyrics.py` — Demucs vocal isolation + Whisper transcription + F0 vocal-gender labeling (`estimate_vocal_gender` writes a `gender` field per song). CLI: `python -m diskrot.transcribe_lyrics`.
-- `pack_cache.py` — Packs .pt token files into the sharded mmap layout (`packed/packed_NNN.bin` + `packed_index.json`). Deterministic and **resumable**: shards are written atomically and a re-run skips shards already complete-and-valid on disk, so a kill/preemption mid-pack only loses the in-flight shard (not an in-place update — it still validates every shard). `pack()` takes an optional `commit_cb` so the Modal wrapper can commit each shard to the volume. CLI: `python -m diskrot.pack_cache`.
+- `pack_cache.py` — Packs .pt token files into the sharded mmap layout (`packed/packed_NNN.bin` + `packed_index.json`). Deterministic and **resumable**: shards are written atomically and a re-run skips shards already complete-and-valid on disk, so a kill/preemption mid-pack only loses the in-flight shard (not an in-place update — it still validates every shard). `pack()` takes an optional `commit_cb` so the Modal wrapper can commit each shard to the volume. With `--mel-cache-dir` it also writes a parallel `packed_NNN.mel.bin` (12×fp16 chroma) at the **same per-song offsets** from the `<name>.mel.npy` files (missing/mismatched chroma is zero-filled, never dropped, so membership stays identical). CLI: `python -m diskrot.pack_cache`.
 - `modal_train.py` — Modal H100/DDP training entrypoint. `DEFAULTS` here is the model's source of truth. `modal run --detach diskrot/modal_train.py --n-gpus 4`.
 - `modal_tokenize.py` — Modal L4 tokenization (up to 50 containers). `modal run --detach diskrot/modal_tokenize.py`.
 - `modal_auto_tag.py` — Modal L4 audio captioning (up to 20 containers). `modal run --detach diskrot/modal_auto_tag.py`.
 - `modal_transcribe.py` — Modal L4 parallel transcription (up to 50 containers). `modal run --detach diskrot/modal_transcribe.py`.
+- `modal_melody.py` — Modal CPU parallel chromagram extraction (up to 50 containers); writes per-song `<name>.mel.npy` for melody conditioning. Runs **after** tokenize (needs the token frame count to align), **before** pack. `modal run --detach diskrot/modal_melody.py`.
 - `modal_prepare.py` — CPU pass that validates (ffprobe), dedupes (SHA-256), drops <20s clips, and drops long files (>5:30) so the L4 tokenizer doesn't OOM. `modal run --detach diskrot/modal_prepare.py [--apply]`.
 - `modal_pack_cache.py` — Modal wrapper around `pack_cache.py`.
 - `modal_inspect_ckpts.py` — Inspect a checkpoint trajectory on the volume. `modal run diskrot/modal_inspect_ckpts.py --prefix v7_1500m`.
 
 ### Server (`server/`)
-- `main.py` — FastAPI app with endpoints: GET /health, POST /generate, POST /extend. All generation endpoints accept optional text, lyrics, style_audio, and style_weight params. (`/extend` continues a clip forward from a cut point `from_seconds`, defaulting to the clip tail.)
-- `inference.py` — InferenceEngine. Loads checkpoint, handles float16 casting and torch.compile. generate_audio(), extend_audio() methods.
+- `main.py` — FastAPI app with endpoints: GET /health, POST /generate, POST /extend, POST /cover. /generate and /extend accept optional text, lyrics, style_audio, and style_weight params. (`/extend` continues a clip forward from a cut point `from_seconds`, defaulting to the clip tail.) `/cover` takes a required `melody_audio` upload (the hum), conditions on its chromagram (the audio never appears in the output), and uses the prompt for timbre — needs a melody-trained checkpoint; supports `melody_cfg_scale`.
+- `inference.py` — InferenceEngine. Loads checkpoint, handles float16 casting and torch.compile. generate_audio(), extend_audio(), cover_audio() methods (cover_audio + `_build_melody` for the chroma path).
 
 ### Scripts (`scripts/`)
 - `dac_roundtrip.py` — DAC encode/decode sanity check. Writes orig + reconstructed WAVs.
@@ -91,18 +96,19 @@ Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `
 1. **Add corpus**: upload your own MP3s → `nano-corpus` volume (`modal volume put`)
 2. **Prepare**: validate (ffprobe) + dedupe (SHA-256) + drop <20s + drop long files (>5:30) via `diskrot.modal_prepare` — required so the L4 tokenizer doesn't OOM
 3. **Tokenize**: MP3 → librosa (44.1kHz mono) → DAC encode → int16 tensor [9, T_frames] saved as .pt
-4. **Pack**: .pt files → sharded mmap layout (`packed/packed_NNN.bin` + JSON sidecars) via `diskrot.pack_cache`
-5. **Caption** (optional): MP3 → LP-MusicCaps (16 kHz mel → BART) → natural-language description → tags.json
-6. **Transcribe** (optional): MP3 → Demucs (vocal isolation) → Whisper (word-level timestamps) + F0 vocal-gender estimate → sharded `lyrics/` dir (`lyrics_NNN.json`, 256 hash-keyed shards, atomic writes; each per-song entry also carries a `gender` field; the `.map()` loop runs in a spawned remote fn so `--detach` survives terminal close)
-7. **Train**: packed shards + tags.json + lyrics/ → TokenDataset (mmap-backed random 30s crops) → delayed sequence → cross-entropy loss per codebook
-8. **Inference**: checkpoint → NanoAudioGPT → autoregressive generation with KV cache → DAC decode → MP3 via ffmpeg
+4. **Melody** (optional): MP3 → `chroma_cqt` (forced to the song's token frame count) → per-song `<name>.mel.npy` via `diskrot.modal_melody` — runs after tokenize, before pack
+5. **Pack**: .pt files (+ `<name>.mel.npy` via `--mel-cache-dir`) → sharded mmap layout (`packed/packed_NNN.bin` + parallel `packed_NNN.mel.bin` + JSON sidecars) via `diskrot.pack_cache`
+6. **Caption** (optional): MP3 → LP-MusicCaps (16 kHz mel → BART) → natural-language description → tags.json
+7. **Transcribe** (optional): MP3 → Demucs (vocal isolation) → Whisper (word-level timestamps) + F0 vocal-gender estimate → sharded `lyrics/` dir (`lyrics_NNN.json`, 256 hash-keyed shards, atomic writes; each per-song entry also carries a `gender` field; the `.map()` loop runs in a spawned remote fn so `--detach` survives terminal close)
+8. **Train**: packed shards (+ chroma sidecar) + tags.json + lyrics/ → TokenDataset (mmap-backed random 30s crops) → delayed sequence → cross-entropy loss per codebook
+9. **Inference**: checkpoint → NanoAudioGPT → autoregressive generation with KV cache → DAC decode → MP3 via ffmpeg (the `/cover` path additionally feeds the uploaded hum's chromagram)
 
 ## Modal Volumes
 
 | Volume | Contents |
 |---|---|
 | nano-corpus | Raw MP3 files |
-| nano-tokens | .pt token files, packed/ shards, tags.json, lyrics.json |
+| nano-tokens | .pt token files, `<name>.mel.npy` chroma, packed/ shards (incl. `.mel.bin`), tags.json, lyrics/ |
 | nano-ckpts | Training checkpoints (step_*.pt, latest.pt, best.pt) |
 
 ## Checkpoints
@@ -113,7 +119,7 @@ Inference loads GPTConfig from checkpoint's `cfg` dict, so model architecture ch
 
 ## Common Tasks
 
-- **Add more training data**: Add MP3s to corpus, re-run prepare + tokenize + pack + auto-tag + transcribe, then re-train (the `add-songs` skill walks this end-to-end). More of the same kind of data is the goal — don't curate for variety.
+- **Add more training data**: Add MP3s to corpus, re-run prepare + tokenize + melody + pack + auto-tag + transcribe, then re-train (the `add-songs` skill walks this end-to-end). More of the same kind of data is the goal — don't curate for variety.
 - **Change model size**: Edit the `DEFAULTS` dict in `diskrot/modal_train.py` (Modal) and/or `GPTConfig` defaults in `model/nano_audio_gpt.py` (local, since the local CLI has no architecture flags). Must start fresh (delete checkpoints).
 - **Change segment length**: Edit `segment_seconds` in TrainConfig (`diskrot/train.py`). Also update `max_seq_len` in GPTConfig if needed (must be >= segment_frames + n_codebooks - 1).
 - **Disable text conditioning**: Pass `--text-conditioned false` to modal_train.py or omit `--tags-path` / `--lyrics-path` from train.py.

@@ -171,6 +171,69 @@ def test_lyric_composed_cfg_runs_and_in_range():
     assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
 
 
+def _melody_cfg(**overrides) -> GPTConfig:
+    base = dict(use_melody_conditioning=True, melody_enc_layers=2)
+    base.update(overrides)
+    return _tiny_cfg(**base)
+
+
+def test_oneshot_logits_match_torch_with_melody():
+    """The melody encoder (incl. the channels-last Conv1d weight transpose) +
+    additive melody term must match torch end-to-end."""
+    import mlx.core as mx
+
+    cfg = _melody_cfg(use_text_conditioning=True)
+    m, mlx_m = _build_pair(cfg)
+    K, T = cfg.n_codebooks, 12
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, T))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    chroma = torch.randn(1, T, cfg.melody_n_bins)  # length == seq so no null-pad
+
+    with torch.no_grad():
+        ref = m(tokens, text_emb=text_emb, melody=chroma).numpy()
+    mel_emb = mlx_m._encode_melody(mx.array(chroma.numpy()))
+    got = np.array(
+        mlx_m.logits_oneshot(
+            mx.array(tokens.numpy().astype(np.int32)),
+            text_emb=mx.array(text_emb.numpy()),
+            melody_emb=mel_emb,
+        )
+    )
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() < 1e-3
+
+
+def test_cached_decode_matches_with_melody():
+    """Greedy KV-cached generate with melody conditioning must match torch exactly
+    (validates encode_melody_delayed placement + the generate threading)."""
+    cfg = _melody_cfg(use_text_conditioning=True)
+    m, mlx_m = _build_pair(cfg, seed=11)
+    K = cfg.n_codebooks
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 10))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    melody = torch.randn(1, 6, cfg.melody_n_bins)  # one per new frame
+    kw = dict(num_new_frames=6, temperature=0.0, top_k=None, top_p=None,
+              text_emb=text_emb, cfg_scale=1.0, melody=melody)
+    out_t = m.generate(tokens[0], **kw)
+    out_m = mlx_m.generate(tokens[0], **kw)
+    assert torch.equal(out_t, out_m)
+
+
+def test_melody_composed_cfg_runs_and_in_range():
+    """Composed melody guidance (separate melody_cfg_scale) runs on MLX."""
+    cfg = _melody_cfg(use_text_conditioning=True)
+    _, mlx_m = _build_pair(cfg, seed=12)
+    K = cfg.n_codebooks
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 8))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    melody = torch.randn(1, 5, cfg.melody_n_bins)
+    out = mlx_m.generate(tokens[0], num_new_frames=5, temperature=0.9, top_k=50,
+                         top_p=0.95, text_emb=text_emb, cfg_scale=2.0,
+                         melody=melody, melody_cfg_scale=4.0)
+    assert out.shape == (K, 8 + 5)
+    assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
+
+
 @pytest.mark.parametrize("bits", [8, 4])
 def test_quantized_runs_in_range(bits):
     """int8/int4 just need to run and produce valid tokens — no bit-parity."""

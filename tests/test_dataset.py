@@ -70,14 +70,14 @@ def test_skips_too_short_files(synth_tokens_dir):
     ds = TokenDataset(tokens_dir, segment_frames=500, split="train", seed=42, val_ratio=0.125)
     # All retained entries must be long enough. Verify via __getitem__ shape.
     for i in range(len(ds)):
-        tokens, _, _ = ds[i]
+        tokens, *_ = ds[i]
         assert tokens.shape[1] == 500
 
 
 def test_getitem_shape_and_dtype(synth_tokens_dir):
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=1000))
     ds = TokenDataset(tokens_dir, segment_frames=300)
-    tokens, tags, lyric_ids = ds[0]
+    tokens, tags, lyric_ids, _melody = ds[0]
     assert tokens.shape == (9, 300)
     # int16 stays int16 on host (saves ~24 GB shared RAM at production scale).
     # Training loop casts to int64 via .long() after .to(device) — see
@@ -100,7 +100,7 @@ def test_getitem_uses_random_crop_within_bounds(synth_tokens_dir):
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=600))
     ds = TokenDataset(tokens_dir, segment_frames=500)
     for _ in range(50):
-        tokens, _, _ = ds[0]
+        tokens, *_ = ds[0]
         assert tokens.shape == (9, 500)
 
 
@@ -118,7 +118,7 @@ def test_tags_loaded(synth_tokens_dir, tmp_path):
     # The split is determined by the seeded shuffle; walk every sample and
     # confirm the tag matches whatever song landed at that index.
     for i in range(len(ds)):
-        _, tag, _ = ds[i]
+        _, tag, *_ = ds[i]
         if ds.names[i] == "song_000":
             assert tag == "ambient drone"
         elif ds.names[i] == "song_001":
@@ -278,11 +278,11 @@ def test_collate_lyrics_pads_and_masks(synth_tokens_dir):
 
     batch = [
         (torch.zeros(9, 300, dtype=torch.int16), "tagA",
-         torch.tensor([BOS_PHONEME_ID, 10, 11], dtype=torch.long)),
+         torch.tensor([BOS_PHONEME_ID, 10, 11], dtype=torch.long), None),
         (torch.zeros(9, 300, dtype=torch.int16), "tagB",
-         torch.tensor([BOS_PHONEME_ID], dtype=torch.long)),
+         torch.tensor([BOS_PHONEME_ID], dtype=torch.long), None),
     ]
-    tokens, tags, ids, mask = collate_lyrics(batch)
+    tokens, tags, ids, mask, _melody = collate_lyrics(batch)
     assert tokens.shape == (2, 9, 300)
     assert tags == ["tagA", "tagB"]
     assert ids.shape == (2, 3)

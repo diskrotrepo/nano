@@ -27,6 +27,6 @@ def test_init_mmap_serves_correct_crops(synth_tokens_dir):
     ds = TokenDataset(cache, segment_frames=300, split="train", seed=42, val_ratio=0.25)
 
     random.seed(99)
-    tokens, _, _ = ds[0]
+    tokens, *_ = ds[0]
     assert tokens.shape == (9, 300)
     assert tokens.dtype == torch.int16

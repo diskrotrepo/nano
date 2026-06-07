@@ -267,6 +267,26 @@ class InferenceEngine:
 
         return tag_emb, lyric_ids, lyric_mask
 
+    def _build_melody(self, melody_audio_bytes: bytes) -> "torch.Tensor":
+        """Chroma for the uploaded hum -> melody tensor [1, T, 12] on device.
+
+        Uses the SHARED ``diskrot.melody.extract_chroma`` (the same code the
+        training pack runs) so the inference chroma is byte-identical to what the
+        model trained on. The hum's length defines T (the cover length); chroma
+        frame count = ceil(samples/512), the DAC convention.
+        """
+        from diskrot.melody import extract_chroma
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(melody_audio_bytes)
+            mel_path = f.name
+        try:
+            chroma = extract_chroma(mel_path)  # [12, T] float32
+        finally:
+            os.unlink(mel_path)
+        mel = torch.from_numpy(chroma).transpose(0, 1).contiguous()  # [T, 12]
+        return mel.to(self.device).to(self._cond_dtype())[None]  # [1, T, 12]
+
     def _cond_dtype(self) -> torch.dtype:
         """dtype for the conditioning tensor, to match the model's compute dtype.
         fp32 only for the torch-on-CPU path; the torch accelerated paths follow
@@ -377,6 +397,68 @@ class InferenceEngine:
         )
         return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
 
+
+    @torch.no_grad()
+    def cover_audio(
+        self,
+        melody_audio_bytes: bytes,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        melody_cfg_scale: float | None = None,
+        lyric_cfg_scale: float | None = None,
+    ) -> tuple[bytes, str]:
+        """Cover a hummed/uploaded melody in the prompt's timbre. Returns (bytes, mime).
+
+        The melody audio is converted to a chromagram (NOT used as an audio prompt
+        — its tokens never appear in the output); generation starts from scratch
+        (random seed) and the chroma drives the contour while ``text`` (tags +
+        lyrics) drives timbre/instrumentation and words. The hum's length sets the
+        output length (clamped to the model's context).
+        """
+        if not getattr(self.model.cfg, "use_melody_conditioning", False):
+            raise RuntimeError(
+                "This checkpoint was trained without melody conditioning — /cover "
+                "needs a model with use_melody_conditioning=True."
+            )
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+
+        melody = self._build_melody(melody_audio_bytes)  # [1, T, 12]
+        # prompt=None adds a single seed frame (T_prompt=1), so the melody (placed
+        # at the new-frame positions) can be at most max_total - 1 frames.
+        new_frames = min(melody.shape[1], max_total - 1)
+        if new_frames <= 0:
+            raise ValueError("Melody audio is too short or context limit too small.")
+        melody = melody[:, :new_frames, :]
+
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt=None, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale,
+            lyric_cfg_scale=lyric_cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+        )  # [K, 1 + new_frames]
+
+        out_tokens = out_tokens[:, 1:]  # strip the seed frame
+        wav = self.codec.decode(out_tokens.cpu())
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+
+        meta = self._gen_metadata(
+            "cover", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            melody_cfg_scale=melody_cfg_scale, seconds=new_frames / self.codec.FRAME_RATE_HZ,
+        )
+        return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
 
     @torch.no_grad()
     def generate_audio(

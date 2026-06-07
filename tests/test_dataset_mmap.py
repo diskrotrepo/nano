@@ -19,7 +19,7 @@ def _crop_for_idx(ds: TokenDataset, idx: int, seed: int) -> torch.Tensor:
     """Sample idx with a deterministic random.seed for reproducibility."""
     import random as _r
     _r.seed(seed)
-    tokens, _, _ = ds[idx]
+    tokens, *_ = ds[idx]
     return tokens
 
 
@@ -32,7 +32,7 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     # 6 songs, val_ratio=0.2 -> max(1, 1.2) = 1 val; rest train.
     assert len(val) == 1
     assert len(train) == 5
-    tokens, tag, lyric_ids = train[0]
+    tokens, tag, lyric_ids, _melody = train[0]
     assert isinstance(tokens, torch.Tensor)
     assert tokens.dtype == torch.int16
     assert tokens.shape == (9, 400)
@@ -97,7 +97,7 @@ def test_pickle_roundtrip_clears_mmap_handles(synth_tokens_dir):
     revived = pickle.loads(blob)
     assert revived._mmap_handles == {}  # cleared by __getstate__
     # And the revived dataset can still serve samples (re-opens lazily).
-    tokens, _, _ = revived[0]
+    tokens, *_ = revived[0]
     assert tokens.shape == (9, 200)
 
 

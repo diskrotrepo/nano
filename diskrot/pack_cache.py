@@ -66,9 +66,22 @@ DEFAULT_SHARD_TARGET_SONGS = 5_000
 # .bin matches the dimensions its sidecar claims (truncation guard on resume).
 _BYTES_PER_ELEM = 2
 
+# Parallel melody (chromagram) sidecar binary, written at the SAME per-song
+# offsets as the token .bin so the dataset's random crop window indexes both
+# identically. 12 chroma bins stored as float16 (2 bytes/element). Hardcoded (not
+# imported from diskrot.melody) so the packer needn't pull in librosa.
+_N_CHROMA = 12
+_MEL_DTYPE = np.float16
+_MEL_BYTES_PER_ELEM = 2
+_MEL_EXT = ".mel.npy"  # per-song chroma file (NOT *.pt — keeps the token glob clean)
+
 
 def _shard_bin_name(shard_id: int) -> str:
     return f"{SHARD_PREFIX}{shard_id:03d}.bin"
+
+
+def _shard_mel_bin_name(shard_id: int) -> str:
+    return f"{SHARD_PREFIX}{shard_id:03d}.mel.bin"
 
 
 def _shard_meta_name(shard_id: int) -> str:
@@ -80,6 +93,7 @@ def _shard_is_valid(
     shard_id: int,
     expected_names: list[str],
     n_codebooks: int | None,
+    expect_melody: bool = False,
 ) -> dict | None:
     """Return the shard's loaded meta dict iff it is complete-and-valid on disk,
     else None (caller rebuilds).
@@ -129,6 +143,18 @@ def _shard_is_valid(
         return None
     if bin_path.stat().st_size != expected_bytes:
         return None
+    # 9. melody sidecar (only when this pack is producing one): the .mel.bin must
+    # exist, be flagged in the meta, and be size-consistent. Membership is
+    # identical to the token .bin (missing per-song chroma is zero-filled, never
+    # dropped), so the names drift guard above already covers it.
+    if expect_melody:
+        if not meta.get("has_melody"):
+            return None
+        mel_bin = out_dir / _shard_mel_bin_name(shard_id)
+        if not mel_bin.exists():
+            return None
+        if mel_bin.stat().st_size != _N_CHROMA * int(total_T) * _MEL_BYTES_PER_ELEM:
+            return None
     return meta
 
 
@@ -172,6 +198,7 @@ def pack(
     n_workers: int = _DEFAULT_LOAD_WORKERS,
     verbose: bool = True,
     commit_cb: Callable[[], None] | None = None,
+    mel_cache_dir: str | Path | None = None,
 ) -> Path:
     """Single-pass per-shard parallel pack of every ``*.pt`` in ``cache_dir``.
 
@@ -202,8 +229,15 @@ def pack(
     cache_dir = Path(cache_dir)
     out_dir = Path(out_dir) if out_dir else cache_dir / PACKED_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
+    mel_cache_dir = Path(mel_cache_dir) if mel_cache_dir is not None else None
+    pack_melody = mel_cache_dir is not None
+    n_mel_missing = 0  # per-song chroma absent/mismatched -> zero-filled (counted)
 
-    files = sorted(cache_dir.glob("*.pt"))
+    # Exclude the chroma sidecars from the token glob (they also end in ".pt"-free
+    # ".mel.npy", but guard defensively in case a future ext collides).
+    files = sorted(
+        p for p in cache_dir.glob("*.pt") if not p.name.endswith(_MEL_EXT)
+    )
     if not files:
         raise FileNotFoundError(f"no .pt files in {cache_dir}")
     if verbose:
@@ -262,7 +296,9 @@ def pack(
         expected_names = [f.stem for f in member_files]
 
         # ---- Resume: skip a shard already complete-and-valid on disk ----
-        existing = _shard_is_valid(out_dir, shard_id, expected_names, n_codebooks)
+        existing = _shard_is_valid(
+            out_dir, shard_id, expected_names, n_codebooks, expect_melody=pack_melody,
+        )
         if existing is not None:
             if n_codebooks is None:
                 n_codebooks, dtype = int(existing["n_codebooks"]), torch.int16
@@ -334,6 +370,37 @@ def pack(
         shard_total_T = offsets[-1]
         shard_names = expected_names
 
+        # ---- Load this shard's per-song chroma (if packing melody) ----
+        # Membership stays identical to the token .bin: a missing or
+        # frame-mismatched chroma is ZERO-filled (zero == "no melody", already a
+        # valid L2-normalized silent frame), never dropped — so offsets and the
+        # names drift guard line up across both bins.
+        mel_arrays: list[np.ndarray] | None = None
+        if pack_melody:
+            frame_counts = [offsets[j + 1] - offsets[j] for j in range(len(member_files))]
+
+            def _load_mel(arg: tuple[Path, int]) -> "np.ndarray | None":
+                path, n_frames = arg
+                mp = mel_cache_dir / (path.stem + _MEL_EXT)
+                if not mp.exists():
+                    return None
+                try:
+                    arr = np.load(mp)
+                except Exception:  # noqa: BLE001 — corrupt/torn write = treat as missing
+                    return None
+                if arr.ndim != 2 or arr.shape[0] != _N_CHROMA or arr.shape[1] != n_frames:
+                    return None
+                return np.ascontiguousarray(arr, dtype=_MEL_DTYPE)
+
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                loaded = list(ex.map(_load_mel, zip(member_files, frame_counts)))
+            mel_arrays = []
+            for j, arr in enumerate(loaded):
+                if arr is None:
+                    n_mel_missing += 1
+                    arr = np.zeros((_N_CHROMA, frame_counts[j]), dtype=_MEL_DTYPE)
+                mel_arrays.append(arr)
+
         # Write the .bin to a temp path, then atomically rename. A preemption
         # mid-blit leaves only the .tmp (ignored on resume), never a partial
         # packed_NNN.bin that could look valid.
@@ -354,6 +421,25 @@ def pack(
         del tensors
         os.replace(bin_tmp, bin_path)
 
+        # ---- Parallel melody .bin at the SAME offsets (temp + atomic rename) ----
+        # Written before the meta commit marker, exactly like the token .bin, so an
+        # interrupted shard is rebuilt (the meta's absence is the signal).
+        if mel_arrays is not None:
+            mel_bin_path = out_dir / _shard_mel_bin_name(shard_id)
+            mel_tmp = out_dir / (_shard_mel_bin_name(shard_id) + ".tmp")
+            mm_mel = np.memmap(
+                mel_tmp, dtype=_MEL_DTYPE, mode="w+",
+                shape=(_N_CHROMA, int(shard_total_T)),
+            )
+            try:
+                for j, arr in enumerate(mel_arrays):
+                    mm_mel[:, offsets[j]:offsets[j + 1]] = arr
+                mm_mel.flush()
+            finally:
+                del mm_mel
+            del mel_arrays
+            os.replace(mel_tmp, mel_bin_path)
+
         # Sidecar metadata for this shard, written LAST (after the .bin is in
         # place) via temp + atomic rename — its presence is the commit marker
         # that _shard_is_valid keys on.
@@ -365,6 +451,8 @@ def pack(
             "total_T": int(shard_total_T),
             "offsets": offsets,
             "names": shard_names,
+            "has_melody": pack_melody,
+            "n_chroma": _N_CHROMA if pack_melody else 0,
         }
         meta_path = out_dir / _shard_meta_name(shard_id)
         meta_tmp = out_dir / (_shard_meta_name(shard_id) + ".tmp")
@@ -422,6 +510,13 @@ def pack(
     # ---- Global index across all shards, written LAST and atomically. ----
     # The consumer treats the index's presence as "layout complete", so it must
     # land only after every shard it references is on disk, and never torn.
+    if pack_melody and verbose:
+        if n_mel_missing:
+            print(f"[pack] melody: {n_mel_missing} song(s) had no/mismatched chroma "
+                  f"— zero-filled (still packed, treated as 'no melody')", flush=True)
+        else:
+            print("[pack] melody: chroma packed for all songs", flush=True)
+
     index_payload = {
         "format_version": FORMAT_VERSION,
         "n_codebooks": int(n_codebooks),
@@ -429,6 +524,8 @@ def pack(
         "n_shards": n_shards,
         "n_songs_total": len(files),
         "shards": index_entries,
+        "has_melody": pack_melody,
+        "n_chroma": _N_CHROMA if pack_melody else 0,
     }
     index_tmp = out_dir / (SHARD_INDEX_NAME + ".tmp")
     with open(index_tmp, "w") as f:
@@ -481,6 +578,24 @@ def open_shard_mmap(out_dir: str | Path, shard_id: int) -> tuple[np.memmap, dict
     return mm, meta
 
 
+def open_shard_mel_mmap(out_dir: str | Path, shard_id: int) -> tuple[np.memmap, dict]:
+    """Open shard ``shard_id``'s parallel chroma sidecar as a read-only
+    ``np.memmap`` of shape [12, total_T] float16, at the SAME per-song offsets as
+    the token bin. Raises if the shard was packed without melody."""
+    out_dir = Path(out_dir)
+    meta = load_shard_meta(out_dir, shard_id)
+    if not meta.get("has_melody"):
+        raise FileNotFoundError(
+            f"shard {shard_id:03d} has no melody sidecar — repack with mel_cache_dir"
+        )
+    mm = np.memmap(
+        out_dir / _shard_mel_bin_name(shard_id),
+        dtype=_MEL_DTYPE, mode="r",
+        shape=(_N_CHROMA, int(meta["total_T"])),
+    )
+    return mm, meta
+
+
 def iter_all_names(out_dir: str | Path) -> Iterable[tuple[int, int, str, int]]:
     """Yield ``(shard_id, local_idx, name, n_frames)`` for every song across
     all shards, in deterministic shard order. Lets the dataset build a global
@@ -507,5 +622,9 @@ if __name__ == "__main__":
     p.add_argument("--shard-target-songs", type=int,
                    default=DEFAULT_SHARD_TARGET_SONGS,
                    help=f"approx songs per shard (default {DEFAULT_SHARD_TARGET_SONGS})")
+    p.add_argument("--mel-cache-dir", type=str, default=None,
+                   help="dir of per-song <name>.mel.npy chroma (from diskrot.melody / "
+                        "modal_melody); when set, packs a parallel packed_NNN.mel.bin")
     args = p.parse_args()
-    pack(args.cache_dir, args.out_dir, shard_target_songs=args.shard_target_songs)
+    pack(args.cache_dir, args.out_dir, shard_target_songs=args.shard_target_songs,
+         mel_cache_dir=args.mel_cache_dir)

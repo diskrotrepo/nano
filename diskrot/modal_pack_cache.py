@@ -52,8 +52,24 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
-def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16):
+def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True):
+    from pathlib import Path
+
     from diskrot.pack_cache import pack
+
+    # Pack the parallel chroma sidecar (packed_NNN.mel.bin) when the per-song
+    # <name>.mel.npy files from modal_melody.py are present. Auto-skip if none
+    # exist yet (a pre-melody pack) unless explicitly disabled — songs without a
+    # chroma file are zero-filled, so a partial extraction is safe.
+    mel_cache_dir = None
+    if melody:
+        has_any = next(Path("/tokens").glob("*.mel.npy"), None) is not None
+        if has_any:
+            mel_cache_dir = "/tokens"
+            print("[pack] melody: chroma sidecars found — packing parallel .mel.bin", flush=True)
+        else:
+            print("[pack] melody: no *.mel.npy found — packing tokens only "
+                  "(run modal_melody.py first to add melody conditioning)", flush=True)
 
     out_dir = pack(
         "/tokens",
@@ -63,16 +79,18 @@ def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16):
         # Persist each completed shard so a preemption+retry skips it. pack()
         # stays modal-free; the volume commit is injected here.
         commit_cb=tokens_vol.commit,
+        mel_cache_dir=mel_cache_dir,
     )
     tokens_vol.commit()  # idempotent safety net if commit_cb was a no-op
     print(f"[done] packed shards live at {out_dir}", flush=True)
 
 
 @app.local_entrypoint()
-def main(shard_target_songs: int = 5_000, n_workers: int = 16):
+def main(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True):
     fc = pack_remote.spawn(
         shard_target_songs=shard_target_songs,
         n_workers=n_workers,
+        melody=melody,
     )
     print(f"pack launched (detached) -- function call id: {fc.object_id}")
     print("monitor with: modal app logs nano-pack")

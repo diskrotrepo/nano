@@ -111,9 +111,14 @@ DEFAULTS = {
     "steps": 400_000,
     "patience": 20,
     "eval_batches": 50,
-    # v8_sing: first run with phoneme LyricEncoder cross-attention so the model
-    # sings intelligible words. Fresh start — incompatible with v7 checkpoints
-    # (new modules + GPTConfig fields).
+    # v8_sing: phoneme LyricEncoder cross-attention (intelligible singing) + the
+    # additive chroma (melody) conditioning stream that lets a hummed melody be
+    # re-rendered in the prompt's timbre (the /cover path). Both land in the same
+    # fresh start — v8 is still pre-ship, so melody folds into its train rather
+    # than minting a new version. Incompatible with v7 checkpoints (new modules +
+    # GPTConfig fields). Melody requires the pack to carry the parallel chroma
+    # sidecar (modal_melody.py → --mel-cache-dir); without it the model trains the
+    # null path only.
     "ckpt_subdir": "v8_sing",
     # Lyric (phoneme) conditioning — a ~100M bidirectional encoder feeding a
     # per-block lyric cross-attention. Enabled together with tag conditioning.
@@ -121,6 +126,10 @@ DEFAULTS = {
     "lyric_enc_heads": 8,
     "lyric_enc_d_ff": 4096,
     "max_lyric_len": 256,
+    # Melody (chroma) conditioning — a small additive encoder over the 12-bin
+    # chromagram (~13M params). Enabled together with tags + lyrics.
+    "melody_n_bins": 12,
+    "melody_enc_layers": 2,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 8 (global 64 on 8 ranks)
 
@@ -165,14 +174,17 @@ def _build_model_cfg(
     lyric_enc_heads: int = DEFAULTS["lyric_enc_heads"],
     lyric_enc_d_ff: int = DEFAULTS["lyric_enc_d_ff"],
     max_lyric_len: int = DEFAULTS["max_lyric_len"],
+    melody_n_bins: int = DEFAULTS["melody_n_bins"],
+    melody_enc_layers: int = DEFAULTS["melody_enc_layers"],
 ):
     from model.nano_audio_gpt import GPTConfig
 
-    # text_conditioned drives BOTH the pooled-CLAP tag path and the phoneme lyric
-    # path — this bespoke model ships tags + lyric conditioning together.
+    # text_conditioned drives the pooled-CLAP tag path, the phoneme lyric path,
+    # AND the additive melody path — this bespoke model ships all three together.
     return GPTConfig(
         use_text_conditioning=text_conditioned,
         use_lyric_conditioning=text_conditioned,
+        use_melody_conditioning=text_conditioned,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
         d_ff=d_ff, dropout=dropout,
         max_seq_len=max_seq_len,
@@ -181,6 +193,8 @@ def _build_model_cfg(
         lyric_enc_heads=lyric_enc_heads,
         lyric_enc_d_ff=lyric_enc_d_ff,
         max_lyric_len=max_lyric_len,
+        melody_n_bins=melody_n_bins,
+        melody_enc_layers=melody_enc_layers,
     )
 
 

@@ -124,12 +124,14 @@ def _active_label_at(segs: list[dict] | None, t: float) -> str:
 
 
 def collate_lyrics(batch):
-    """DataLoader collate for TokenDataset's (tokens, tags, lyric_ids) items.
+    """DataLoader collate for TokenDataset's (tokens, tags, lyric_ids, melody) items.
 
     Pads the variable-length phoneme-id sequences to the batch max and builds a
     bool mask (True = real phoneme). Required because default_collate can't stack
-    ragged lyric tensors. Returns (tokens [B,K,T], tags list[str],
-    lyric_ids [B,Lmax], lyric_mask [B,Lmax]).
+    ragged lyric tensors. The melody (chroma) crop is fixed-length (== segment
+    frames) so it stacks directly; it's ``None`` for non-melody packs. Returns
+    (tokens [B,K,T], tags list[str], lyric_ids [B,Lmax], lyric_mask [B,Lmax],
+    melody [B,T,12] | None).
     """
     from model.lyric_encoder import PAD_PHONEME_ID
 
@@ -141,7 +143,9 @@ def collate_lyrics(batch):
     for i, t in enumerate(lyrics):
         ids[i, : t.shape[0]] = t
     mask = ids != PAD_PHONEME_ID
-    return tokens, tags, ids, mask
+    melodies = [b[3] for b in batch]
+    melody = torch.stack(melodies) if melodies and melodies[0] is not None else None
+    return tokens, tags, ids, mask, melody
 
 
 
@@ -208,8 +212,13 @@ def load_mmap_bundle(
     train_entries, val_entries, shard_metas = _build_mmap_split_index(
         packed_dir, segment_frames, val_ratio, seed,
     )
+    # Melody is available iff the pack wrote the parallel chroma sidecars (index
+    # flag). The dataset then co-crops chroma with the SAME crop window.
+    from diskrot.pack_cache import load_shard_index
+    has_melody = bool(load_shard_index(packed_dir).get("has_melody", False))
     print(f"[mmap-bundle] {len(train_entries)} train + {len(val_entries)} val "
-          f"entries across {len(shard_metas)} shards ({time.time()-t0:.1f}s)",
+          f"entries across {len(shard_metas)} shards "
+          f"(melody={'on' if has_melody else 'off'}) ({time.time()-t0:.1f}s)",
           flush=True)
     return {
         "packed_dir": str(packed_dir),
@@ -219,6 +228,7 @@ def load_mmap_bundle(
         "tags": _load_tags(tags_path),
         "lyrics": _load_lyrics(lyrics_path),
         "structure": _load_structure(structure_path),
+        "has_melody": has_melody,
     }
 
 
@@ -282,6 +292,8 @@ class TokenDataset(Dataset):
         ds._mmap_entries = bundle[f"{split}_entries"]
         ds._shard_metas = bundle["shard_metas"]
         ds._mmap_handles = {}
+        ds._has_melody = bool(bundle.get("has_melody", False))
+        ds._mel_handles = {}
         ds.names = [e[2] for e in ds._mmap_entries]
         name_set = set(ds.names)
         all_tags = bundle.get("tags", {})
@@ -309,6 +321,7 @@ class TokenDataset(Dataset):
         # them and let each worker reopen lazily on first __getitem__.
         state = self.__dict__.copy()
         state["_mmap_handles"] = {}
+        state["_mel_handles"] = {}
         return state
 
     def __len__(self) -> int:
@@ -328,6 +341,24 @@ class TokenDataset(Dataset):
     def _get(self, idx: int):
         shard_id, local_idx, _, _ = self._mmap_entries[idx]
         mm = self._get_shard_mmap(shard_id)
+        offsets = self._shard_metas[shard_id]["offsets"]
+        return mm[:, offsets[local_idx]:offsets[local_idx + 1]]  # numpy view
+
+    def _get_shard_mel_mmap(self, shard_id: int) -> np.memmap:
+        mm = self._mel_handles.get(shard_id)
+        if mm is not None:
+            return mm
+        from diskrot.pack_cache import open_shard_mel_mmap
+
+        assert self._packed_dir is not None
+        mm, _ = open_shard_mel_mmap(self._packed_dir, shard_id)
+        self._mel_handles[shard_id] = mm
+        return mm
+
+    def _get_mel(self, idx: int):
+        """Per-song chroma view [12, T_full] at the SAME offsets as the tokens."""
+        shard_id, local_idx, _, _ = self._mmap_entries[idx]
+        mm = self._get_shard_mel_mmap(shard_id)
         offsets = self._shard_metas[shard_id]["offsets"]
         return mm[:, offsets[local_idx]:offsets[local_idx + 1]]  # numpy view
 
@@ -401,7 +432,7 @@ class TokenDataset(Dataset):
                     break  # whole-unit truncation — never slice a word/marker mid-unit
         return ids
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, torch.Tensor, torch.Tensor | None]:
         t = self._get(idx)  # [K, T_full] int16 — torch.Tensor or np.memmap view
         T = t.shape[1]
         start = random.randint(0, T - self.segment_frames)
@@ -416,4 +447,10 @@ class TokenDataset(Dataset):
         start_sec = start / DACodec.FRAME_RATE_HZ
         end_sec = (start + self.segment_frames) / DACodec.FRAME_RATE_HZ
         lyric_ids = self._get_segment_lyric_ids(self.names[idx], start_sec, end_sec)
-        return tokens, tags, torch.tensor(lyric_ids, dtype=torch.long)
+        # Co-crop the chroma with the IDENTICAL [start, start+segment_frames] window
+        # so the melody lines up with the tokens frame-for-frame. -> [seg, 12] float.
+        melody = None
+        if self._has_melody:
+            mel = np.ascontiguousarray(self._get_mel(idx)[:, start:start + self.segment_frames])
+            melody = torch.from_numpy(mel).to(torch.float32).transpose(0, 1).contiguous()
+        return tokens, tags, torch.tensor(lyric_ids, dtype=torch.long), melody

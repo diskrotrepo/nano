@@ -17,6 +17,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .delay_pattern import revert_delay
 from .lyric_encoder import PHONEME_VOCAB_SIZE, LyricEncoder
+from .melody_encoder import MelodyEncoder
 
 KVCache = tuple[torch.Tensor, torch.Tensor]  # (past_k, past_v)
 
@@ -91,6 +92,16 @@ class GPTConfig:
     lyric_enc_heads: int = 8
     lyric_enc_d_ff: int = 4096
     max_lyric_len: int = 256
+    # Melody (chromagram-sequence) conditioning — a time-aligned, MusicGen-Melody
+    # style stream, separate from both the pooled-CLAP tag path and the lyric
+    # cross-attention. When enabled, a MelodyEncoder projects a [B,T,12] chroma
+    # sequence and the decoder ADDS it to the per-frame token-sum input at the cb0
+    # anchor (delayed position p ↔ frame p), so a hummed melody is regenerated in
+    # whatever timbre the tags ask for. Dense+time-aligned, so additive rather than
+    # cross-attention. Adding it is checkpoint-incompatible (new submodule).
+    use_melody_conditioning: bool = False
+    melody_n_bins: int = 12
+    melody_enc_layers: int = 2
     rope_base: float = 10000.0
     use_gradient_checkpointing: bool = True
 
@@ -299,6 +310,16 @@ class NanoAudioGPT(nn.Module):
                 vocab_size=cfg.phoneme_vocab_size,
                 dropout=cfg.dropout,
             )
+        # MelodyEncoder also lives INSIDE the model (same rationale as the lyric
+        # encoder: DDP grad-sync + saves in the model state_dict). Its output is
+        # added to the decoder input per frame rather than cross-attended.
+        if cfg.use_melody_conditioning:
+            self.melody_encoder = MelodyEncoder(
+                d_model=cfg.d_model,
+                n_bins=cfg.melody_n_bins,
+                n_layers=cfg.melody_enc_layers,
+                dropout=cfg.dropout,
+            )
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.ln_final = nn.RMSNorm(cfg.d_model)
         self.heads = nn.ModuleList(
@@ -331,6 +352,61 @@ class NanoAudioGPT(nn.Module):
         ).masked_fill(~lyric_mask[:, None, None, :], float("-inf"))
         return lyric_emb, kv_mask
 
+    def _melody_add(
+        self,
+        melody: torch.Tensor | None,
+        melody_emb: torch.Tensor | None,
+        B: int,
+        T: int,
+        start_pos: int,
+    ) -> torch.Tensor:
+        """The per-frame melody term added to the decoder input, shape [B, T, D].
+
+        Three sources, in precedence order:
+        - ``melody_emb`` (pre-built full delayed-length [B, seq, D], from
+          ``encode_melody_delayed``): sliced ``[start_pos:start_pos+T]`` so the
+          same tensor serves the prefill and each KV-cached decode step (mirrors
+          the RoPE ``self.rotary(start_pos, T)`` slice).
+        - ``melody`` (raw chroma [B, Tc, 12], the training path, start_pos=0):
+          encoded here so DDP syncs the encoder grads, then null-padded to T (the
+          K-2 delay-tail positions) or truncated.
+        - neither (melody dropped / unconditional): the learned null, so the model
+          always receives a melody signal — train and inference agree that "no
+          melody" means the null, not the absence of any add.
+        """
+        if melody_emb is not None:
+            return melody_emb[:, start_pos:start_pos + T, :]
+        if melody is not None:
+            enc = self.melody_encoder.encode_melody(melody)  # [B, Tc, D]
+            Tc = enc.shape[1]
+            if Tc < T:
+                enc = torch.cat([enc, self.melody_encoder.null_emb(B, T - Tc)], dim=1)
+            elif Tc > T:
+                enc = enc[:, :T, :]
+            return enc
+        return self.melody_encoder.null_emb(B, T)
+
+    def encode_melody_delayed(
+        self, melody: torch.Tensor, seq_len: int, offset: int = 0,
+    ) -> torch.Tensor:
+        """Encode chroma once into a full delayed-length tensor [B, seq_len, D].
+
+        The encoded melody (one frame per new audio frame) is placed at delayed
+        positions ``[offset, offset+Tc)`` — ``offset`` is the prompt length, so the
+        melody lines up with the NEW frames at the cb0 anchor — and every other
+        position (prompt/seed prefix + the K-1 delay tail) is the learned null.
+        Used by ``generate`` to encode the (fully-known) melody ONCE and reuse the
+        result across all decode steps via the ``[start_pos:start_pos+T]`` slice.
+        """
+        B = melody.shape[0]
+        enc = self.melody_encoder.encode_melody(melody)  # [B, Tc, D]
+        Tc = enc.shape[1]
+        full = self.melody_encoder.null_emb(B, seq_len).clone()  # [B, seq_len, D]
+        end = min(offset + Tc, seq_len)
+        if end > offset:
+            full[:, offset:end, :] = enc[:, :end - offset, :]
+        return full
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -341,6 +417,8 @@ class NanoAudioGPT(nn.Module):
         lyric_mask: torch.Tensor | None = None,
         lyric_emb: torch.Tensor | None = None,
         lyric_kv_mask: torch.Tensor | None = None,
+        melody: torch.Tensor | None = None,
+        melody_emb: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
@@ -355,6 +433,13 @@ class NanoAudioGPT(nn.Module):
         lyric_emb/lyric_kv_mask: pre-encoded lyric sequence + additive mask (from
             encode_lyrics). Used on the generate path to encode once and reuse
             across decode steps. Takes precedence over lyric_ids.
+        melody: [B, Tc, n_bins] chroma sequence. Encoded INSIDE this forward (DDP
+            grad-sync) and added per-frame; the training path. ``melody=None`` with
+            melody conditioning enabled adds the learned null (the dropped /
+            unconditional state) so train and inference agree.
+        melody_emb: pre-built full delayed-length melody term [B, seq, D] (from
+            encode_melody_delayed). Used on the generate path to encode once and
+            slice per decode step. Takes precedence over ``melody``.
         returns: logits [B, K, T, V] or (logits, new_caches)
         """
         B, K, T = tokens.shape
@@ -374,6 +459,11 @@ class NanoAudioGPT(nn.Module):
         x = self.tok_embeds[0](tokens[:, 0])
         for k in range(1, K):
             x = x + self.tok_embeds[k](tokens[:, k])
+        # Melody is time-aligned: add it to the per-frame input at the cb0 anchor
+        # (delayed position p ↔ frame p). The slice inside _melody_add keeps the
+        # prefill / single-step decode paths aligned, exactly like the RoPE slice.
+        if self.cfg.use_melody_conditioning:
+            x = x + self._melody_add(melody, melody_emb, B, T, start_pos)
         x = self.drop(x)
 
         cos, sin = self.rotary(start_pos, T)
@@ -412,11 +502,22 @@ class NanoAudioGPT(nn.Module):
         lyric_ids_neg: torch.Tensor | None = None,
         lyric_mask_neg: torch.Tensor | None = None,
         lyric_cfg_scale: float | None = None,
+        melody: torch.Tensor | None = None,
+        melody_cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """Continue a prompt, or generate unconditionally when prompt is None.
 
         prompt: [K, T_prompt] or [B, K, T_prompt], or None for unconditional
         text_emb: [B, 1, D] optional text conditioning (from CLAPTextEncoder)
+        melody: [B, num_new_frames, n_bins] chroma for the frames being generated.
+            Encoded ONCE into a full delayed-length tensor (placed at the new-frame
+            positions, learned-null elsewhere) and reused across decode steps. The
+            CFG baseline uses the learned null, so melody is guided like the other
+            axes. Length should match num_new_frames (the cover length).
+        melody_cfg_scale: when set (and melody is given), guide the melody axis with
+            its OWN scale via an extra composed stream — analogous to
+            lyric_cfg_scale, nesting after it (tags → lyrics → melody). When None,
+            melody is guided jointly with the rest by cfg_scale (one fewer pass).
         lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask for the lyric
             conditioning stream. Encoded once and reused across decode steps.
         lyric_ids_neg/lyric_mask_neg: optional *negative* lyric stream for the
@@ -516,50 +617,81 @@ class NanoAudioGPT(nn.Module):
             if self.cfg.use_lyric_conditioning and lyric_ids_neg is not None:
                 lyric_neg, lyric_kv_neg = self.encode_lyrics(lyric_ids_neg, lyric_mask_neg)
 
+            # Encode the (fully-known) melody ONCE into a full delayed-length term,
+            # placed at the new-frame positions (offset by the prompt). The CFG
+            # baseline is the learned null. Both are reused across decode steps.
+            mel_pos = mel_neg = None
+            has_melody = self.cfg.use_melody_conditioning and melody is not None
+            if self.cfg.use_melody_conditioning:
+                mel_neg = self.melody_encoder.null_emb(B, T_delay)  # [B, T_delay, D]
+                mel_pos = (
+                    self.encode_melody_delayed(melody, T_delay, offset=T_prompt)
+                    if melody is not None else mel_neg
+                )
+
             has_cond = any(
                 v is not None for v in (text_emb, text_emb_neg, lyric_pos, lyric_neg)
-            )
-            composed = (
+            ) or has_melody
+            composed_lyric = (
                 lyric_cfg_scale is not None and lyric_cfg_scale != 1.0
                 and lyric_pos is not None
             )
-            use_cfg = (cfg_scale != 1.0 and has_cond) or composed
+            composed_melody = (
+                melody_cfg_scale is not None and melody_cfg_scale != 1.0
+                and has_melody
+            )
+            use_cfg = (cfg_scale != 1.0 and has_cond) or composed_lyric or composed_melody
 
-            # Conditioning streams run in lockstep, each with its own KV cache:
-            #   cond  = positive tags + positive lyrics
-            #   base  = negative/absent tags + negative/absent lyrics (CFG baseline)
-            #   mid   = positive tags + lyrics dropped (only for composed guidance,
-            #           to isolate the lyric axis)
-            cond_s = {"text": text_emb, "lemb": lyric_pos, "lkv": lyric_kv_pos}
-            streams = [cond_s]
-            base_s = mid_s = None
-            if use_cfg:
-                base_s = {"text": text_emb_neg, "lemb": lyric_neg, "lkv": lyric_kv_neg}
-                streams.append(base_s)
-            if composed:
-                mid_s = {"text": text_emb, "lemb": None, "lkv": None}
-                streams.append(mid_s)
-            for s in streams:
+            # Guidance as an ordered list of stages from the CFG baseline to the
+            # fully-conditioned state. Each consecutive pair contributes
+            # scale_i * (stage_{i+1} - stage_i); axes WITHOUT their own scale are
+            # folded into the cfg_scale (tags) step so they're still guided with no
+            # extra forward pass. Nesting order is tags → lyrics → melody.
+            #   logits = stages[0] + Σ scales[i] * (stages[i+1] - stages[i])
+            # Each stage is a full conditioning state {text, lemb, lkv, mel} with
+            # its own KV cache.
+            full = {"text": text_emb, "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
+            if not use_cfg:
+                stages = [full]
+                scales: list[float] = []
+            else:
+                off = {"text": text_emb_neg, "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
+                # The cfg (tags) step turns on everything that isn't separately
+                # composed; composed axes start off and are switched on later.
+                tags_on = dict(full)
+                if composed_lyric:
+                    tags_on["lemb"], tags_on["lkv"] = lyric_neg, lyric_kv_neg
+                if composed_melody:
+                    tags_on["mel"] = mel_neg
+                stages = [off, tags_on]
+                scales = [cfg_scale]
+                if composed_lyric:
+                    lyr_on = dict(stages[-1])
+                    lyr_on["lemb"], lyr_on["lkv"] = lyric_pos, lyric_kv_pos
+                    stages.append(lyr_on)
+                    scales.append(lyric_cfg_scale)
+                if composed_melody:
+                    mel_on = dict(stages[-1])
+                    mel_on["mel"] = mel_pos
+                    stages.append(mel_on)
+                    scales.append(melody_cfg_scale)
+            for s in stages:
                 s["caches"] = _make_caches()
 
             def _run(inp: torch.Tensor, start: int):
-                for s in streams:
+                for s in stages:
                     out, s["caches"] = self.forward(
                         inp, kv_caches=s["caches"], start_pos=start,
                         text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                        melody_emb=s["mel"],
                     )
                     s["logits"] = out
 
             def _combine():
-                if composed:
-                    return (
-                        base_s["logits"]
-                        + cfg_scale * (mid_s["logits"] - base_s["logits"])
-                        + lyric_cfg_scale * (cond_s["logits"] - mid_s["logits"])
-                    )
-                if use_cfg:
-                    return base_s["logits"] + cfg_scale * (cond_s["logits"] - base_s["logits"])
-                return cond_s["logits"]
+                out = stages[0]["logits"]
+                for i, sc in enumerate(scales):
+                    out = out + sc * (stages[i + 1]["logits"] - stages[i]["logits"])
+                return out
 
             # prefill: run full prompt through transformer
             prefill_len = max(1, T_prompt)
