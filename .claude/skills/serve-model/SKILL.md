@@ -85,7 +85,7 @@ curl -X POST http://localhost:8000/generate \
 ```
 
 Other `/generate` knobs: `cfg_scale` (default 3.0), `negative_prompt`, `sweeten`
-(default on), `seed_mode` (`random` default; `silence` suits quiet/ambient prompts).
+(default on). From-scratch generation always seeds from a random DAC column.
 
 `/continue` (extend an uploaded clip) and `/extend` (use a clip's tail as prompt)
 take a multipart `audio=@file.mp3` plus `add_seconds` / `prompt_seconds` /

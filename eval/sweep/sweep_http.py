@@ -97,7 +97,6 @@ def gen_one(base, setting, prompt_key, clip_idx, tag):
     form = {
         "seconds": str(C.SECONDS),
         "prompt": C.PROMPTS[prompt_key],
-        "seed_mode": setting["seed_mode"],
         "top_p": str(setting["top_p"]),
         "cfg_scale": str(setting["cfg_scale"]),
         "score_clap": "true",
@@ -116,7 +115,7 @@ def gen_one(base, setting, prompt_key, clip_idx, tag):
     blended = blended_score(collapse, clap)
     rec = {
         "setting": setting["id"], "cfg_scale": setting["cfg_scale"],
-        "seed_mode": setting["seed_mode"], "profile": setting["profile"],
+        "profile": setting["profile"],
         "prompt": prompt_key, "clip": clip_idx, "file": str(path),
         **feat, "collapse": collapse, "clap": clap, "score": blended,
         "gen_sec": round(time.time() - t0, 1),
@@ -175,7 +174,7 @@ def main():
         sdir = ROOT / "samples" / tag
         sdir.mkdir(parents=True, exist_ok=True)
         form = {"seconds": "3", "prompt": C.PROMPTS["techno"],
-                "seed_mode": s["seed_mode"], "top_p": str(s["top_p"]),
+                "top_p": str(s["top_p"]),
                 "cfg_scale": str(s["cfg_scale"]), "score_clap": "true",
                 **_form_for_profile(s)}
         r = requests.post(f"{base}/generate", data=form, timeout=600)

@@ -2,7 +2,7 @@
 
 Usage:
     SMOKE=1 python -m eval.sweep.run_sweep            # single 3s gen, sanity only
-    python -m eval.sweep.run_sweep --stage 1          # coarse: 24 settings x 3 prompts x 1 clip
+    python -m eval.sweep.run_sweep --stage 1          # coarse: 15 settings x 5 prompts x 1 clip
     python -m eval.sweep.run_sweep --stage 2          # fine: top-N from stage1 x 2 clips
     NANO_CKPT=checkpoints/best_1500m.pt python -m eval.sweep.run_sweep --stage 1
 
@@ -32,7 +32,6 @@ def gen_one(eng, setting, prompt_key, clip_idx, tag):
     audio, mime = eng.generate_audio(
         seconds=C.SECONDS,
         text=C.PROMPTS[prompt_key],
-        seed_mode=setting["seed_mode"],
         temperature=setting["temperature"],
         top_k=setting["top_k"],
         top_p=setting["top_p"],
@@ -44,7 +43,7 @@ def gen_one(eng, setting, prompt_key, clip_idx, tag):
     feat = features(str(path))
     rec = {
         "setting": setting["id"], "cfg_scale": setting["cfg_scale"],
-        "seed_mode": setting["seed_mode"], "profile": setting["profile"],
+        "profile": setting["profile"],
         "prompt": prompt_key, "clip": clip_idx, "file": str(path),
         **feat, "score": score(feat), "gen_sec": round(time.time() - t0, 1),
     }
@@ -91,7 +90,7 @@ def main():
         sdir = ROOT / "samples" / tag
         sdir.mkdir(parents=True, exist_ok=True)
         audio, mime = eng.generate_audio(
-            seconds=3.0, text=C.PROMPTS["techno"], seed_mode=s["seed_mode"],
+            seconds=3.0, text=C.PROMPTS["techno"],
             temperature=s["temperature"], top_k=s["top_k"], top_p=s["top_p"],
             cfg_scale=s["cfg_scale"])
         (sdir / "SMOKE.mp3").write_bytes(audio)

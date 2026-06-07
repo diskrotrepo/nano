@@ -114,6 +114,7 @@ async def continue_endpoint(
     audio: UploadFile = File(...),
     add_seconds: float = Form(25.0),
     prompt_seconds: float = Form(8.0),
+    prompt_start: float = Form(0.0),
     temperature: float = Form(0.9),
     top_k: int = Form(50),
     top_p: float = Form(0.95),
@@ -141,6 +142,7 @@ async def continue_endpoint(
             data,
             add_seconds=add_seconds,
             prompt_seconds=prompt_seconds if prompt_seconds > 0 else None,
+            prompt_start=max(0.0, prompt_start),
             temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
@@ -166,7 +168,6 @@ async def generate_endpoint(
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
     cfg_scale: float = Form(3.0),
-    seed_mode: str = Form("random"),
     prompt: str = Form(""),
     lyrics: str = Form(""),
     negative_prompt: str = Form(""),
@@ -182,13 +183,6 @@ async def generate_endpoint(
         adherence of the generated clip is returned in the X-Nano-Clap-Score
         response header (used by the inference sweep to rank prompt adherence,
         which collapse-only librosa scoring can't see).
-
-    seed_mode='random' (default): random DAC seed token. Works for any prompt
-        character — the model uses CFG + tight sampling to find a coherent
-        trajectory regardless of seed energy.
-    seed_mode='silence': 1 second of encoded silence as seed. Better for
-        quiet/ambient/slow prompts where the audio context aligns with the
-        prompt. Locks high-energy prompts into silence.
 
     per_cb_temperature / per_cb_top_k / per_cb_top_p: optional comma-separated
         list (length = n_codebooks) overriding the scalar. Later codebooks model
@@ -207,7 +201,6 @@ async def generate_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            seed_mode=seed_mode,
             text=combined,
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
@@ -232,6 +225,7 @@ async def extend_endpoint(
     audio: UploadFile = File(...),
     add_seconds: float = Form(20.0),
     overlap_seconds: float = Form(8.0),
+    overlap_start: float = Form(-1.0),
     temperature: float = Form(0.9),
     top_k: int = Form(50),
     top_p: float = Form(0.95),
@@ -260,6 +254,7 @@ async def extend_endpoint(
             data,
             add_seconds=add_seconds,
             overlap_seconds=overlap_seconds,
+            overlap_start=overlap_start if overlap_start >= 0 else None,
             temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),

@@ -452,10 +452,9 @@ class NanoAudioGPT(nn.Module):
             Applied before top_k (consistent with HF transformers / MusicGen).
         returns: [B, K, T_prompt + num_new_frames]
 
-        When prompt is None a single random seed frame is used internally; the
-        InferenceEngine seeds with DAC-encoded silence instead to keep the
-        from-scratch path on-distribution.
-        Uses KV cache for efficient autoregressive decoding.
+        When prompt is None a single random seed frame is used internally — the
+        from-scratch path the InferenceEngine relies on (a fresh random seed per
+        call). Uses KV cache for efficient autoregressive decoding.
         """
         if prompt is None:
             device = next(self.parameters()).device

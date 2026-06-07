@@ -79,7 +79,6 @@ class InferenceEngine:
         self.codec = DACodec(device=self.device)
         self.text_encoder: CLAPTextEncoder | None = None
         self.sweetener: PromptSweetener | None = None  # lazy — only built on first use
-        self._silence_seed: torch.Tensor | None = None
 
         ckpt_path = ckpt_path or os.environ.get("NANO_CKPT", "./checkpoints/latest.pt")
         if Path(ckpt_path).exists():
@@ -158,22 +157,6 @@ class InferenceEngine:
             raise FileNotFoundError(
                 f"No checkpoint at {ckpt_path} — train a model first or set NANO_CKPT"
             )
-
-    def _silence_seed_tokens(self) -> torch.Tensor:
-        """~1 second of DAC-encoded digital silence (86 frames). Used to seed
-        from-scratch generation for prompts that match a quiet trajectory
-        (lo-fi, ambient, slow). A shorter seed (e.g. 1 frame) leaves the model
-        without enough on-distribution context to find a coherent trajectory
-        and degenerates to noise; a longer one is unnecessary. For high-energy
-        prompts where the model can't escape the silence basin (hip-hop /
-        intense / distorted), use seed_mode='random' instead so the audio
-        context doesn't fight the cross-attention conditioning. Cached after
-        the first call."""
-        if self._silence_seed is None:
-            samples = self.codec.SAMPLE_RATE  # 1 second
-            silence = torch.zeros(1, samples, dtype=torch.float32)
-            self._silence_seed = self.codec.encode(silence).to(self.device)
-        return self._silence_seed
 
     def _gen_metadata(
         self,
@@ -291,6 +274,7 @@ class InferenceEngine:
         mp3_bytes: bytes,
         add_seconds: float = 25.0,
         prompt_seconds: float | None = None,
+        prompt_start: float = 0.0,
         temperature: float | list[float] = 0.9,
         top_k: int | None | list[int | None] = 50,
         top_p: float | None | list[float | None] = 0.95,
@@ -303,8 +287,11 @@ class InferenceEngine:
     ) -> tuple[bytes, str]:
         """Take an mp3 prompt, return (audio_bytes, mime_type) of the continuation.
 
-        Tries to return mp3; falls back to wav if the ffmpeg backend is unavailable.
-        The returned audio is [prompt | new_audio] concatenated.
+        The seed is the window ``[prompt_start, prompt_start + prompt_seconds]`` of
+        the uploaded clip (``prompt_start`` defaults to 0 = the head, the historical
+        behavior; ``prompt_seconds=None`` runs to the clip end). Tries to return
+        mp3; falls back to wav if the ffmpeg backend is unavailable. The returned
+        audio is [seed_window | new_audio] concatenated.
         """
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             f.write(mp3_bytes)
@@ -314,10 +301,16 @@ class InferenceEngine:
         finally:
             os.unlink(in_path)
 
+        # Select the seed window [prompt_start, prompt_start + prompt_seconds].
+        if prompt_start > 0:
+            start_frame = int(prompt_start * self.codec.FRAME_RATE_HZ)
+            prompt_tokens = prompt_tokens[:, start_frame:]
         if prompt_seconds is not None:
             max_prompt_frames = int(prompt_seconds * self.codec.FRAME_RATE_HZ)
             if prompt_tokens.shape[1] > max_prompt_frames:
                 prompt_tokens = prompt_tokens[:, :max_prompt_frames]
+        if prompt_tokens.shape[1] == 0:
+            raise ValueError("Selected prompt window is empty; widen the selection.")
 
         # cap so the delayed sequence fits in the model's positional window
         K = self.model.cfg.n_codebooks
@@ -351,6 +344,7 @@ class InferenceEngine:
             temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
             style_weight=style_weight if style_audio_bytes else None,
             add_seconds=add_seconds, prompt_seconds=prompt_seconds,
+            prompt_start=prompt_start if prompt_start > 0 else None,
         )
         return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
 
@@ -360,6 +354,7 @@ class InferenceEngine:
         full_audio_bytes: bytes,
         add_seconds: float = 20.0,
         overlap_seconds: float = 8.0,
+        overlap_start: float | None = None,
         temperature: float | list[float] = 0.9,
         top_k: int | None | list[int | None] = 50,
         top_p: float | None | list[float | None] = 0.95,
@@ -370,10 +365,12 @@ class InferenceEngine:
         style_weight: float = 0.5,
         lyric_cfg_scale: float | None = None,
     ) -> tuple[bytes, str]:
-        """Take the full current clip, use its tail as prompt, return original + new audio.
+        """Take the full current clip, seed from a window of it, return original + new audio.
 
-        Lets the UI grow a clip past the model's 35s single-shot cap by chaining.
-        Each call adds ~add_seconds of audio onto the end.
+        The seed window is ``[overlap_start, overlap_start + overlap_seconds]``.
+        When ``overlap_start is None`` (default) it's the clip's tail — the
+        historical behavior that continues seamlessly. Lets the UI grow a clip past
+        the model's single-shot cap by chaining; each call adds ~add_seconds.
         """
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             f.write(full_audio_bytes)
@@ -389,7 +386,13 @@ class InferenceEngine:
             int(overlap_seconds * self.codec.FRAME_RATE_HZ),
             full_tokens.shape[1],
         ))
-        prompt_tokens = full_tokens[:, -overlap_frames:]
+        if overlap_start is None:
+            prompt_tokens = full_tokens[:, -overlap_frames:]  # tail
+        else:
+            s = max(0, int(overlap_start * self.codec.FRAME_RATE_HZ))
+            prompt_tokens = full_tokens[:, s:s + overlap_frames]
+        if prompt_tokens.shape[1] == 0:
+            raise ValueError("Selected overlap window is empty; widen the selection.")
 
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
@@ -424,6 +427,7 @@ class InferenceEngine:
             temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
             style_weight=style_weight if style_audio_bytes else None,
             add_seconds=add_seconds, overlap_seconds=overlap_seconds,
+            overlap_start=overlap_start,
         )
         return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
 
@@ -436,7 +440,6 @@ class InferenceEngine:
         top_k: int | None | list[int | None] = 50,
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
-        seed_mode: str = "random",
         text: str | None = None,
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
@@ -451,34 +454,18 @@ class InferenceEngine:
         ``text`` and returns it as a third element: (audio_bytes, mime, clap).
         Default stays a 2-tuple so existing callers are unaffected.
 
-        seed_mode controls how the from-scratch generation is bootstrapped:
-            "random" (default): one random DAC token per codebook. With the
-                current tight sampling (top_k=50, top_p=0.95) + CFG, random
-                seeding produces coherent output that the prompt can steer
-                in any direction — including "loud" prompts that a silence
-                seed structurally can't escape.
-            "silence": one DAC frame of steady-state silence. Better for
-                prompts that semantically *match* silence (slow, ambient,
-                quiet) — the model continues the quiet context coherently.
-                Fails for high-energy prompts because the audio context
-                (silence) overpowers the cross-attention conditioning: the
-                model has no training example of "silence → drum hit" in
-                one step, so it stays silent regardless of cfg_scale.
+        The autoregressive loop is bootstrapped from a single column of random
+        DAC tokens (model.generate picks a fresh seed per call). With the current
+        tight sampling + CFG this produces coherent output the prompt can steer in
+        any direction. (A silence-seed mode existed once but only worked for quiet
+        prompts and collapsed high-energy ones to silence, so it was removed.)
         """
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1  # T_total such that T_total + K - 1 <= max_seq_len
 
-        if seed_mode == "silence":
-            seed_tokens: torch.Tensor | None = self._silence_seed_tokens()
-            seed_frames = int(seed_tokens.shape[1])
-        elif seed_mode == "random":
-            # Pass None so model.generate() picks a fresh random seed per call
-            # (cached silence would be deterministic across calls — random
-            # gives more variety).
-            seed_tokens = None
-            seed_frames = 1
-        else:
-            raise ValueError(f"unknown seed_mode {seed_mode!r}; expected 'random' or 'silence'")
+        # Pass None so model.generate() picks a fresh random seed per call.
+        seed_tokens = None
+        seed_frames = 1
 
         new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
         if seed_frames + new_frames > max_total:
@@ -510,7 +497,7 @@ class InferenceEngine:
             "generate", text=text, negative_text=negative_text,
             temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
             style_weight=style_weight if style_audio_bytes else None,
-            seconds=seconds, seed_mode=seed_mode,
+            seconds=seconds,
         )
         body, mime = _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
         if not score_clap:

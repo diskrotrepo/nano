@@ -9,9 +9,9 @@ axis against cfg_scale at 10s, holding everything else constant:
                                (engine splits conditioning on the first ". ")
   - fixed prompt + top_p    -> only cfg_scale and temperature vary
 
-Seed caveat: /generate seed_mode='random' draws a fresh DAC seed per call, so
-each cell is one draw, not a fixed-seed comparison. Trends across the grid are
-meaningful; a single cell winning by a hair is within seed noise.
+Seed caveat: /generate draws a fresh random DAC seed per call, so each cell is
+one draw, not a fixed-seed comparison. Trends across the grid are meaningful; a
+single cell winning by a hair is within seed noise.
 
 Usage:
     uv run --no-sync python -m eval.sweep.cfg_temp_sweep
@@ -46,7 +46,6 @@ def gen(cfg: float, temp: float, path: Path) -> bool:
          "-F", f"cfg_scale={cfg}",
          "-F", f"top_p={TOP_P}",
          "-F", "sweeten=false",
-         "-F", "seed_mode=random",
          "-o", str(path), "-w", "%{http_code}"],
         capture_output=True, text=True,
     ).stdout.strip()
@@ -78,7 +77,7 @@ def main() -> None:
         "# cfg_scale x temperature sweep",
         "",
         f"prompt: `{PROMPT}`",
-        f"seconds={SECONDS}, top_p={TOP_P}, sweeten=off, seed_mode=random (1 clip/cell).",
+        f"seconds={SECONDS}, top_p={TOP_P}, sweeten=off (1 clip/cell).",
         "Score = collapse-gated 0.6*beat + 0.4*rms (higher = more musical, less silence/noise).",
         "",
         "| rank | score | cfg | temp | beat | rms | sil | centroid | file |",

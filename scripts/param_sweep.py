@@ -24,7 +24,6 @@ SECONDS = float(os.environ.get("NANO_SECONDS", "15"))
 CFG_SCALES = [1.5, 3.0, 5.0, 7.0]
 TEMPERATURES = [0.7, 0.9, 1.1]
 TOP_KS = [50, 250]
-SEED_MODE = "random"
 
 
 def _multipart(fields: dict) -> tuple[bytes, str]:
@@ -45,7 +44,6 @@ def run_one(cfg_scale, temperature, top_k, idx, total):
         "top_k": top_k,
         "top_p": 0.95,
         "cfg_scale": cfg_scale,
-        "seed_mode": SEED_MODE,
         "prompt": PROMPT,
     }
     body, boundary = _multipart(fields)
