@@ -3,8 +3,8 @@ name: serve-model
 description: >-
   Serve nano inference locally or on Modal and exercise the generation endpoints.
   Use this skill when the user wants to run the server, generate or extend audio
-  from a checkpoint, deploy the inference API, or test /generate /extend with text,
-  lyrics, or style conditioning.
+  from a checkpoint, cover a hummed melody, deploy the inference API, or test
+  /generate /extend /cover with text, lyrics, melody, or style conditioning.
 allowed-tools: Read, Bash
 ---
 
@@ -64,8 +64,9 @@ weight format (`weights=int8 weight-only (fp16 compute)`).
 
 ## Endpoints
 
-`GET /health`, `POST /generate`, `POST /extend`. Both generation endpoints accept
-optional `prompt` (tags), `lyrics`, `style_audio` (file), and `style_weight`.
+`GET /health`, `POST /generate`, `POST /extend`, `POST /cover`. `/generate` and
+`/extend` accept optional `prompt` (tags), `lyrics`, `style_audio` (file), and
+`style_weight`.
 
 **Sampling fields (HTTP form):** `temperature` / `top_k` / `top_p` are **scalars
 only** — passing a list (`[0.9,...]`) returns HTTP 422. For per-codebook control use
@@ -91,6 +92,24 @@ Other `/generate` knobs: `cfg_scale` (default 3.0), `negative_prompt`, `sweeten`
 point), and optional `from_seconds` (the cut point T — keep the original up to T,
 regenerate after; defaults to the clip's tail = seamless append). Chain `/extend` to
 grow clips past the ~95s single-shot limit.
+
+`/cover` re-renders a hummed/uploaded melody in the prompt's timbre (hum → solo
+violin). It takes a **required** multipart `melody_audio=@hum.mp3` — only the clip's
+chromagram conditions generation; its audio/tokens never appear in the output. The
+hum's length sets the output length. Use `prompt` (tags) for timbre/instrumentation
+and `lyrics` for words; `melody_cfg_scale` (>0) pushes melody adherence with its own
+guidance scale, independent of `cfg_scale`. Same per-cb sampling fields as above.
+**Requires a melody-trained checkpoint** (`use_melody_conditioning`) — otherwise it
+returns HTTP 400.
+
+```bash
+curl -X POST http://localhost:8000/cover \
+  -F melody_audio=@hum.mp3 \
+  -F prompt="solo violin, warm, expressive, legato" \
+  -F cfg_scale=3.0 -F melody_cfg_scale=2.0 \
+  -F per_cb_temperature="0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3" \
+  --output cover.mp3
+```
 
 See the **Inference** section of [README.md](../../../README.md) for the full curl
 set (style blending, extend).

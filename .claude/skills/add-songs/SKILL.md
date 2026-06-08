@@ -2,10 +2,10 @@
 name: add-songs
 description: >-
   Add MP3s to the nano training corpus and run them through the full data-prep
-  pipeline (upload, prepare, tokenize, pack, optional auto-tag and transcribe).
+  pipeline (upload, prepare, tokenize, optional melody/auto-tag/transcribe, pack).
   Use this skill when the user wants to add training data, ingest songs, build or
-  grow the corpus, prepare data for training, run tokenize/pack/tag/transcribe, or
-  asks how to get their MP3s into the model.
+  grow the corpus, prepare data for training, run tokenize/melody/pack/tag/transcribe,
+  or asks how to get their MP3s into the model.
 allowed-tools: Read, Bash
 ---
 
@@ -32,7 +32,7 @@ same data helps; variety does not — do **not** curate for genre/style diversit
 | Volume | Holds |
 |---|---|
 | `nano-corpus` | Raw MP3 files |
-| `nano-tokens` | `.pt` token files, `packed/` shards, `tags.json`, `lyrics/` |
+| `nano-tokens` | `.pt` token files, `<name>.mel.npy` chroma, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/` |
 | `nano-ckpts` | Training checkpoints |
 
 All Modal fan-out steps below are launched with `--detach` and are **resumable** —
@@ -71,18 +71,35 @@ python -m diskrot.tokenize --corpus /path/to/mp3s --out ./token_cache
 ```
 Output: per-song int16 `.pt` files (`[9, T]`) on `nano-tokens` (or `./token_cache`).
 
-### 4. Pack — `.pt` files → sharded mmap layout
+### 4. Extract melody (chroma) — *optional*, needed for melody conditioning / `/cover`
+```bash
+modal run --detach diskrot/modal_melody.py
+```
+Writes a per-song `<name>.mel.npy` (12-bin chromagram, forced to the song's DAC
+frame count) on `nano-tokens`. **Run after tokenize** (it reads each `.pt` for the
+frame count) and **before pack**. CPU, cheap, resumable (skips songs that already
+have chroma). There is no local CLI for this step (use `diskrot.melody.extract_chroma`
+programmatically for a local smoke corpus). Skip it if you won't use melody
+conditioning — the rest of the pipeline works unchanged (tags+lyrics only).
+
+> Inode cost: one extra small file per song on `nano-tokens` (~doubles the loose
+> file count). The loose `.pt` / `.mel.npy` are only inputs to pack — prunable after
+> packing if the volume's inode headroom gets tight (training reads only the shards).
+
+### 5. Pack — `.pt` files (+ chroma) → sharded mmap layout
 Required once before training. Auto-detected by the trainer.
 ```bash
 modal run --detach diskrot/modal_pack_cache.py
 # or locally:
-python -m diskrot.pack_cache --cache-dir ./token_cache
-# flags: --out-dir  --shard-target-songs 5000
+python -m diskrot.pack_cache --cache-dir ./token_cache --mel-cache-dir ./token_cache
+# flags: --out-dir  --shard-target-songs 5000  --mel-cache-dir (chroma dir)
 ```
-Writes `packed/packed_NNN.bin` + per-shard JSON + `packed_index.json`. Shards are
-written atomically and a re-run skips complete-and-valid shards.
+Writes `packed/packed_NNN.bin` + per-shard JSON + `packed_index.json`. The Modal
+wrapper **auto-detects** `*.mel.npy` and writes the parallel `packed_NNN.mel.bin`
+chroma sidecar (at the same offsets); the local packer needs `--mel-cache-dir` to
+do so. Shards are written atomically and a re-run skips complete-and-valid shards.
 
-### 5. Auto-tag — *optional*, needed for text conditioning
+### 6. Auto-tag — *optional*, needed for text conditioning
 ```bash
 modal run --detach diskrot/modal_auto_tag.py
 # or locally:
@@ -92,7 +109,7 @@ python -m diskrot.auto_tag --corpus /path/to/mp3s --out ./tags.json
 LP-MusicCaps writes a natural-language description per song into `tags.json`.
 Re-running only processes new files.
 
-### 6. Transcribe lyrics — *optional*, needed for lyric conditioning, **expensive**
+### 7. Transcribe lyrics — *optional*, needed for lyric conditioning, **expensive**
 ```bash
 modal run --detach diskrot/modal_transcribe.py
 # or locally:
@@ -105,15 +122,18 @@ inference.**
 
 ## Decision points
 
-- **Need tags?** Only if you'll train/serve text-conditioned (the default). Run step 5.
-- **Need lyrics?** Only if you'll use lyric conditioning. Run step 6 (expensive).
+- **Need tags?** Only if you'll train/serve text-conditioned (the default). Run step 6.
+- **Need lyrics?** Only if you'll use lyric conditioning. Run step 7 (expensive).
+- **Need melody / `/cover`?** Run step 4 (melody) then repack (step 5) so the chroma
+  sidecar lands. Cheap (CPU) — worth it if you want the hum→re-render capability.
 - **Local vs Modal?** Modal for real fan-out scale; local for a smoke corpus to
   exercise the pipeline.
 
 ## Verify the cache is train-ready
 
-On `nano-tokens` you should have `packed/packed_index.json` (required) and, if you
-ran step 5, `tags.json`. Quick check:
+On `nano-tokens` you should have `packed/packed_index.json` (required); if you ran
+the melody step, `packed/` also has `packed_NNN.mel.bin` (and `packed_index.json`
+reports `"has_melody": true`); and if you ran step 6, `tags.json`. Quick check:
 ```bash
 modal volume ls nano-tokens
 modal volume ls nano-tokens packed | head

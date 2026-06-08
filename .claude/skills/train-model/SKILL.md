@@ -12,7 +12,10 @@ allowed-tools: Read, Bash
 # Train the nano model
 
 Assumes a packed token cache already exists on `nano-tokens` (see the
-**add-songs** skill).
+**add-songs** skill). For **melody conditioning** (the `/cover` capability) the pack
+must carry the chroma sidecar — run add-songs' melody step then repack. Without it
+the model trains the null path only (a `WARNING: ... pack has NO chroma sidecar` line
+is logged at startup) — harmless, just no melody signal.
 
 ## Pick your path
 
@@ -39,7 +42,7 @@ DDP auto-picks per-rank batch 8 → global 64, matching the tuned LR. Common fla
 --steps 400000   --lr 3.0e-4   --warmup-steps 5000   --patience 20
 --ckpt-subdir v7_1500m
 --d-model 2048   --n-layers 22   --n-heads 16   --d-ff 8192
---text-conditioned True           # set False to disable text conditioning
+--text-conditioned True           # drives tags + lyrics + melody together (set False to disable)
 --segment-seconds 30.0   --max-seq-len 8192
 --wandb-project NAME   --wandb-run-name NAME    # needs WANDB_API_KEY secret
 ```
@@ -51,6 +54,7 @@ python -m diskrot.train --device cuda --cache-dir ./token_cache --ckpt-dir ./che
 # flags: --steps  --batch-size  --lr  --patience
 #        --tags-path ./tags.json        (text conditioning)
 #        --lyrics-path ./lyrics         (lyric conditioning)
+#        --melody                       (melody conditioning; needs a chroma-packed cache)
 ```
 For device-specific setup see [README.5090.md](../../../README.5090.md) (CUDA /
 RTX 5090) and [README.m4max.md](../../../README.m4max.md) (Apple MPS).
