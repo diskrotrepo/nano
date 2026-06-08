@@ -36,13 +36,20 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _params = GenParams();
 
-  /// Mode is derived, not toggled: extend whenever a source clip has been
-  /// dropped onto the create area (sets `inputAudio`), otherwise generate.
+  /// Mode is derived from whether a source clip has been dropped onto the create
+  /// area (sets `inputAudio`): no source → generate; source present → whichever
+  /// transform the user picked, [_sourceMode] (extend or cover).
   NanoMode get _mode =>
-      _params.inputAudio != null ? NanoMode.extend : NanoMode.generate;
+      _params.inputAudio != null ? _sourceMode : NanoMode.generate;
 
-  /// The library clip dropped as the extend source (for its name + waveform).
-  GenClip? _extendSource;
+  /// Which transform a dropped source drives. extend (continue the clip) or
+  /// cover (re-render its melody in the prompt's timbre). Picked via the toggle
+  /// that appears once a clip is dropped.
+  NanoMode _sourceMode = NanoMode.extend;
+
+  /// The library clip dropped as the source (for its name + waveform). Used by
+  /// both extend and cover.
+  GenClip? _sourceClip;
 
   final _serverCtl = TextEditingController(text: 'http://127.0.0.1:8000');
   final _promptCtl = TextEditingController();
@@ -215,13 +222,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// The create/controls column, made a drop target: dragging a ready library
-  /// clip over it shows a "drop to extend track" overlay; dropping sets it as
-  /// the extend source.
+  /// clip over it shows a "drop a track" overlay; dropping sets it as the source
+  /// for extend / cover.
   Widget _controlsArea(List<Widget> children, EdgeInsets padding) {
     return DragTarget<GenClip>(
       onWillAcceptWithDetails: (d) =>
           d.data.status == ClipStatus.ready && d.data.bytes != null,
-      onAcceptWithDetails: (d) => _acceptExtendSource(d.data),
+      onAcceptWithDetails: (d) => _acceptSource(d.data),
       builder: (context, candidate, rejected) {
         return Stack(
           children: [
@@ -230,7 +237,7 @@ class _HomePageState extends State<HomePage> {
               const Positioned.fill(
                 child: Padding(
                   padding: EdgeInsets.all(12),
-                  child: DropOverlay(label: 'drop to extend track'),
+                  child: DropOverlay(label: 'drop to extend or cover'),
                 ),
               ),
           ],
@@ -426,22 +433,35 @@ class _HomePageState extends State<HomePage> {
         style: const TextStyle(color: NanoColors.textDim, fontSize: 11));
   }
 
-  /// Set the dropped library clip as the extend source — flips the derived mode
-  /// to extend and seeds the cut marker at the tail.
-  void _acceptExtendSource(GenClip clip) {
+  /// Set the dropped library clip as the source — flips the derived mode to the
+  /// active transform (extend/cover) and seeds the extend cut marker at the tail.
+  void _acceptSource(GenClip clip) {
     if (clip.status != ClipStatus.ready || clip.bytes == null) return;
     final ext = (clip.mime ?? '').contains('wav') ? 'wav' : 'mp3';
     setState(() {
-      _extendSource = clip;
+      _sourceClip = clip;
       _params.inputAudio = AudioFile('nano-clip-${clip.id}.$ext', clip.bytes!);
       _params.fromSeconds = -1.0; // default: append at the tail
     });
   }
 
-  /// Clear the extend source — back to generate.
-  void _clearExtendSource() {
+  /// Upload an external audio file as the source (e.g. a hum to cover) — same
+  /// effect as dropping a library clip, but there's no GenClip behind it, so the
+  /// extend cut-marker waveform is skipped (extend just appends at the tail).
+  Future<void> _uploadSource() async {
+    final f = await _pickAudio();
+    if (f == null) return;
     setState(() {
-      _extendSource = null;
+      _sourceClip = null;
+      _params.inputAudio = f;
+      _params.fromSeconds = -1.0;
+    });
+  }
+
+  /// Clear the source — back to generate.
+  void _clearSource() {
+    setState(() {
+      _sourceClip = null;
       _params.inputAudio = null;
       _params.fromSeconds = -1.0;
     });
@@ -668,63 +688,167 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _modeCard() {
-    return switch (_mode) {
-      NanoMode.generate => SectionCard(
-          title: 'generate',
-          children: [
-            LabeledSlider(
-              label: 'seconds',
-              value: _params.seconds,
-              min: 1,
-              max: 95,
-              fractionDigits: 0,
-              suffix: 's',
-              help: 'Single-shot generation length (max ~95s).',
-              onChanged: (v) => setState(() => _params.seconds = v),
-            ),
-          ],
-        ),
-      NanoMode.extend => SectionCard(
-          title: 'extend',
-          children: [
-            _extendSourceRow(),
-            const SizedBox(height: 10),
-            if (_extendSource?.bytes != null)
-              ExtendWaveform(
-                bytes: _extendSource!.bytes!,
-                durationSeconds: _extendSource!.durationSeconds ?? 0,
-                fromSeconds: _params.fromSeconds,
-                onChanged: (v) => setState(() => _params.fromSeconds = v),
-              ),
-            const SizedBox(height: 12),
-            LabeledSlider(
-              label: 'add_seconds',
-              value: _params.addSeconds,
-              min: 1,
-              max: 90,
-              fractionDigits: 0,
-              suffix: 's',
-              help: 'How much new audio to append onto the end.',
-              onChanged: (v) => setState(() => _params.addSeconds = v),
-            ),
-            LabeledSlider(
-              label: 'overlap_seconds',
-              value: _params.overlapSeconds,
-              min: 1,
-              max: 30,
-              fractionDigits: 0,
-              suffix: 's',
-              help: 'Tail of the clip used as the prompt for the continuation.',
-              onChanged: (v) => setState(() => _params.overlapSeconds = v),
-            ),
-          ],
-        ),
-    };
+    if (_mode == NanoMode.generate) {
+      return SectionCard(
+        title: 'generate',
+        children: [
+          LabeledSlider(
+            label: 'seconds',
+            value: _params.seconds,
+            min: 1,
+            max: 95,
+            fractionDigits: 0,
+            suffix: 's',
+            help: 'Single-shot generation length (max ~95s).',
+            onChanged: (v) => setState(() => _params.seconds = v),
+          ),
+          const SizedBox(height: 10),
+          const Divider(height: 1, color: NanoColors.border),
+          const SizedBox(height: 8),
+          // Bring in a source track to transform: drag a library clip onto this
+          // panel, or upload a file (e.g. a hum to cover). Either flips to the
+          // extend/cover controls.
+          _filePickRow(
+            label: 'or drop / upload audio to extend or cover',
+            file: null,
+            onPick: _uploadSource,
+            onClear: () {},
+          ),
+        ],
+      );
+    }
+    // A source clip is dropped — pick the transform (extend or cover) with the
+    // toggle, then show that transform's controls.
+    return SectionCard(
+      title: _mode.label,
+      children: [
+        _sourceClipRow(),
+        const SizedBox(height: 12),
+        _transformToggle(),
+        const SizedBox(height: 14),
+        ...(_mode == NanoMode.cover ? _coverControls() : _extendControls()),
+      ],
+    );
   }
 
-  Widget _extendSourceRow() {
-    final name = _extendSource?.prompt.isNotEmpty == true
-        ? _extendSource!.prompt
+  /// extend | cover segmented toggle, shown once a source clip is dropped.
+  Widget _transformToggle() {
+    Widget seg(NanoMode m, IconData icon) {
+      final selected = _sourceMode == m;
+      return Expanded(
+        child: InkWell(
+          onTap: () => setState(() => _sourceMode = m),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 9),
+            decoration: BoxDecoration(
+              color: selected ? NanoColors.pink : Colors.transparent,
+              border: Border.all(
+                  color: selected ? NanoColors.pink : NanoColors.border),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon,
+                    size: 14,
+                    color: selected ? Colors.black : NanoColors.textDim),
+                const SizedBox(width: 6),
+                Text(
+                  m.label,
+                  style: TextStyle(
+                    color: selected ? Colors.black : NanoColors.textDim,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      children: [
+        seg(NanoMode.extend, Icons.east),
+        const SizedBox(width: 8),
+        seg(NanoMode.cover, Icons.brush),
+      ],
+    );
+  }
+
+  List<Widget> _extendControls() {
+    return [
+      if (_sourceClip?.bytes != null)
+        ExtendWaveform(
+          bytes: _sourceClip!.bytes!,
+          durationSeconds: _sourceClip!.durationSeconds ?? 0,
+          fromSeconds: _params.fromSeconds,
+          onChanged: (v) => setState(() => _params.fromSeconds = v),
+        ),
+      const SizedBox(height: 12),
+      LabeledSlider(
+        label: 'add_seconds',
+        value: _params.addSeconds,
+        min: 1,
+        max: 90,
+        fractionDigits: 0,
+        suffix: 's',
+        help: 'How much new audio to append onto the end.',
+        onChanged: (v) => setState(() => _params.addSeconds = v),
+      ),
+      LabeledSlider(
+        label: 'overlap_seconds',
+        value: _params.overlapSeconds,
+        min: 1,
+        max: 30,
+        fractionDigits: 0,
+        suffix: 's',
+        help: 'Tail of the clip used as the prompt for the continuation.',
+        onChanged: (v) => setState(() => _params.overlapSeconds = v),
+      ),
+    ];
+  }
+
+  List<Widget> _coverControls() {
+    return [
+      const Padding(
+        padding: EdgeInsets.only(bottom: 14),
+        child: Text(
+          "Re-renders the dropped clip's melody in your prompt's timbre "
+          '(e.g. hum → solo violin). The source audio is not kept — only its '
+          'melodic contour conditions the output. The output length matches the '
+          'source. Needs a melody-trained checkpoint.',
+          style:
+              TextStyle(color: NanoColors.textDim, fontSize: 11, height: 1.4),
+        ),
+      ),
+      LabeledSlider(
+        label: 'melody adherence',
+        value: _params.melodyCfgScale,
+        min: 0.0,
+        max: 10.0,
+        help: '0 = guided jointly with the prompt by prompt adherence. Higher '
+            'pushes the cover to track your melody more tightly (its own '
+            'guidance scale).',
+        minLabel: 'off',
+        maxLabel: 'max',
+        defaultValue: GenParams.defaultMelodyCfgScale,
+        describe: (v) => v == 0
+            ? 'off (joint)'
+            : v < 3
+                ? 'gentle'
+                : v < 6
+                    ? 'tracks closely'
+                    : 'forced',
+        onChanged: (v) => setState(() => _params.melodyCfgScale = v),
+      ),
+    ];
+  }
+
+  Widget _sourceClipRow() {
+    final name = _sourceClip?.prompt.isNotEmpty == true
+        ? _sourceClip!.prompt
         : (_params.inputAudio?.name ?? 'dropped track');
     return Row(
       children: [
@@ -738,7 +862,7 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         IconButton(
-          onPressed: _clearExtendSource,
+          onPressed: _clearSource,
           icon: const Icon(Icons.close, size: 16, color: NanoColors.textDim),
           tooltip: 'clear — back to generate',
           visualDensity: VisualDensity.compact,
@@ -1117,14 +1241,14 @@ class ClipCard extends StatelessWidget {
       child: MouseRegion(
         cursor: SystemMouseCursors.grab,
         child: Tooltip(
-          message: 'drag onto the create panel to extend',
+          message: 'drag onto the create panel to extend or cover',
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: const [
               Icon(Icons.drag_indicator, size: 15, color: NanoColors.pink),
               SizedBox(width: 2),
               Text(
-                'extend',
+                'use',
                 style: TextStyle(
                   color: NanoColors.pink,
                   fontSize: 11,

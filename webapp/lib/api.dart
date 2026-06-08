@@ -3,16 +3,18 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-enum NanoMode { generate, extend }
+enum NanoMode { generate, extend, cover }
 
 extension NanoModeX on NanoMode {
   String get path => switch (this) {
         NanoMode.generate => '/generate',
         NanoMode.extend => '/extend',
+        NanoMode.cover => '/cover',
       };
   String get label => switch (this) {
         NanoMode.generate => 'generate',
         NanoMode.extend => 'extend',
+        NanoMode.cover => 'cover',
       };
 }
 
@@ -42,6 +44,7 @@ class GenParams {
   static const double defaultTopP = 0.95;
   static const double defaultCfgScale = 4.0;
   static const double defaultLyricCfgScale = 3.0;
+  static const double defaultMelodyCfgScale = 0.0;
 
   // sampling (all modes)
   double temperature = defaultTemperature;
@@ -57,13 +60,19 @@ class GenParams {
   double seconds = 30.0;
   bool scoreClap = false;
 
-  // extend
+  // extend + cover both consume a dropped source clip via `inputAudio` (the
+  // sound dropped "in place" onto the create panel). Extend continues it; cover
+  // re-renders its melody (chromagram) in the prompt's timbre.
   AudioFile? inputAudio;
   double addSeconds = 20.0;
   double overlapSeconds = 8.0;
   // Cut point: where the extension begins. -1.0 = clip tail (seamless append,
   // lossless). A value >= 0 discards audio after it and regenerates from there.
   double fromSeconds = -1.0;
+
+  // cover-only — independent guidance on the melody axis (0 = guided jointly
+  // with the prompt by cfg_scale).
+  double melodyCfgScale = defaultMelodyCfgScale;
 }
 
 class NanoResult {
@@ -149,6 +158,15 @@ class NanoApi {
         f['from_seconds'] = p.fromSeconds.toString();
         req.files.add(http.MultipartFile.fromBytes(
           'audio', p.inputAudio!.bytes,
+          filename: p.inputAudio!.name,
+        ));
+      case NanoMode.cover:
+        _requireInput(p);
+        f['melody_cfg_scale'] = p.melodyCfgScale.toString();
+        // The dropped source clip is the melody to cover; its audio never
+        // appears in the output — only its chromagram conditions generation.
+        req.files.add(http.MultipartFile.fromBytes(
+          'melody_audio', p.inputAudio!.bytes,
           filename: p.inputAudio!.name,
         ));
     }
