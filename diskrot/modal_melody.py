@@ -98,7 +98,11 @@ class MelodyExtractor:
                 n_frames = int(toks.shape[1])
                 chroma = extract_chroma(str(mp3), n_frames=n_frames)  # [12, n_frames] f32
                 tmp = out.with_suffix(out.suffix + ".tmp")
-                np.save(tmp, chroma.astype(np.float16))
+                # Write via an open handle: np.save appends ".npy" to any path
+                # arg that doesn't already end in ".npy", which would silently
+                # retarget the temp file and break the os.replace below.
+                with open(tmp, "wb") as fh:
+                    np.save(fh, chroma.astype(np.float16))
                 os.replace(tmp, out)
                 n_done += 1
             except Exception as e:  # noqa: BLE001 — one bad file must not kill the batch

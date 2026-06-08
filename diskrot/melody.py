@@ -27,6 +27,7 @@ Key contract:
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import librosa
@@ -36,6 +37,32 @@ N_CHROMA = 12
 SAMPLE_RATE = 44100
 HOP_LENGTH = 512  # -> 86.13 Hz; DACodec uses the same hop, frame count = ceil(n/hop)
 _EPS = 1e-8
+
+
+def _load_audio_file(path: str) -> np.ndarray:
+    """Decode any ffmpeg-readable file to mono float32 at SAMPLE_RATE.
+
+    ``librosa.load`` opens via libsndfile first, which can't read most of the
+    corpus's MP3s, so it silently falls back to the deprecated ``audioread`` +
+    libmpg123 path — slow and noisy (the "PySoundFile failed" / junk-header
+    warning storm) across hundreds of thousands of songs. ffmpeg (already in the
+    pipeline image) decodes MP3 natively, tolerates junk/ID3 headers, and is the
+    same backend used elsewhere. Falls back to ``librosa.load`` only if the
+    ffmpeg binary isn't on PATH.
+    """
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "quiet",
+        "-i", str(path),
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-ac", "1", "-ar", str(SAMPLE_RATE),
+        "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+    except FileNotFoundError:
+        y, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
+        return y
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
 def _dac_frame_count(n_samples: int) -> int:
@@ -92,7 +119,7 @@ def extract_chroma(
     returns: ``np.ndarray[12, n_frames]`` float32, each frame L2-normalized.
     """
     if isinstance(source, (str, Path)):
-        y, _ = librosa.load(str(source), sr=SAMPLE_RATE, mono=True)
+        y = _load_audio_file(str(source))
     else:
         y = np.asarray(source, dtype=np.float32)
         if y.ndim != 1:
