@@ -197,11 +197,23 @@ def _acquire_lock() -> bool:
     return True
 
 
+@app.function(
+    image=image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+)
 def _release_lock() -> None:
+    # reload so this (fresh) container sees the lock the acquire container wrote,
+    # else the unlink silently misses and the lease lingers for LOCK_STALE_SEC.
+    tokens_vol.reload()
     Path(LOCK_PATH).unlink(missing_ok=True)
     tokens_vol.commit()
 
 
+@app.function(
+    image=image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    timeout=24 * 60 * 60,
+)
 def orchestrate(flush_every: int = 2000):
     """Dispatch transcription and merge results into the sharded lyrics dir.
 
@@ -221,7 +233,7 @@ def orchestrate(flush_every: int = 2000):
     loss. A lease lock (see ``_acquire_lock``) refuses a concurrent second run.
     ``list_pending`` skips songs already in the shards, so re-launching resumes.
     """
-    if not _acquire_lock():
+    if not _acquire_lock.remote():
         return
     try:
         pending = list_pending.remote()
@@ -264,7 +276,7 @@ def orchestrate(flush_every: int = 2000):
             print(f"file errors: {n_errors} "
                   f"(transient — affected files stay pending; re-run to finish them)")
     finally:
-        _release_lock()
+        _release_lock.remote()
 
 
 @app.local_entrypoint()
