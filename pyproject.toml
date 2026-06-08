@@ -18,6 +18,10 @@ dependencies = [
     "msclap",
     "transformers>=4.35",
     "torchcodec>=0.13.0",
+    # Phoneme g2p for the LyricEncoder — needed at BOTH train and inference (the
+    # single train==inference id mapping in model/lyric_encoder.py). Without it
+    # the lyric/structure equivalence tests silently skip and inference ImportErrors.
+    "g2p_en",
 ]
 
 [project.optional-dependencies]

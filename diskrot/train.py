@@ -613,14 +613,19 @@ def train_run(
         print(f"lyric (phoneme) conditioning enabled: {n_lyrics} songs with lyrics "
               f"(max_lyric_len={cfg.model.max_lyric_len}, cfg_dropout={cfg.cfg_dropout})")
 
-    if cfg.model.use_melody_conditioning and main:
-        if getattr(train_ds, "_has_melody", False):
+    if cfg.model.use_melody_conditioning:
+        # Fail fast on every rank: without the chroma sidecar the melody encoder
+        # only ever sees its learned null, so a full run would silently train no
+        # melody signal at all. Don't burn the GPU hours — abort and tell the user.
+        if not getattr(train_ds, "_has_melody", False):
+            raise RuntimeError(
+                "use_melody_conditioning=True but the pack has NO chroma sidecar "
+                "(packed_NNN.mel.bin). Repack with pack_cache --mel-cache-dir (run "
+                "diskrot.modal_melody first), or disable melody conditioning."
+            )
+        if main:
             print(f"melody (chroma) conditioning enabled (n_bins={cfg.model.melody_n_bins}, "
                   f"cfg_dropout={cfg.cfg_dropout})")
-        else:
-            print("WARNING: use_melody_conditioning=True but the pack has NO chroma "
-                  "sidecar — repack with --mel-cache-dir. Training will add only the "
-                  "learned null (no melody signal).")
 
     # Wrap in DDP *before* torch.compile so the compiled graph includes the
     # DDP comm hooks. device_ids selects this rank's GPU.
