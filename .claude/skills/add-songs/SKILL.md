@@ -32,7 +32,8 @@ same data helps; variety does not — do **not** curate for genre/style diversit
 | Volume | Holds |
 |---|---|
 | `nano-corpus` | Raw MP3 files |
-| `nano-tokens` | `.pt` token files, `<name>.mel.npy` chroma, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/` |
+| `nano-tokens` | `.pt` token files, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/` |
+| `nano-melody` | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its inode cap) |
 | `nano-ckpts` | Training checkpoints |
 
 All Modal fan-out steps below are launched with `--detach` and are **resumable** —
@@ -76,15 +77,18 @@ Output: per-song int16 `.pt` files (`[9, T]`) on `nano-tokens` (or `./token_cach
 modal run --detach diskrot/modal_melody.py
 ```
 Writes a per-song `<name>.mel.npy` (12-bin chromagram, forced to the song's DAC
-frame count) on `nano-tokens`. **Run after tokenize** (it reads each `.pt` for the
-frame count) and **before pack**. CPU, cheap, resumable (skips songs that already
-have chroma). There is no local CLI for this step (use `diskrot.melody.extract_chroma`
-programmatically for a local smoke corpus). Skip it if you won't use melody
-conditioning — the rest of the pipeline works unchanged (tags+lyrics only).
+frame count) to the dedicated **`nano-melody`** volume. **Run after tokenize** (it
+reads each `.pt` on `nano-tokens` for the frame count) and **before pack**. CPU,
+cheap, resumable (skips songs that already have chroma). There is no local CLI for
+this step (use `diskrot.melody.extract_chroma` programmatically for a local smoke
+corpus). Skip it if you won't use melody conditioning — the rest of the pipeline
+works unchanged (tags+lyrics only).
 
-> Inode cost: one extra small file per song on `nano-tokens` (~doubles the loose
-> file count). The loose `.pt` / `.mel.npy` are only inputs to pack — prunable after
-> packing if the volume's inode headroom gets tight (training reads only the shards).
+> Why its own volume: this adds one small file per song. `nano-tokens` already
+> holds ~one `.pt` per song and sits near the 500k-inode volume cap, so co-locating
+> the chroma there would push it over mid-run — hence `nano-melody`. The loose `.pt`
+> / `.mel.npy` are only inputs to pack — prunable after packing (training reads only
+> the shards).
 
 ### 5. Pack — `.pt` files (+ chroma) → sharded mmap layout
 Required once before training. Auto-detected by the trainer.
@@ -94,9 +98,10 @@ modal run --detach diskrot/modal_pack_cache.py
 python -m diskrot.pack_cache --cache-dir ./token_cache --mel-cache-dir ./token_cache
 # flags: --out-dir  --shard-target-songs 5000  --mel-cache-dir (chroma dir)
 ```
-Writes `packed/packed_NNN.bin` + per-shard JSON + `packed_index.json`. The Modal
-wrapper **auto-detects** `*.mel.npy` and writes the parallel `packed_NNN.mel.bin`
-chroma sidecar (at the same offsets); the local packer needs `--mel-cache-dir` to
+Writes `packed/packed_NNN.bin` + per-shard JSON + `packed_index.json` on
+`nano-tokens`. The Modal wrapper mounts `nano-melody` and **auto-detects**
+`*.mel.npy` there, writing the parallel `packed_NNN.mel.bin` chroma sidecar (at the
+same offsets) back onto `nano-tokens`; the local packer needs `--mel-cache-dir` to
 do so. Shards are written atomically and a re-run skips complete-and-valid shards.
 
 ### 6. Auto-tag — *optional*, needed for text conditioning

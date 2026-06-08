@@ -31,6 +31,10 @@ image = (
 )
 
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
+# Per-song chroma sidecars (<name>.mel.npy) live on their own volume — see
+# modal_melody.py for why. Read-only here; only the packed .mel.bin output lands
+# back on nano-tokens alongside the token shards.
+melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
 
 
 @app.function(
@@ -43,7 +47,6 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     # hours; the timeout is set to 18 hours to cover a full-scale pack on a
     # single container.
     timeout=60 * 60 * 18,
-    volumes={"/tokens": tokens_vol},
     # Single container does the whole 12-18h pack, so pin it to a
     # non-preemptible instance — it never restarts mid-run. pack() is also
     # resumable (skips already-valid shards, commits each as it lands via
@@ -51,6 +54,7 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     # the last committed shard rather than rebuilding from scratch.
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
+    volumes={"/tokens": tokens_vol, "/melody": melody_vol},
 )
 def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True):
     from pathlib import Path
@@ -63,13 +67,13 @@ def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bo
     # chroma file are zero-filled, so a partial extraction is safe.
     mel_cache_dir = None
     if melody:
-        has_any = next(Path("/tokens").glob("*.mel.npy"), None) is not None
+        has_any = next(Path("/melody").glob("*.mel.npy"), None) is not None
         if has_any:
-            mel_cache_dir = "/tokens"
+            mel_cache_dir = "/melody"
             print("[pack] melody: chroma sidecars found — packing parallel .mel.bin", flush=True)
         else:
-            print("[pack] melody: no *.mel.npy found — packing tokens only "
-                  "(run modal_melody.py first to add melody conditioning)", flush=True)
+            print("[pack] melody: no *.mel.npy found on nano-melody — packing tokens "
+                  "only (run modal_melody.py first to add melody conditioning)", flush=True)
 
     out_dir = pack(
         "/tokens",

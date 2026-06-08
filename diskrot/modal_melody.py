@@ -1,10 +1,11 @@
 """Modal entrypoint: extract per-song chromagrams for melody conditioning.
 
 For each tokenized song it computes the 12-bin chroma (``diskrot.melody``) and
-writes ``<name>.mel.npy`` next to the song's ``<name>.pt`` on the nano-tokens
-volume. ``diskrot.pack_cache`` then folds those into the parallel
-``packed_NNN.mel.bin`` sidecar (``--mel-cache-dir /tokens``) so the dataset can
-co-crop melody with the tokens.
+writes ``<name>.mel.npy`` to the dedicated **nano-melody** volume (NOT next to
+the ``<name>.pt`` on nano-tokens — see the inode note below).
+``diskrot.pack_cache`` then folds those into the parallel ``packed_NNN.mel.bin``
+sidecar (``--mel-cache-dir /melody``) so the dataset can co-crop melody with the
+tokens.
 
 Pipeline order: tokenize → **melody** → pack (tokens+chroma) → train. Melody
 needs the song's DAC frame count (read from ``<name>.pt``) to force-align the
@@ -15,10 +16,12 @@ read-merge-write shard contention like lyrics), so workers write their own files
 and commit per batch. Resumable — ``list_pending`` skips songs that already have
 a ``.mel.npy``.
 
-Note on inodes: this adds one small (~60 KB fp16) file per song to nano-tokens.
-At full corpus that roughly doubles the loose-file count; the per-song ``.pt`` and
-``.mel.npy`` are only inputs to ``pack_cache`` and may be pruned after packing if
-the volume's inode headroom gets tight (training reads only the packed shards).
+Note on inodes: this adds one small (~60 KB fp16) file per song. nano-tokens
+already holds ~one ``.pt`` per song and is near the 500k-inode volume cap, so the
+chroma files live on their **own nano-melody volume** — co-locating them on
+nano-tokens would push the loose-file count over the cap mid-run. Both the
+``.pt`` and the ``.mel.npy`` are only inputs to ``pack_cache`` and may be pruned
+after packing (training reads only the packed shards).
 
 Run::
 
@@ -52,6 +55,9 @@ image = (
 
 corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
+# Dedicated volume for the per-song chroma sidecars: keeps the ~1 file/song they
+# add off nano-tokens, which is already near the 500k-inode cap.
+melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
 
 _MEL_EXT = ".mel.npy"  # must match diskrot.pack_cache._MEL_EXT
 _BATCH = 200           # songs per worker call (bounds commit frequency)
@@ -62,7 +68,7 @@ _BATCH = 200           # songs per worker call (bounds commit frequency)
     cpu=2.0,
     timeout=60 * 60,
     max_containers=50,
-    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol, "/melody": melody_vol},
 )
 class MelodyExtractor:
     @modal.method()
@@ -82,7 +88,7 @@ class MelodyExtractor:
         for stem in stems:
             mp3 = Path("/corpus") / f"{stem}.mp3"
             pt = Path("/tokens") / f"{stem}.pt"
-            out = Path("/tokens") / f"{stem}{_MEL_EXT}"
+            out = Path("/melody") / f"{stem}{_MEL_EXT}"
             if not mp3.exists() or not pt.exists():
                 n_missing += 1
                 continue
@@ -98,16 +104,16 @@ class MelodyExtractor:
             except Exception as e:  # noqa: BLE001 — one bad file must not kill the batch
                 print(f"FAILED {stem}: {type(e).__name__}: {str(e)[:120]}", flush=True)
                 n_failed += 1
-        tokens_vol.commit()
+        melody_vol.commit()
         return (n_done, n_missing, n_failed)
 
 
-@app.function(image=image, volumes={"/tokens": tokens_vol})
+@app.function(image=image, volumes={"/tokens": tokens_vol, "/melody": melody_vol})
 def list_pending() -> list[str]:
-    """Stems with a tokenized ``.pt`` but no ``.mel.npy`` yet."""
-    tokens = Path("/tokens")
-    pt_stems = {p.stem for p in tokens.glob("*.pt") if not p.name.endswith(_MEL_EXT)}
-    done = {p.name[: -len(_MEL_EXT)] for p in tokens.glob(f"*{_MEL_EXT}")}
+    """Stems with a tokenized ``.pt`` (nano-tokens) but no ``.mel.npy`` yet
+    (nano-melody)."""
+    pt_stems = {p.stem for p in Path("/tokens").glob("*.pt")}
+    done = {p.name[: -len(_MEL_EXT)] for p in Path("/melody").glob(f"*{_MEL_EXT}")}
     pending = sorted(pt_stems - done)
     print(f"{len(pt_stems)} tokenized, {len(done)} with chroma, {len(pending)} pending")
     return pending
@@ -115,13 +121,14 @@ def list_pending() -> list[str]:
 
 @app.function(
     image=image,
-    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol, "/melody": melody_vol},
     timeout=24 * 60 * 60,
 )
 def orchestrate(batch: int = _BATCH):
     """Dispatch chroma extraction across parallel containers (runs remotely so
     ``--detach`` survives terminal close — mirrors modal_transcribe.orchestrate)."""
     tokens_vol.reload()
+    melody_vol.reload()
     pending = list_pending.remote()
     if not pending:
         print("Nothing to extract — all tokenized songs already have chroma")

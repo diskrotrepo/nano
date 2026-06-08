@@ -96,8 +96,8 @@ Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `
 1. **Add corpus**: upload your own MP3s → `nano-corpus` volume (`modal volume put`)
 2. **Prepare**: validate (ffprobe) + dedupe (SHA-256) + drop <20s + drop long files (>5:30) via `diskrot.modal_prepare` — required so the L4 tokenizer doesn't OOM
 3. **Tokenize**: MP3 → librosa (44.1kHz mono) → DAC encode → int16 tensor [9, T_frames] saved as .pt
-4. **Melody** (optional): MP3 → `chroma_cqt` (forced to the song's token frame count) → per-song `<name>.mel.npy` via `diskrot.modal_melody` — runs after tokenize, before pack
-5. **Pack**: .pt files (+ `<name>.mel.npy` via `--mel-cache-dir`) → sharded mmap layout (`packed/packed_NNN.bin` + parallel `packed_NNN.mel.bin` + JSON sidecars) via `diskrot.pack_cache`
+4. **Melody** (optional): MP3 → `chroma_cqt` (forced to the song's token frame count) → per-song `<name>.mel.npy` on the **nano-melody** volume via `diskrot.modal_melody` — runs after tokenize, before pack (own volume so it doesn't blow nano-tokens' inode cap)
+5. **Pack**: .pt files (+ `<name>.mel.npy` from nano-melody via `--mel-cache-dir`) → sharded mmap layout (`packed/packed_NNN.bin` + parallel `packed_NNN.mel.bin` + JSON sidecars) via `diskrot.pack_cache`
 6. **Caption** (optional): MP3 → LP-MusicCaps (16 kHz mel → BART) → natural-language description → tags.json
 7. **Transcribe** (optional): MP3 → Demucs (vocal isolation) → Whisper (word-level timestamps) + F0 vocal-gender estimate → sharded `lyrics/` dir (`lyrics_NNN.json`, 256 hash-keyed shards, atomic writes; each per-song entry also carries a `gender` field; the `.map()` loop runs in a spawned remote fn so `--detach` survives terminal close)
 8. **Train**: packed shards (+ chroma sidecar) + tags.json + lyrics/ → TokenDataset (mmap-backed random 30s crops) → delayed sequence → cross-entropy loss per codebook
@@ -108,7 +108,8 @@ Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `
 | Volume | Contents |
 |---|---|
 | nano-corpus | Raw MP3 files |
-| nano-tokens | .pt token files, `<name>.mel.npy` chroma, packed/ shards (incl. `.mel.bin`), tags.json, lyrics/ |
+| nano-tokens | .pt token files, packed/ shards (incl. `.mel.bin`), tags.json, lyrics/ |
+| nano-melody | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its ~500k-inode cap) |
 | nano-ckpts | Training checkpoints (step_*.pt, latest.pt, best.pt) |
 
 ## Checkpoints
