@@ -64,9 +64,9 @@ weight format (`weights=int8 weight-only (fp16 compute)`).
 
 ## Endpoints
 
-`GET /health`, `POST /generate`, `POST /extend`, `POST /cover`. `/generate` and
-`/extend` accept optional `prompt` (tags), `lyrics`, `style_audio` (file), and
-`style_weight`.
+`GET /health`, `POST /generate`, `POST /extend`, `POST /cover`, `POST /infill`.
+`/generate` and `/extend` accept optional `prompt` (tags), `lyrics`, `style_audio`
+(file), and `style_weight`.
 
 **Sampling fields (HTTP form):** `temperature` / `top_k` / `top_p` are **scalars
 only** — passing a list (`[0.9,...]`) returns HTTP 422. For per-codebook control use
@@ -109,6 +109,26 @@ curl -X POST http://localhost:8000/cover \
   -F cfg_scale=3.0 -F melody_cfg_scale=2.0 \
   -F per_cb_temperature="0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3" \
   --output cover.mp3
+```
+
+`/infill` fills the gap between two clips (fill-in-the-middle). It takes **required**
+multipart `before_audio=@a.mp3` and `after_audio=@b.mp3` plus `gap_seconds`, and
+generates a bridge that flows out of the first into the second — the response is
+`before | middle | after` (the two uploads are kept verbatim, joined to the
+generated middle with a short crossfade). `prompt` (tags) drives the fill's timbre;
+an optional `melody_audio` hum guides the gap's contour; **lyrics are not used**.
+Same per-cb sampling fields as above. **Requires a FIM-trained checkpoint**
+(`use_fim`, a v8+ model) — otherwise it returns HTTP 400.
+
+```bash
+curl -X POST http://localhost:8000/infill \
+  -F before_audio=@intro.mp3 \
+  -F after_audio=@outro.mp3 \
+  -F gap_seconds=10 \
+  -F prompt="warm analog synth pads, steady groove" \
+  -F cfg_scale=3.0 \
+  -F per_cb_temperature="0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3" \
+  --output filled.mp3
 ```
 
 See the **Inference** section of [README.md](../../../README.md) for the full curl

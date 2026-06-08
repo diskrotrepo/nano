@@ -102,16 +102,41 @@ class GPTConfig:
     use_melody_conditioning: bool = False
     melody_n_bins: int = 12
     melody_enc_layers: int = 2
+    # Fill-in-the-middle (infill). When enabled, training reorders a fraction of
+    # crops into the canonical FIM layout `prefix <SUF> suffix <MID> middle` (a
+    # frame-domain reorder before the delay pattern — attention and the delay
+    # logic are untouched) so the decoder learns to bridge a gap it has been
+    # shown the suffix of. Adds two per-codebook control ids (<SUF>/<MID>) after
+    # pad, so enabling it grows the embedding/head vocab and is
+    # checkpoint-incompatible (a fresh start, like adding the melody encoder).
+    use_fim: bool = False
     rope_base: float = 10000.0
     use_gradient_checkpointing: bool = True
 
     @property
+    def n_control(self) -> int:
+        """Reserved ids appended after the DAC vocab: pad, plus the two FIM
+        sentinels when use_fim is on."""
+        return 1 + (2 if self.use_fim else 0)
+
+    @property
     def vocab_with_pad(self) -> int:
-        return self.vocab_per_codebook + 1
+        """Embedding/head size: DAC vocab + control ids (pad [+ FIM sentinels])."""
+        return self.vocab_per_codebook + self.n_control
 
     @property
     def pad_id(self) -> int:
         return self.vocab_per_codebook
+
+    @property
+    def suf_id(self) -> int:
+        """FIM <SUF> sentinel (separates prefix from suffix). Valid iff use_fim."""
+        return self.vocab_per_codebook + 1
+
+    @property
+    def mid_id(self) -> int:
+        """FIM <MID> sentinel (marks the start of the to-be-generated middle)."""
+        return self.vocab_per_codebook + 2
 
 
 class CausalSelfAttention(nn.Module):
@@ -707,7 +732,10 @@ class NanoAudioGPT(nn.Module):
                     logits = _combine()
 
                 step_logits = logits[:, :, -1, :].clone()  # [B, K, V]
-                step_logits[..., pad] = float("-inf")
+                # Mask every control id (pad, plus the FIM <SUF>/<MID> sentinels
+                # when use_fim) so generation only ever emits real DAC tokens —
+                # the FIM middle must never contain a sentinel.
+                step_logits[..., self.cfg.vocab_per_codebook:] = float("-inf")
 
                 # Per-codebook sampling: each cb gets its own temperature/top_k/top_p
                 # so later codebooks (high-entropy DAC residuals) can be sampled

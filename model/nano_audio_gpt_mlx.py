@@ -624,7 +624,10 @@ class MLXNanoAudioGPT(mnn.Module):
                 logits = _combine()
 
             step = logits[:, :, -1, :]  # [B, K, V]
-            step[:, :, pad] = NEG_INF
+            # Mask all control ids (pad, plus FIM <SUF>/<MID> when use_fim) so the
+            # generated output only ever contains real DAC tokens. Mirrors the
+            # torch path's `step_logits[..., vocab_per_codebook:] = -inf`.
+            step[:, :, cfg.vocab_per_codebook:] = NEG_INF
 
             for k in range(K):
                 if k + T_prompt <= pos < k + T_total:

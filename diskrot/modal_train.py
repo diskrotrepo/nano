@@ -130,6 +130,14 @@ DEFAULTS = {
     # chromagram (~13M params). Enabled together with tags + lyrics.
     "melody_n_bins": 12,
     "melody_enc_layers": 2,
+    # Fill-in-the-middle (infill, the /infill path). Adds two per-codebook control
+    # ids (<SUF>/<MID>) and reorders fim_prob of batches into the FIM layout so the
+    # model learns to bridge a gap given prefix+suffix. FIM batches drop lyrics
+    # (frame reorder scrambles sung alignment) but keep tags + co-reordered melody,
+    # so keep fim_prob modest — singing is the headline objective. Enabling use_fim
+    # grows the vocab and is checkpoint-incompatible (fresh v8 start).
+    "use_fim": True,
+    "fim_prob": 0.15,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 8 (global 64 on 8 ranks)
 
@@ -138,6 +146,7 @@ def _build_cfg_kwargs(
     steps: int, batch_size: int, lr: float, warmup_steps: int,
     patience: int, eval_batches: int, ckpt_subdir: str, text_conditioned: bool,
     segment_seconds: float = 10.0,
+    fim_prob: float = DEFAULTS["fim_prob"],
     wandb_project: str | None = None, wandb_run_name: str | None = None,
 ) -> dict:
     """Shared TrainConfig builder for both single- and multi-GPU paths.
@@ -146,6 +155,7 @@ def _build_cfg_kwargs(
     lyrics_path = "/tokens/lyrics" if text_conditioned else None
     structure_path = "/tokens/structure" if text_conditioned else None
     return dict(
+        fim_prob=fim_prob,
         cache_dir="/tokens",
         ckpt_dir=f"/ckpts/{ckpt_subdir}",
         device="cuda",
@@ -176,15 +186,19 @@ def _build_model_cfg(
     max_lyric_len: int = DEFAULTS["max_lyric_len"],
     melody_n_bins: int = DEFAULTS["melody_n_bins"],
     melody_enc_layers: int = DEFAULTS["melody_enc_layers"],
+    use_fim: bool = DEFAULTS["use_fim"],
 ):
     from model.nano_audio_gpt import GPTConfig
 
     # text_conditioned drives the pooled-CLAP tag path, the phoneme lyric path,
     # AND the additive melody path — this bespoke model ships all three together.
+    # FIM (infill) is independent of conditioning: it adds the <SUF>/<MID> control
+    # ids and is trained via fim_prob batch reordering in the loop.
     return GPTConfig(
         use_text_conditioning=text_conditioned,
         use_lyric_conditioning=text_conditioned,
         use_melody_conditioning=text_conditioned,
+        use_fim=use_fim,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
         d_ff=d_ff, dropout=dropout,
         max_seq_len=max_seq_len,
@@ -398,6 +412,7 @@ def train_remote(
         tags_path=tags_path,
         lyrics_path=lyrics_path,
         segment_seconds=segment_seconds,
+        fim_prob=DEFAULTS["fim_prob"],
         wandb_project=wandb_project or None,
         wandb_run_name=wandb_run_name or None,
         model=model_cfg,

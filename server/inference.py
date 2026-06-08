@@ -461,6 +461,117 @@ class InferenceEngine:
         return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
 
     @torch.no_grad()
+    def infill_audio(
+        self,
+        before_audio_bytes: bytes,
+        after_audio_bytes: bytes,
+        gap_seconds: float = 10.0,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        melody_audio_bytes: bytes | None = None,
+        melody_cfg_scale: float | None = None,
+    ) -> tuple[bytes, str]:
+        """Fill the gap between two clips. Returns ``[before | middle | after]``.
+
+        The model is shown the ``before`` clip (prefix) and the ``after`` clip
+        (suffix) in the FIM layout ``prefix <SUF> suffix <MID>`` and generates a
+        ``gap_seconds`` bridge that flows out of ``before`` and into ``after``.
+        ``text`` drives timbre/instrumentation (tags); lyrics are NOT used (the
+        model never trained FIM with the sung-lyric stream). An optional
+        ``melody_audio`` hum guides the gap's contour (clamped to gap length).
+
+        The before/after waveforms are kept as the raw uploads (never re-decoded
+        through DAC); only the generated middle is decoded, and the three are
+        joined with a short equal-power crossfade at each seam to avoid clicks.
+        """
+        if not getattr(self.model.cfg, "use_fim", False):
+            raise RuntimeError(
+                "This checkpoint was trained without FIM — /infill needs a model "
+                "with use_fim=True (a v8+ checkpoint trained with fim_prob>0)."
+            )
+        from model.fim import build_fim_prompt
+
+        before_wav, before_codes = self._load_and_encode(before_audio_bytes)
+        after_wav, after_codes = self._load_and_encode(after_audio_bytes)
+
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        gap_frames = int(gap_seconds * self.codec.FRAME_RATE_HZ)
+        if gap_frames <= 0:
+            raise ValueError("gap_seconds must be positive.")
+        if gap_frames > max_total - 2:
+            raise ValueError("gap_seconds exceeds the model context limit.")
+
+        # Budget: T_prompt + gap_frames <= max_total, with T_prompt = Tp + Ts + 2
+        # (two sentinel frames). Keep the frames ADJACENT to the gap — the tail of
+        # `before` and the head of `after` — since those carry the bridge context.
+        Tp, Ts = before_codes.shape[1], after_codes.shape[1]
+        budget = max_total - gap_frames - 2
+        if budget < 2:
+            raise ValueError("gap_seconds leaves no room for context; shorten the gap.")
+        if Tp + Ts > budget:
+            keep = budget // 2
+            Tp, Ts = min(Tp, budget - min(Ts, keep)), min(Ts, keep)
+            before_codes = before_codes[:, -Tp:]
+            after_codes = after_codes[:, :Ts]
+
+        prompt = build_fim_prompt(
+            before_codes, after_codes, self.model.cfg.suf_id, self.model.cfg.mid_id,
+        ).to(self.device)
+        T_prompt = prompt.shape[1]
+
+        # Optional melody for the gap (placed at the new-frame positions by
+        # generate's encode_melody_delayed(offset=T_prompt)).
+        melody = None
+        if melody_audio_bytes and getattr(self.model.cfg, "use_melody_conditioning", False):
+            melody = self._build_melody(melody_audio_bytes)[:, :gap_frames, :]
+
+        cond_emb, _, _ = self._build_conditioning(text)
+        neg_emb, _, _ = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt, num_new_frames=gap_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            cfg_scale=cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+        )  # [K, T_prompt + gap_frames]
+        middle_tokens = out_tokens[:, T_prompt:]  # the bridged gap
+
+        middle_wav = self.codec.decode(middle_tokens.cpu())
+        if middle_wav.dim() == 1:
+            middle_wav = middle_wav.unsqueeze(0)
+
+        full = _crossfade_concat(
+            [before_wav, middle_wav, after_wav], self.codec.SAMPLE_RATE,
+        )
+        meta = self._gen_metadata(
+            "infill", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            melody_cfg_scale=melody_cfg_scale if melody is not None else None,
+            gap_seconds=gap_frames / self.codec.FRAME_RATE_HZ,
+        )
+        return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
+
+    def _load_and_encode(self, audio_bytes: bytes) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode mp3 bytes to a raw mono [1, samples] waveform and its DAC codes
+        [K, T]. The raw waveform is kept verbatim for stitching (never re-decoded);
+        the codes feed the model as FIM prefix/suffix context."""
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_bytes)
+            in_path = f.name
+        try:
+            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
+            wav = torch.from_numpy(y).unsqueeze(0)
+            codes = self.codec.encode(wav)
+        finally:
+            os.unlink(in_path)
+        return wav, codes
+
+    @torch.no_grad()
     def generate_audio(
         self,
         seconds: float = 30.0,
@@ -544,6 +655,28 @@ class InferenceEngine:
             finally:
                 os.unlink(tmp)
         return body, mime, clap
+
+
+def _crossfade_concat(
+    segments: list[torch.Tensor], sr: int, fade_seconds: float = 0.03,
+) -> torch.Tensor:
+    """Concatenate mono [1, samples] segments with an equal-power crossfade at
+    each seam. Used by /infill to splice ``before | middle | after`` without the
+    clicks a hard cut would leave at the two boundaries.
+
+    The fade is clamped to half the shorter side of each seam, so very short
+    segments still join cleanly (degrading to a near-hard cut)."""
+    out = segments[0]
+    for nxt in segments[1:]:
+        n = min(int(fade_seconds * sr), out.shape[1], nxt.shape[1])
+        if n <= 0:
+            out = torch.cat([out, nxt], dim=1)
+            continue
+        t = torch.linspace(0, 1, n, dtype=out.dtype, device=out.device)
+        fade_out, fade_in = torch.cos(t * torch.pi / 2), torch.sin(t * torch.pi / 2)
+        seam = out[:, -n:] * fade_out + nxt[:, :n] * fade_in
+        out = torch.cat([out[:, :-n], seam, nxt[:, n:]], dim=1)
+    return out
 
 
 def _encode_audio(

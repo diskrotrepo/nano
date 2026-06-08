@@ -292,3 +292,55 @@ async def cover_endpoint(
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
     return Response(content=body, media_type=mime, headers=sweet_headers)
+
+
+@app.post("/infill")
+async def infill_endpoint(
+    before_audio: UploadFile = File(...),
+    after_audio: UploadFile = File(...),
+    gap_seconds: float = Form(10.0),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form(""),
+    per_cb_top_k: str = Form(""),
+    per_cb_top_p: str = Form(""),
+    cfg_scale: float = Form(3.0),
+    prompt: str = Form(""),
+    negative_prompt: str = Form(""),
+    sweeten: bool = Form(True),
+    melody_audio: UploadFile | None = File(None),
+    melody_cfg_scale: float = Form(0.0),
+) -> Response:
+    """Fill the gap between two clips — returns ``[before | middle | after]``.
+
+    `before_audio` and `after_audio` are kept verbatim; the model generates a
+    `gap_seconds` bridge that flows out of the first and into the second.
+    `prompt` (tags) drives the timbre of the fill. An optional `melody_audio` hum
+    guides the gap's melodic contour. Lyrics are not used by infill.
+
+    Requires a checkpoint trained with FIM (use_fim — a v8+ model).
+    """
+    assert engine is not None
+    before = await before_audio.read()
+    after = await after_audio.read()
+    if not before or not after:
+        raise HTTPException(400, "both before_audio and after_audio are required")
+    mel = await melody_audio.read() if melody_audio is not None else None
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    try:
+        body, mime = engine.infill_audio(
+            before, after,
+            gap_seconds=gap_seconds,
+            temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+            top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+            top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+            cfg_scale=cfg_scale,
+            text=prompt.strip() or None,
+            negative_text=negative_prompt.strip() or None,
+            melody_audio_bytes=mel or None,
+            melody_cfg_scale=melody_cfg_scale or None,
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return Response(content=body, media_type=mime, headers=sweet_headers)

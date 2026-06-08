@@ -24,6 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from model.codec import DACodec
 from model.delay_pattern import build_train_inputs
+from model.fim import fim_reorder_batch
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
 from diskrot.dataset import TokenDataset, collate_lyrics
@@ -57,6 +58,12 @@ class TrainConfig:
     lyrics_path: str | None = None  # path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning
     structure_path: str | None = None  # path to structure (sharded dir or JSON) for section-marker conditioning
     cfg_dropout: float = 0.1  # probability of dropping text conditioning (classifier-free guidance)
+    # Fraction of training batches reordered into the FIM (infill) layout. Only
+    # active when model.use_fim is True. A FIM batch drops lyric conditioning
+    # (its sung alignment can't survive a frame reorder) but keeps tags and the
+    # co-reordered melody, so this trades directly against lyric/melody training
+    # — keep it modest since singing is the headline objective.
+    fim_prob: float = 0.0
 
     seed: int = 42
 
@@ -715,6 +722,18 @@ def train_run(
         # int16 on host (P3 — saves ~24 GB shared RAM). Cast to int64 on
         # GPU because nn.Embedding's index_select kernel requires int64.
         batch = batch.to(cfg.device, non_blocking=True).long()
+        mel_dev = melody.to(cfg.device, non_blocking=True) if melody is not None else None
+
+        # Fill-in-the-middle: with prob fim_prob reorder this batch into the
+        # infill layout `prefix <SUF> suffix <MID> middle` (frame-domain reorder
+        # before the delay pattern). FIM scrambles frame order, so the lyric
+        # stream (its near-monotonic sung alignment) is dropped for the batch;
+        # tags stay (order-invariant) and melody is co-reordered to match.
+        do_fim = cfg.model.use_fim and _rng.random() < cfg.fim_prob
+        if do_fim:
+            batch, mel_dev = fim_reorder_batch(
+                batch, mel_dev, cfg.model.suf_id, cfg.model.mid_id, _rng
+            )
         inputs, targets = build_train_inputs(batch, pad_id)
 
         # Tag + lyric conditioning, each dropped INDEPENDENTLY for classifier-free
@@ -725,16 +744,18 @@ def train_run(
         if text_encoder is not None and _rng.random() >= cfg.cfg_dropout:
             text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
         l_ids = l_mask = None
-        if cfg.model.use_lyric_conditioning and _rng.random() >= cfg.cfg_dropout:
+        if (cfg.model.use_lyric_conditioning and not do_fim
+                and _rng.random() >= cfg.cfg_dropout):
             l_ids = lyric_ids.to(cfg.device, non_blocking=True)
             l_mask = lyric_mask.to(cfg.device, non_blocking=True)
         # Melody dropped INDEPENDENTLY too (its own Bernoulli). "Drop melody" =
         # pass None so forward adds the learned null instead of the chroma — the
-        # unconditional state inference's CFG baseline also uses.
+        # unconditional state inference's CFG baseline also uses. On a FIM batch
+        # mel_dev is the co-reordered chroma.
         mel = None
-        if (cfg.model.use_melody_conditioning and melody is not None
+        if (cfg.model.use_melody_conditioning and mel_dev is not None
                 and _rng.random() >= cfg.cfg_dropout):
-            mel = melody.to(cfg.device, non_blocking=True)
+            mel = mel_dev
 
         for g in optim.param_groups:
             g["lr"] = _cosine_lr(step, cfg)
