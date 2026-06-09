@@ -200,6 +200,12 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     timeout=24 * 60 * 60,
+    # The driver is a single point of failure: if its container is preempted or a
+    # save_results.remote() raises, the whole fan-out is orphaned (containers keep
+    # billing with nothing collecting their results). retries auto-respawns it;
+    # resume-by-skip (list_pending) makes re-execution idempotent — it just skips
+    # the files already committed and continues.
+    retries=modal.Retries(max_retries=3, backoff_coefficient=1.0, initial_delay=10.0),
 )
 def orchestrate(flush_every: int = 200, limit: int = 0):
     """Dispatch analysis and merge results into the sharded structure dir.
