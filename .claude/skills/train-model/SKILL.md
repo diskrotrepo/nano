@@ -76,6 +76,35 @@ healthy `tok/s`, per-codebook `cb[...]` losses, and stall diagnosis are covered 
 Automatic from `latest.pt` — just relaunch the **same** command. Modal fan-out is
 crash-safe; a preemption mid-run resumes from the last checkpoint.
 
+## Fine-tune from an existing checkpoint
+
+Adapt a trained model to a new corpus **without** starting from scratch. Two modes:
+
+| Mode | Flag | What trains | When |
+|---|---|---|---|
+| **LoRA** | `--lora-rank 16` | low-rank adapters only, base frozen (<1% of params, tiny optimizer state) | the usual choice — cheap, small artifacts |
+| **Full** | `--lora-rank 0` | every weight | large target corpus, or LoRA underfits |
+
+```bash
+# LoRA fine-tune off the v8 checkpoint into a SEPARATE ckpt-subdir
+modal run --detach diskrot/modal_train.py --n-gpus 8 \
+    --finetune-from /ckpts/v8_sing/best.pt \
+    --ckpt-subdir v8_sing_ft \
+    --lora-rank 16 --lora-alpha 16 \
+    --lr 1.0e-4 --steps 40000 --warmup-steps 500
+```
+
+- **Always pass a fresh `--ckpt-subdir`** (Modal) / `--ckpt-dir` (local). `--finetune-from`
+  only seeds weights on a *fresh* run; if `latest.pt` already exists in the dir it
+  resumes that instead. `main` hard-errors if you point `--finetune-from` at the
+  default subdir. The run's own `latest.pt` resume still works for crash recovery.
+- `--finetune-from` loads **weights only** (fresh LR schedule + optimizer); typically
+  drop the LR (~3–10×) and steps vs a from-scratch run.
+- Local: `python -m diskrot.train --finetune-from CKPT --ckpt-dir DIR --lora-rank 16 ...`.
+- **Serving a LoRA checkpoint:** the inference engine merges adapters on load (logs
+  `merged LoRA adapters (rank=...)`), so no extra step is needed. To bake a plain
+  checkpoint for archival/distribution: `python -m scripts.merge_lora IN.pt OUT.pt`.
+
 ## Extract a slim model + download the best checkpoint
 
 After training, export an inference-only checkpoint (optimizer stripped, fp16 —

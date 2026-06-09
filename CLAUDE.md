@@ -44,6 +44,7 @@ Each stream drops independently for classifier-free guidance (10% each during tr
 - `melody_encoder.py` — chromagram melody conditioning. `MelodyEncoder` (12→d_model conv/linear stack + a learned `null`), a submodule of NanoAudioGPT. Unlike tags/lyrics (cross-attention), melody is **dense and time-aligned**, so it's added to the decoder's per-frame input at the cb0 anchor. The additive path that lets a hummed melody be re-rendered in the prompt's timbre (`/cover`).
 - `fim.py` — fill-in-the-middle (infill) reorder. `fim_reorder_batch` (train: rearrange a [B,K,T] crop + its chroma into `prefix <SUF> suffix <MID> middle`, frame-domain, before the delay pattern) + `build_fim_prompt` (inference: the byte-identical `prefix <SUF> suffix <MID>` prompt). Gated by `GPTConfig.use_fim`, which adds the `<SUF>`/`<MID>` control ids; `tests/test_fim.py` guards train==inference layout.
 - `captioner.py` — Vendored LP-MusicCaps (BART-based audio captioner). load_captioner() for inference.
+- `lora.py` — LoRA fine-tuning. `LoRALinear` wraps a frozen `nn.Linear` with a trainable low-rank update (`B@A`, scaled `alpha/rank`, identity at init); `apply_lora()` injects adapters on the attention/MLP projections (`DEFAULT_LORA_TARGETS`), `mark_only_lora_trainable()` freezes the base, and `merge_lora_state_dict()` folds adapters back into plain `.weight` tensors so both inference backends load a fine-tune with no LoRA awareness.
 
 ### Training (`diskrot/`)
 - `train.py` — TrainConfig + train_run(). Device-agnostic training loop. Cosine LR with warmup, AdamW, early stopping, per-codebook loss logging. CLI: `python -m diskrot.train`.
@@ -72,6 +73,7 @@ Each stream drops independently for classifier-free guidance (10% each during tr
 - `dac_roundtrip.py` — DAC encode/decode sanity check. Writes orig + reconstructed WAVs.
 - `eval_checkpoint.py` — Evaluate a checkpoint (loss / generation sanity check).
 - `eval_train_vs_val.py` — Compare train vs val loss for a checkpoint (overfitting check).
+- `merge_lora.py` — Bake a LoRA fine-tune checkpoint into a plain one (`python -m scripts.merge_lora IN.pt OUT.pt`). Inference already merges on load; this is for archival/distribution.
 
 ### Claude skills (`.claude/skills/`)
 Task runbooks that orchestrate the CLIs above (link the READMEs, don't duplicate them):
@@ -130,3 +132,4 @@ Inference loads GPTConfig from checkpoint's `cfg` dict, so model architecture ch
 - **Change model size**: Edit the `DEFAULTS` dict in `diskrot/modal_train.py` (Modal) and/or `GPTConfig` defaults in `model/nano_audio_gpt.py` (local, since the local CLI has no architecture flags). Must start fresh (delete checkpoints).
 - **Change segment length**: Edit `segment_seconds` in TrainConfig (`diskrot/train.py`). Also update `max_seq_len` in GPTConfig if needed (must be >= segment_frames + n_codebooks - 1).
 - **Disable text conditioning**: Pass `--text-conditioned false` to modal_train.py or omit `--tags-path` / `--lyrics-path` from train.py.
+- **Fine-tune from a checkpoint**: Point a run at a pretrained checkpoint with `--finetune-from <ckpt>` and **always give it a fresh `--ckpt-subdir`** (Modal) / `--ckpt-dir` (local) so its own `latest.pt` can't resume the base run instead of seeding from it. `--lora-rank N` (N>0) trains low-rank adapters with the base frozen (parameter-efficient — well under 1% of params, much smaller optimizer state); `--lora-rank 0` does a full fine-tune of every weight. `--finetune-from` loads weights only (fresh LR schedule + optimizer); a normal in-place resume from `latest.pt` is unchanged and takes precedence. LoRA checkpoints serve directly (inference merges adapters on load); use `scripts/merge_lora.py` to bake them into a plain checkpoint. Unlike an architecture change, fine-tuning does **not** require deleting checkpoints — it starts from them.

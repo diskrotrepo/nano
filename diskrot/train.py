@@ -25,6 +25,13 @@ from torch.utils.data.distributed import DistributedSampler
 from model.codec import DACodec
 from model.delay_pattern import build_train_inputs
 from model.fim import fim_reorder_batch
+from model.lora import (
+    DEFAULT_LORA_TARGETS,
+    LoRAConfig,
+    apply_lora,
+    mark_only_lora_trainable,
+    merge_lora_state_dict,
+)
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
 from diskrot.dataset import TokenDataset, collate_lyrics
@@ -66,6 +73,22 @@ class TrainConfig:
     fim_prob: float = 0.0
 
     seed: int = 42
+
+    # ---- Fine-tuning ----
+    # finetune_from: path to a pretrained checkpoint whose model weights seed
+    # this run on a *fresh* start. Ignored when resuming our own latest.pt (that
+    # path restores everything, adapters included). Always point a fine-tune run
+    # at a NEW ckpt_dir so its latest.pt can't collide with the base run's.
+    #
+    # lora_rank > 0  → inject LoRA adapters on the attention/MLP projections and
+    #                  freeze the base (parameter-efficient; tiny trainable set).
+    # lora_rank == 0 → full fine-tune (every weight trains) when finetune_from is
+    #                  set; this is also the plain from-scratch path when it isn't.
+    finetune_from: str | None = None
+    lora_rank: int = 0
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_targets: tuple[str, ...] = DEFAULT_LORA_TARGETS
 
     # Distributed (multi-GPU) — DDP is active when world_size > 1.
     # batch_size is interpreted as the *per-rank* batch; global batch is
@@ -251,6 +274,7 @@ def _build_ckpt_dict(
     best_val_step: int,
     evals_without_improvement: int,
     prev_val_loss: float | None,
+    lora_meta: dict | None = None,
 ) -> dict:
     """Build the checkpoint dict used by both the best-checkpoint and
     step-checkpoint save sites. Single source of truth for the on-disk
@@ -273,7 +297,46 @@ def _build_ckpt_dict(
     }
     if text_encoder is not None:
         ckpt["text_proj"] = text_encoder.proj.state_dict()
+    # Records that "model" carries LoRALinear sub-keys (base.weight + lora_A/B)
+    # and how they're scaled, so inference / the merge tool can fold them back.
+    if lora_meta is not None:
+        ckpt["lora"] = lora_meta
     return ckpt
+
+
+def _load_finetune_base(
+    model: torch.nn.Module,
+    text_encoder: "CLAPTextEncoder | None",
+    path: str,
+    device: str,
+    main: bool,
+) -> None:
+    """Seed ``model`` (and the CLAP projection) from a pretrained checkpoint.
+
+    Loads weights only — never the optimizer or training-loop state — so the
+    fine-tune starts a fresh schedule. ``strict=False`` tolerates architecture
+    deltas (e.g. enabling lyric/melody conditioning on a base that lacked it:
+    the new modules simply keep their init). If the source was itself a LoRA
+    run, its adapters are merged into plain weights first.
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    state_dict = {
+        k.removeprefix("_orig_mod.").removeprefix("module."): v
+        for k, v in ckpt["model"].items()
+    }
+    if "lora" in ckpt:
+        state_dict = merge_lora_state_dict(state_dict, ckpt["lora"])
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if text_encoder is not None and "text_proj" in ckpt:
+        text_encoder.proj.load_state_dict(ckpt["text_proj"])
+    if main:
+        print(f"fine-tune: seeded base weights from {path} (step "
+              f"{ckpt.get('step', '?')}, val {ckpt.get('best_val_loss', float('nan')):.4f})")
+        if missing:
+            print(f"  {len(missing)} param(s) not in source — left at init "
+                  f"(e.g. {missing[0]})")
+        if unexpected:
+            print(f"  {len(unexpected)} source param(s) ignored (e.g. {unexpected[0]})")
 
 
 def _restore_train_state(ckpt: dict) -> dict:
@@ -634,6 +697,32 @@ def train_run(
             print(f"melody (chroma) conditioning enabled (n_bins={cfg.model.melody_n_bins}, "
                   f"cfg_dropout={cfg.cfg_dropout})")
 
+    # ---- Fine-tuning: seed from a pretrained base and/or inject LoRA ----
+    # Order matters: load the base into the bare NanoAudioGPT, THEN wrap targeted
+    # Linears with LoRA, THEN freeze — all before DDP/compile so the wrapped
+    # graph and the optimizer see the final parameter set. We skip the base-load
+    # when our own latest.pt exists (resume restores the full state, adapters
+    # included, further down).
+    resuming = (Path(cfg.ckpt_dir) / "latest.pt").exists()
+    lora_meta: dict | None = None
+    if cfg.finetune_from and not resuming:
+        _load_finetune_base(model, text_encoder, cfg.finetune_from, cfg.device, main)
+    if cfg.lora_rank > 0:
+        lora_cfg = LoRAConfig(
+            rank=cfg.lora_rank, alpha=cfg.lora_alpha,
+            dropout=cfg.lora_dropout, targets=tuple(cfg.lora_targets),
+        )
+        n_adapters = apply_lora(model, lora_cfg)
+        mark_only_lora_trainable(model)
+        lora_meta = lora_cfg.to_dict()
+        if main:
+            n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"LoRA enabled: rank={cfg.lora_rank} alpha={cfg.lora_alpha} "
+                  f"→ {n_adapters} adapters, {n_train/1e6:.2f}M trainable "
+                  f"({100*n_train/n_params:.2f}% of {n_params/1e6:.0f}M)")
+    elif cfg.finetune_from and main:
+        print("full fine-tune: all base weights trainable (lora_rank=0)")
+
     # Wrap in DDP *before* torch.compile so the compiled graph includes the
     # DDP comm hooks. device_ids selects this rank's GPU.
     if use_ddp:
@@ -654,8 +743,10 @@ def train_run(
         if main:
             print("torch.compile enabled")
 
-    # only train the model params + text_encoder projection (CLAP itself is frozen)
-    trainable = list(model.parameters())
+    # only train the model params + text_encoder projection (CLAP itself is
+    # frozen). Filter on requires_grad so LoRA / full-freeze fine-tunes hand the
+    # optimizer only the params that actually learn (a plain run has them all on).
+    trainable = [p for p in model.parameters() if p.requires_grad]
     if text_encoder is not None:
         trainable += list(text_encoder.proj.parameters())
     optim = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay,
@@ -879,6 +970,7 @@ def train_run(
                         best_val_step=best_val_step,
                         evals_without_improvement=evals_without_improvement,
                         prev_val_loss=prev_val_loss,
+                        lora_meta=lora_meta,
                     )
                     torch.save(ckpt_data, best_path)
                     print(f"  checkup at step {step:>6}  score {val_loss:.4f}  "
@@ -911,6 +1003,7 @@ def train_run(
                     best_val_step=best_val_step,
                     evals_without_improvement=evals_without_improvement,
                     prev_val_loss=prev_val_loss,
+                    lora_meta=lora_meta,
                 )
                 p = Path(cfg.ckpt_dir) / f"step_{step:07d}.pt"
                 torch.save(ckpt, p)
@@ -941,6 +1034,17 @@ if __name__ == "__main__":
     p.add_argument("--melody", action="store_true",
                    help="enable melody (chroma) conditioning — requires the pack to "
                         "have been built with --mel-cache-dir (parallel .mel.bin)")
+    p.add_argument("--finetune-from", type=str, default=None,
+                   help="path to a pretrained checkpoint to seed weights from "
+                        "(fresh runs only; use a NEW --ckpt-dir so resume can't "
+                        "find the base run's latest.pt)")
+    p.add_argument("--lora-rank", type=int, default=0,
+                   help="LoRA rank: >0 injects adapters + freezes the base "
+                        "(parameter-efficient); 0 = full fine-tune of every weight")
+    p.add_argument("--lora-alpha", type=float, default=16.0,
+                   help="LoRA scaling alpha (effective scale = alpha / rank)")
+    p.add_argument("--lora-dropout", type=float, default=0.0,
+                   help="dropout on the LoRA input projection")
     args = p.parse_args()
 
     # Tags drive the pooled-CLAP path (use_text_conditioning); lyrics drive the
@@ -962,6 +1066,10 @@ if __name__ == "__main__":
         tags_path=args.tags_path,
         lyrics_path=args.lyrics_path,
         structure_path=args.structure_path,
+        finetune_from=args.finetune_from,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         model=model_cfg,
     )
     train_run(cfg)

@@ -89,6 +89,15 @@ class InferenceEngine:
             if any(k.startswith("_orig_mod.") for k in state):
                 state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
+            # Fold LoRA adapters into plain weights before either backend sees
+            # the state-dict, so a fine-tuned checkpoint loads with no LoRA
+            # awareness and zero runtime overhead (delta is baked into .weight).
+            if "lora" in ckpt:
+                from model.lora import merge_lora_state_dict
+
+                state = merge_lora_state_dict(state, ckpt["lora"])
+                print(f"[inference] merged LoRA adapters (rank={ckpt['lora']['rank']})")
+
             # Backend: MLX on Apple Silicon (unless NANO_MLX=0), else PyTorch.
             self.backend = (
                 "mlx"

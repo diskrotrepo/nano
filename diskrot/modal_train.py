@@ -144,6 +144,15 @@ DEFAULTS = {
     # swapped onto this checkpoint anyway.
     "use_fim": False,
     "fim_prob": 0.0,
+    # Fine-tuning (off by default — the headline run trains from scratch). Set
+    # finetune_from to a checkpoint path on the ckpts volume (e.g.
+    # "/ckpts/v8_sing/best.pt") and ALWAYS pair it with a fresh --ckpt-subdir so
+    # the run's own latest.pt can't collide with the base. lora_rank>0 trains
+    # adapters only; lora_rank=0 (with finetune_from) is a full fine-tune.
+    "finetune_from": "",
+    "lora_rank": 0,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.0,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 8 (global 64 on 8 ranks)
 
@@ -153,6 +162,10 @@ def _build_cfg_kwargs(
     patience: int, eval_batches: int, ckpt_subdir: str, text_conditioned: bool,
     segment_seconds: float = 10.0,
     fim_prob: float = DEFAULTS["fim_prob"],
+    finetune_from: str = "",
+    lora_rank: int = 0,
+    lora_alpha: float = DEFAULTS["lora_alpha"],
+    lora_dropout: float = DEFAULTS["lora_dropout"],
     wandb_project: str | None = None, wandb_run_name: str | None = None,
 ) -> dict:
     """Shared TrainConfig builder for both single- and multi-GPU paths.
@@ -162,6 +175,10 @@ def _build_cfg_kwargs(
     structure_path = "/tokens/structure" if text_conditioned else None
     return dict(
         fim_prob=fim_prob,
+        finetune_from=finetune_from or None,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         cache_dir="/tokens",
         ckpt_dir=f"/ckpts/{ckpt_subdir}",
         device="cuda",
@@ -392,6 +409,10 @@ def train_remote(
     # mid-run. Pass --no-use-gradient-checkpointing to disable for small-config
     # benchmarks.
     use_gradient_checkpointing: bool = True,
+    finetune_from: str = DEFAULTS["finetune_from"],
+    lora_rank: int = DEFAULTS["lora_rank"],
+    lora_alpha: float = DEFAULTS["lora_alpha"],
+    lora_dropout: float = DEFAULTS["lora_dropout"],
     wandb_project: str = "",
     wandb_run_name: str = "",
 ):
@@ -419,6 +440,10 @@ def train_remote(
         lyrics_path=lyrics_path,
         segment_seconds=segment_seconds,
         fim_prob=DEFAULTS["fim_prob"],
+        finetune_from=finetune_from or None,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         wandb_project=wandb_project or None,
         wandb_run_name=wandb_run_name or None,
         model=model_cfg,
@@ -459,6 +484,10 @@ def train_remote_multi(
     max_seq_len: int = DEFAULTS["max_seq_len"],
     # On by default; see train_remote() for the OOM rationale.
     use_gradient_checkpointing: bool = True,
+    finetune_from: str = DEFAULTS["finetune_from"],
+    lora_rank: int = DEFAULTS["lora_rank"],
+    lora_alpha: float = DEFAULTS["lora_alpha"],
+    lora_dropout: float = DEFAULTS["lora_dropout"],
     wandb_project: str = "",
     wandb_run_name: str = "",
 ):
@@ -478,6 +507,10 @@ def train_remote_multi(
         steps, batch_size, lr, warmup_steps, patience, eval_batches,
         ckpt_subdir, text_conditioned,
         segment_seconds=segment_seconds,
+        finetune_from=finetune_from,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         wandb_project=wandb_project or None,
         wandb_run_name=wandb_run_name or None,
     )
@@ -550,6 +583,10 @@ def main(
     # remember the flag. Pass --no-use-gradient-checkpointing to disable for
     # small-config benchmarks.
     use_gradient_checkpointing: bool = True,
+    finetune_from: str = DEFAULTS["finetune_from"],
+    lora_rank: int = DEFAULTS["lora_rank"],
+    lora_alpha: float = DEFAULTS["lora_alpha"],
+    lora_dropout: float = DEFAULTS["lora_dropout"],
     wandb_project: str = "",
     wandb_run_name: str = "",
 ):
@@ -557,6 +594,14 @@ def main(
         batch_size = DDP_PER_RANK_BATCH if n_gpus > 1 else DEFAULTS["batch_size"]
         print(f"[main] batch_size auto-selected = {batch_size} "
               f"(n_gpus={n_gpus}, global batch={batch_size * n_gpus})")
+    if finetune_from and ckpt_subdir == DEFAULTS["ckpt_subdir"]:
+        # Guard the easy footgun: writing a fine-tune into the base run's dir
+        # means its latest.pt would resume the BASE instead of seeding from it.
+        raise SystemExit(
+            f"--finetune-from is set but --ckpt-subdir is still the default "
+            f"'{ckpt_subdir}'. Pass a fresh --ckpt-subdir (e.g. "
+            f"'{ckpt_subdir}_ft') so the fine-tune doesn't collide with the base run."
+        )
     common = dict(
         steps=steps, batch_size=batch_size, lr=lr, warmup_steps=warmup_steps,
         patience=patience, eval_batches=eval_batches, ckpt_subdir=ckpt_subdir,
@@ -565,6 +610,10 @@ def main(
         segment_seconds=segment_seconds,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
+        finetune_from=finetune_from,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
     )
