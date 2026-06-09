@@ -35,7 +35,9 @@ def _cache_demucs():
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
+    # git: to pip-install madmom from its repo. build-essential: madmom compiles
+    # C extensions from Cython at install time and the slim image has no compiler.
+    .apt_install("ffmpeg", "libsndfile1", "git", "build-essential")
     # torch pinned to 2.4.0 (not 2.4.1) so it matches the only natten prebuilt
     # wheel available for cu121 — natten's compiled CUDA extension is built per
     # exact torch version, and the index only ships a torch2.4.0 build.
@@ -56,10 +58,25 @@ image = (
         find_links="https://shi-labs.com/natten/wheels/cu121/torch2.4.0/",
         extra_options="--trusted-host shi-labs.com",
     )
+    # allin1's beat/segment backbone is madmom, which has no PyPI build for
+    # py3.12 (last release 0.16.1 predates it) — the official allin1 install is
+    # `pip install git+.../madmom`. madmom's setup.py imports numpy + Cython at
+    # build time with no pyproject build-system, so default build isolation can't
+    # see them: preinstall both and build with --no-build-isolation. numpy pinned
+    # <2 (madmom still uses APIs removed in numpy 2.0) and Cython <3 (madmom is
+    # pre-Cython-3 source); both pins are re-asserted in the allin1 stage below so
+    # the resolver can't bump numpy back to 2.x and break madmom at runtime.
+    .pip_install("numpy<2", "cython<3")
+    # Pinned to a commit (not a moving branch) so the image is reproducible —
+    # madmom's main could change/break under us on any future rebuild.
+    .pip_install(
+        "madmom @ git+https://github.com/CPJKU/madmom@27f032e8947204902c675e5e341a3faf5dc86dae",
+        extra_options="--no-build-isolation",
+    )
     .pip_install(
         "allin1",
         "librosa>=0.10",
-        "numpy>=1.26",
+        "numpy>=1.26,<2",
         "tqdm>=4.66",
         "soundfile>=0.12",
         "demucs",
@@ -79,6 +96,10 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     timeout=60 * 60,
     max_containers=50,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    # allin1 pulls its checkpoint from the HF Hub at runtime; the token lifts the
+    # anonymous rate limit that would otherwise throttle/fail a 50-container fan-out
+    # (same secret modal_transcribe.py / modal_auto_tag.py already use).
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 class Analyzer:
     @modal.enter()
