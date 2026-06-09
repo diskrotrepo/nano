@@ -9,7 +9,8 @@ Run:
     modal run --detach diskrot/modal_structure.py --limit 200   # calibration
 
 NOTE: allin1 pulls torch + demucs + natten; natten wheels are built per
-torch/cuda version, so the wheel index below is pinned to torch 2.4.1 / cu121.
+torch/cuda version, so the wheel index below is pinned to torch 2.4.0 / cu121
+(natten ships no torch 2.4.1 wheel — that index path 404s).
 The ~200-song calibration run (--limit) exists to confirm this image resolves and
 to measure seconds/track before the full corpus pass.
 """
@@ -35,15 +36,25 @@ def _cache_demucs():
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
+    # torch pinned to 2.4.0 (not 2.4.1) so it matches the only natten prebuilt
+    # wheel available for cu121 — natten's compiled CUDA extension is built per
+    # exact torch version, and the index only ships a torch2.4.0 build.
     .pip_install(
-        "torch==2.4.1",
-        "torchaudio==2.4.1",
+        "torch==2.4.0",
+        "torchaudio==2.4.0",
         index_url="https://download.pytorch.org/whl/cu121",
     )
-    # natten must match the torch/cuda build above (allin1 depends on it).
+    # natten must match the torch/cuda build above (allin1 depends on it). The
+    # prebuilt wheel lives only on shi-labs.com, where (a) the wheel index dir is
+    # keyed by torch version — torch2.4.0, NOT 2.4.1 (the 2.4.1 path 404s) — and
+    # (b) the TLS cert has expired, so --trusted-host is required to skip the cert
+    # check. Without a matching wheel pip falls back to compiling the sdist, which
+    # needs cmake + nvcc and yields a useless CPU-only build on the GPU-less
+    # builder. The cp312 wheel exists here; keep the image on python 3.12.
     .pip_install(
         "natten==0.17.1",
-        find_links="https://shi-labs.com/natten/wheels/cu121/torch2.4.1/",
+        find_links="https://shi-labs.com/natten/wheels/cu121/torch2.4.0/",
+        extra_options="--trusted-host shi-labs.com",
     )
     .pip_install(
         "allin1",
