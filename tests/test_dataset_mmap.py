@@ -37,10 +37,14 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     assert tokens.dtype == torch.int16
     assert tokens.shape == (9, 400)
     assert tag == ""  # no tags fixture passed
-    # no lyrics/structure fixture → BOS + the dense <unknown_gender> + <no_section>
-    # prefix header (see lyric_encoder)
-    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID
-    assert lyric_ids.tolist() == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, NO_SECTION_ID]
+    # no lyrics/structure fixture → BOS + the dense <unknown_gender> +
+    # <unknown_tempo> + <no_section> prefix header (see lyric_encoder)
+    from model.lyric_encoder import (
+        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+    )
+    assert lyric_ids.tolist() == [
+        BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID, NO_SECTION_ID,
+    ]
 
 
 def test_from_mmap_matches_in_memory_dataset(synth_tokens_dir):

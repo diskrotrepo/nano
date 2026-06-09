@@ -80,26 +80,31 @@ def _load_lyrics(lyrics_path: str | Path | None, verbose: bool = True) -> dict[s
     return lyrics
 
 
-def _load_structure(structure_path: str | Path | None, verbose: bool = True) -> dict[str, list[dict]]:
-    """Load song-structure segments keyed by song name.
+def _load_structure(
+    structure_path: str | Path | None, verbose: bool = True,
+) -> tuple[dict[str, list[dict]], dict[str, float]]:
+    """Load song-structure segments + per-song bpm, keyed by song name.
 
-    Each value is a list of ``{"start","end","label"}`` segments sorted by start,
-    with allin1's non-section ``start``/``end`` sentinel labels filtered out. Songs
-    with no structure entry simply get a ``<no_section>`` prefix at crop time, so a
-    partial structure pass is fine. Mirrors ``_load_lyrics`` (sharded dir or a
-    single JSON).
+    Returns ``(structure, bpm)``. ``structure[name]`` is a list of
+    ``{"start","end","label"}`` segments sorted by start, with allin1's non-section
+    ``start``/``end`` sentinel labels filtered out. ``bpm[name]`` is the allin1
+    tempo (a float) when present in the shard — used for the tempo marker. Both are
+    sparse: songs with no structure entry get a ``<no_section>`` prefix and songs
+    with no bpm get ``<unknown_tempo>`` at crop time, so a partial structure pass is
+    fine. Mirrors ``_load_lyrics`` (sharded dir or a single JSON).
     """
     if structure_path is None:
-        return {}
+        return {}, {}
     sp = Path(structure_path)
     if not sp.exists():
-        return {}
+        return {}, {}
     if sp.is_dir():
         from diskrot.structure import load_structure_shards
         raw = load_structure_shards(sp)
     else:
         raw = json.loads(sp.read_text())
     structure: dict[str, list[dict]] = {}
+    bpm: dict[str, float] = {}
     for key, val in raw.items():
         if not isinstance(val, dict):
             continue
@@ -107,9 +112,13 @@ def _load_structure(structure_path: str | Path | None, verbose: bool = True) -> 
                 if isinstance(s, dict) and s.get("label") not in (None, "start", "end")]
         if segs:
             structure[key] = sorted(segs, key=lambda s: s["start"])
+        b = val.get("bpm")
+        if isinstance(b, (int, float)):
+            bpm[key] = float(b)
     if verbose:
-        print(f"[structure] loaded {len(structure)} entries from {sp}", flush=True)
-    return structure
+        print(f"[structure] loaded {len(structure)} entries "
+              f"({len(bpm)} with bpm) from {sp}", flush=True)
+    return structure, bpm
 
 
 def _active_label_at(segs: list[dict] | None, t: float) -> str:
@@ -220,6 +229,7 @@ def load_mmap_bundle(
           f"entries across {len(shard_metas)} shards "
           f"(melody={'on' if has_melody else 'off'}) ({time.time()-t0:.1f}s)",
           flush=True)
+    structure, bpm = _load_structure(structure_path)
     return {
         "packed_dir": str(packed_dir),
         "train_entries": train_entries,
@@ -227,7 +237,8 @@ def load_mmap_bundle(
         "shard_metas": shard_metas,
         "tags": _load_tags(tags_path),
         "lyrics": _load_lyrics(lyrics_path),
-        "structure": _load_structure(structure_path),
+        "structure": structure,
+        "bpm": bpm,
         "has_melody": has_melody,
     }
 
@@ -305,6 +316,10 @@ class TokenDataset(Dataset):
         # markers into the time-aligned lyric stream. Songs without an entry get a
         # <no_section> prefix, so a partial structure pass is fine.
         ds._structure = {n: all_structure[n] for n in name_set if n in all_structure}
+        # Per-song bpm (allin1 tempo), used for the <tempo_*> header marker. Sparse:
+        # songs without a bpm aren't in the map and get <unknown_tempo> at crop time.
+        all_bpm = bundle.get("bpm", {})
+        ds._bpm = {n: all_bpm[n] for n in name_set if n in all_bpm}
         # Per-song phoneme groups (one list[int] per word), built lazily on first
         # access and reused across crops — g2p runs once per song while it stays
         # hot. Bounded LRU (OrderedDict): each forked DataLoader worker fills its
@@ -376,31 +391,35 @@ class TokenDataset(Dataset):
         Stream format (must stay byte-identical to the inference parser
         ``text_with_markers_to_phoneme_ids``):
 
-            BOS  <gender>  <active-section>  w w  <inline-section>  w ...
+            BOS  <gender>  <tempo>  <active-section>  w w  <inline-section>  w ...
 
         - Always starts with BOS, then exactly one gender marker (the song's
           F0-labeled vocal gender, ``<unknown_gender>`` if instrumental /
-          unlabeled) and exactly one section marker for the section active at
+          unlabeled), one tempo marker (the allin1 bpm bucketed, ``<unknown_tempo>``
+          if no bpm), and exactly one section marker for the section active at
           ``start_sec`` (``<no_section>`` in a gap / for songs without a structure
           entry). This dense prefix means even a boundary-free or instrumental crop
-          carries both slots, never a fully-padded row.
+          carries all three slots, never a fully-padded row.
         - Any section boundary that falls inside the crop is injected inline before
           the first word at/after the boundary. (Gender is per-song, prefix-only.)
         Markers and words are appended via the shared ``append_unit`` separator
         rule; truncated to max_lyric_len.
         """
         from model.lyric_encoder import (
-            BOS_PHONEME_ID, append_unit, append_unit_capped, gender_label_to_id,
-            structure_label_to_id, text_to_word_phoneme_groups,
+            BOS_PHONEME_ID, append_unit, append_unit_capped, bpm_to_id,
+            gender_label_to_id, structure_label_to_id, text_to_word_phoneme_groups,
         )
 
         segs = self._structure.get(name)
         entry = self._lyrics.get(name)
         gender = entry.get("gender") if isinstance(entry, dict) else None
-        # Compact 2-marker header (no internal word-boundary): BOS <gender> <section>.
+        bpm = self._bpm.get(name)
+        # Compact 3-marker header (no internal word-boundary):
+        # BOS <gender> <tempo> <section>.
         ids = [BOS_PHONEME_ID]
         append_unit(ids, [
             gender_label_to_id(gender),
+            bpm_to_id(bpm),
             structure_label_to_id(_active_label_at(segs, start_sec)),
         ])
 

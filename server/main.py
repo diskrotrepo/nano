@@ -9,8 +9,9 @@ Endpoints:
     POST /extend         continue forward from a point T → [original 0→T | new]
     POST /cover          re-render a hummed melody (chroma) in the prompt's timbre
 
-    /generate, /extend accept optional text (tags), lyrics, and style_audio
-conditioning. /extend seeds from the overlap_seconds before a cut point T, keeps
+    /generate, /extend accept optional text (tags), lyrics, gender, bpm, and
+style_audio conditioning (gender/bpm ride the lyric stream as leading [male]/
+[120bpm] markers). /extend seeds from the overlap_seconds before a cut point T, keeps
 the original up to T, and generates forward (T defaults to the clip end, a
 seamless grow-the-clip). /cover conditions on the uploaded melody's chromagram
 (its audio never appears in the output) and needs a melody-trained checkpoint.
@@ -143,6 +144,7 @@ async def generate_endpoint(
     prompt: str = Form(""),
     lyrics: str = Form(""),
     gender: str = Form(""),
+    bpm: float = Form(0.0),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
@@ -185,6 +187,7 @@ async def generate_endpoint(
             style_weight=style_weight,
             lyric_cfg_scale=lyric_cfg_scale or None,
             gender=_norm_gender(gender),
+            bpm=bpm or None,
             score_clap=score_clap,
         )
     except ValueError as e:
@@ -215,6 +218,7 @@ async def extend_endpoint(
     prompt: str = Form(""),
     lyrics: str = Form(""),
     gender: str = Form(""),
+    bpm: float = Form(0.0),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
@@ -255,6 +259,7 @@ async def extend_endpoint(
             style_weight=style_weight,
             lyric_cfg_scale=lyric_cfg_scale or None,
             gender=_norm_gender(gender),
+            bpm=bpm or None,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -274,6 +279,7 @@ async def cover_endpoint(
     prompt: str = Form(""),
     lyrics: str = Form(""),
     gender: str = Form(""),
+    bpm: float = Form(0.0),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
@@ -308,6 +314,7 @@ async def cover_endpoint(
             melody_cfg_scale=melody_cfg_scale or None,
             lyric_cfg_scale=lyric_cfg_scale or None,
             gender=_norm_gender(gender),
+            bpm=bpm or None,
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))

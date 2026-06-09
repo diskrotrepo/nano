@@ -85,11 +85,15 @@ def test_getitem_shape_and_dtype(synth_tokens_dir):
     # for the correctness contract.
     assert tokens.dtype == torch.int16
     assert tags == ""
-    # No lyrics/structure path → BOS + the dense <unknown_gender> + <no_section>
-    # prefixes (never an empty/fully-padded sequence, which would NaN the lyric
-    # cross-attention).
-    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID
-    assert lyric_ids.tolist() == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, NO_SECTION_ID]
+    # No lyrics/structure path → BOS + the dense <unknown_gender> + <unknown_tempo>
+    # + <no_section> prefixes (never an empty/fully-padded sequence, which would NaN
+    # the lyric cross-attention).
+    from model.lyric_encoder import (
+        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+    )
+    assert lyric_ids.tolist() == [
+        BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID, NO_SECTION_ID,
+    ]
 
 
 def test_getitem_uses_random_crop_within_bounds(synth_tokens_dir):
@@ -221,9 +225,11 @@ def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
     overlapping words, and BOS + dense prefixes when nothing overlaps or the song is
     instrumental (no structure entry / no gender field here → <unknown_gender> +
     <no_section>)."""
-    from model.lyric_encoder import BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID
+    from model.lyric_encoder import (
+        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+    )
 
-    prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, NO_SECTION_ID]
+    prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID, NO_SECTION_ID]
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({
@@ -236,8 +242,8 @@ def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
                       lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
 
     full = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
-    assert full[:3] == prefix  # BOS + <unknown_gender> + <no_section> prefix
-    assert len(full) > 3  # phonemes present
+    assert full[:4] == prefix  # BOS + <unknown_gender> + <unknown_tempo> + <no_section>
+    assert len(full) > 4  # phonemes present
     # No overlap → dense prefix only (never a lone BOS).
     assert ds._get_segment_lyric_ids("song_000", 10.0, 11.0) == prefix
     # Instrumental / missing → dense prefix only.
@@ -249,7 +255,7 @@ def test_segment_lyric_ids_gender_prefix(synth_tokens_dir, tmp_path):
     """A song's F0-labeled ``gender`` field becomes the dense gender prefix, and
     the train-time stream matches the inference parser's bracketed equivalent."""
     from model.lyric_encoder import (
-        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID, NO_SECTION_ID,
+        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID, NO_SECTION_ID, UNKNOWN_TEMPO_ID,
         text_with_markers_to_phoneme_ids,
     )
 
@@ -265,7 +271,9 @@ def test_segment_lyric_ids_gender_prefix(synth_tokens_dir, tmp_path):
                       lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
 
     train_ids = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
-    assert train_ids[:3] == [BOS_PHONEME_ID, GENDER_TOKEN_TO_ID["female"], NO_SECTION_ID]
+    assert train_ids[:4] == [
+        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID["female"], UNKNOWN_TEMPO_ID, NO_SECTION_ID,
+    ]
     # train-time stream == inference parser for the equivalent bracketed string
     infer_ids = text_with_markers_to_phoneme_ids("[female] hello world")
     assert train_ids == infer_ids

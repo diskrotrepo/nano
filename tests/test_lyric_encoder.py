@@ -22,15 +22,21 @@ from model.lyric_encoder import (
     PHONEME_VOCAB_SIZE,
     STRUCTURE_LABELS,
     STRUCTURE_TOKEN_TO_ID,
+    TEMPO_BPM_EDGES,
     UNKNOWN_GENDER_ID,
+    UNKNOWN_TEMPO_ID,
     WORD_BOUNDARY_ID,
     LyricEncoder,
+    bpm_to_id,
     gender_label_to_id,
     is_gender_label,
+    is_tempo_label,
+    parse_tempo_label,
     structure_label_to_id,
     text_to_phoneme_ids,
     text_with_markers_to_phoneme_ids,
 )
+from model.lyric_encoder import N_TEMPO_BUCKETS
 
 
 def _g2p_available() -> bool:
@@ -57,7 +63,8 @@ def test_vocab_specials_at_low_ids():
 def test_vocab_size_and_uniqueness():
     assert PHONEME_VOCAB_SIZE == len(PHONEME_VOCAB)
     assert len(set(PHONEME_VOCAB)) == PHONEME_VOCAB_SIZE  # no dup ids
-    assert PHONEME_VOCAB_SIZE == 86  # 4 specials + 9 structure + 3 gender + 70 ARPABET
+    # 4 specials + 9 structure + 3 gender + 8 tempo (1 unknown + 7 buckets) + 70 ARPABET
+    assert PHONEME_VOCAB_SIZE == 94
 
 
 # --- structure markers -------------------------------------------------------
@@ -101,6 +108,43 @@ def test_is_gender_label_classifies_brackets():
     assert not is_gender_label(None)
 
 
+# --- tempo markers -----------------------------------------------------------
+def test_tempo_tokens_present_after_gender_below_arpabet():
+    from model.lyric_encoder import TEMPO_IDS
+    # 1 unknown + N bucket tokens, contiguous, right after the gender markers.
+    assert len(TEMPO_IDS) == N_TEMPO_BUCKETS + 1
+    start = 4 + len(STRUCTURE_LABELS) + len(GENDER_LABELS)
+    assert sorted(TEMPO_IDS) == list(range(start, start + N_TEMPO_BUCKETS + 1))
+    assert PHONEME_VOCAB[UNKNOWN_TEMPO_ID] == "<unknown_tempo>"
+
+
+def test_bpm_to_id_buckets_and_unknown():
+    # boundary behavior: edge value goes UP into the next bucket
+    assert bpm_to_id(TEMPO_BPM_EDGES[0] - 1) != bpm_to_id(TEMPO_BPM_EDGES[0])
+    assert bpm_to_id(TEMPO_BPM_EDGES[0]) == bpm_to_id(TEMPO_BPM_EDGES[0] + 1)
+    # below first edge and above last edge are distinct, valid buckets (not unknown)
+    assert bpm_to_id(40.0) != UNKNOWN_TEMPO_ID
+    assert bpm_to_id(220.0) != UNKNOWN_TEMPO_ID
+    assert bpm_to_id(40.0) != bpm_to_id(220.0)
+    # missing / nonsensical -> unknown
+    assert bpm_to_id(None) == UNKNOWN_TEMPO_ID
+    assert bpm_to_id(0) == UNKNOWN_TEMPO_ID
+    assert bpm_to_id(-5) == UNKNOWN_TEMPO_ID
+    assert bpm_to_id(float("nan")) == UNKNOWN_TEMPO_ID
+
+
+def test_parse_and_is_tempo_label():
+    assert parse_tempo_label("120bpm") == 120.0
+    assert parse_tempo_label("120") == 120.0
+    assert parse_tempo_label("tempo:128") == 128.0
+    assert parse_tempo_label(" Fast ") == parse_tempo_label("fast")
+    # not a tempo -> None, so the parser routes it to the section slot
+    assert parse_tempo_label("chorus") is None
+    assert parse_tempo_label(None) is None
+    assert is_tempo_label("120bpm") and is_tempo_label("fast")
+    assert not is_tempo_label("chorus") and not is_tempo_label(None)
+
+
 def test_structure_label_to_id_folds_unknown_and_normalizes():
     assert structure_label_to_id("chorus") == STRUCTURE_TOKEN_TO_ID["chorus"]
     assert structure_label_to_id("CHORUS") == STRUCTURE_TOKEN_TO_ID["chorus"]
@@ -117,8 +161,9 @@ def test_markers_parse_prefix_and_inline():
     ids = text_with_markers_to_phoneme_ids("[verse] hello [chorus] world")
     assert ids[0] == BOS_PHONEME_ID
     assert ids[1] == UNKNOWN_GENDER_ID  # dense gender slot (none given)
-    assert ids[2] == STRUCTURE_TOKEN_TO_ID["verse"]  # leading section marker = prefix
-    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[3:]  # inline marker
+    assert ids[2] == UNKNOWN_TEMPO_ID   # dense tempo slot (none given)
+    assert ids[3] == STRUCTURE_TOKEN_TO_ID["verse"]  # leading section marker = prefix
+    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[4:]  # inline marker
     # verse appears once (prefix only, not re-emitted)
     assert ids.count(STRUCTURE_TOKEN_TO_ID["verse"]) == 1
 
@@ -132,7 +177,8 @@ def test_markers_parse_gender_prefix_order_independent():
     assert a == b
     assert a[0] == BOS_PHONEME_ID
     assert a[1] == GENDER_TOKEN_TO_ID["female"]
-    assert a[2] == STRUCTURE_TOKEN_TO_ID["chorus"]
+    assert a[2] == UNKNOWN_TEMPO_ID  # no tempo given -> unknown_tempo slot
+    assert a[3] == STRUCTURE_TOKEN_TO_ID["chorus"]
     # gender appears once (prefix only, never inline)
     assert a.count(GENDER_TOKEN_TO_ID["female"]) == 1
 
@@ -143,22 +189,25 @@ def test_markers_no_bracket_artifact_reaches_g2p():
     ids = text_with_markers_to_phoneme_ids("[chorus] singing the blues")
     assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
     plain = text_to_phoneme_ids("singing the blues", add_bos=False)
-    # tail after BOS + <gender> + <chorus> prefixes + leading WB equals plain g2p
-    assert ids[4:] == plain
+    # tail after BOS + <gender> + <tempo> + <chorus> prefixes + leading WB equals
+    # plain g2p (4 prefix tokens then the word-boundary at index 4)
+    assert ids[5:] == plain
 
 
 @g2p_required
 def test_markers_default_prefixes_are_unknown_gender_and_no_section():
     ids = text_with_markers_to_phoneme_ids("hello world")
     assert ids[1] == UNKNOWN_GENDER_ID  # no gender marker -> unknown_gender
-    assert ids[2] == NO_SECTION_ID      # no section marker -> no_section
+    assert ids[2] == UNKNOWN_TEMPO_ID   # no tempo marker -> unknown_tempo
+    assert ids[3] == NO_SECTION_ID      # no section marker -> no_section
 
 
 @g2p_required
 def test_markers_unknown_label_folds_to_no_section():
     ids = text_with_markers_to_phoneme_ids("[prechorus] hello")
     assert ids[1] == UNKNOWN_GENDER_ID  # gender slot still dense
-    assert ids[2] == NO_SECTION_ID      # unknown label as section prefix
+    assert ids[2] == UNKNOWN_TEMPO_ID   # tempo slot still dense
+    assert ids[3] == NO_SECTION_ID      # unknown label as section prefix
 
 
 @g2p_required
@@ -170,7 +219,7 @@ def test_markers_malformed_brackets_never_reach_g2p():
         assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
     # [[chorus]] still resolves the chorus label as the section prefix.
     nested = text_with_markers_to_phoneme_ids("[[chorus]] hello")
-    assert nested[2] == STRUCTURE_TOKEN_TO_ID["chorus"]
+    assert nested[3] == STRUCTURE_TOKEN_TO_ID["chorus"]
     # A bare [] is a no-op: same stream as the plain text.
     assert text_with_markers_to_phoneme_ids("hello [] world") == \
         text_with_markers_to_phoneme_ids("hello world")
@@ -193,8 +242,9 @@ def test_markers_wellformed_unchanged_by_hardening():
     ids = text_with_markers_to_phoneme_ids("[female] [verse] hello world [chorus] yeah")
     assert ids[0] == BOS_PHONEME_ID
     assert ids[1] == GENDER_TOKEN_TO_ID["female"]
-    assert ids[2] == STRUCTURE_TOKEN_TO_ID["verse"]
-    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[3:]
+    assert ids[2] == UNKNOWN_TEMPO_ID  # no tempo given
+    assert ids[3] == STRUCTURE_TOKEN_TO_ID["verse"]
+    assert STRUCTURE_TOKEN_TO_ID["chorus"] in ids[4:]
     assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
 
 

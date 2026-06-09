@@ -83,18 +83,41 @@ UNKNOWN_GENDER_LABEL = "unknown_gender"
 GENDER_LABELS: tuple[str, ...] = (UNKNOWN_GENDER_LABEL, "male", "female")
 _GENDER_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in GENDER_LABELS)
 
+# Tempo (BPM) markers — ride the SAME phoneme stream as the structure/gender
+# markers, for the same reason: tempo is a per-song attribute the decoder can
+# cross-attend to (it conditions the beat rate chroma can't carry, since chroma is
+# octave-invariant pitch, not rhythm), and it CFG-drops with the lyric stream. The
+# allin1 structure pass already computes a per-song ``bpm`` (diskrot.structure),
+# previously discarded; here it's bucketed into coarse ranges (perception of tempo
+# is roughly categorical). ``TEMPO_BPM_EDGES`` are the inclusive lower bounds of
+# buckets 1..N (bucket 0 is everything below the first edge); ``<unknown_tempo>``
+# is the fallback for songs without a bpm (no structure pass / instrumental), so
+# every stream always carries a valid tempo slot (the same dense-prefix discipline
+# as ``<no_section>``/``<unknown_gender>``). Placed between the gender markers and
+# _ARPABET so an ARPABET edit can't silently renumber them. Adding/removing any of
+# these changes PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
+UNKNOWN_TEMPO_LABEL = "unknown_tempo"
+# Bucket boundaries (BPM): bucket i = [EDGES[i-1], EDGES[i]); bucket 0 = [-inf, 70),
+# last bucket = [170, +inf). 7 buckets total. Tunable — changing the count or edges
+# changes the vocab and is checkpoint-incompatible.
+TEMPO_BPM_EDGES: tuple[float, ...] = (70.0, 90.0, 110.0, 130.0, 150.0, 170.0)
+N_TEMPO_BUCKETS: int = len(TEMPO_BPM_EDGES) + 1  # 7
+_TEMPO_TOKENS: tuple[str, ...] = (
+    f"<{UNKNOWN_TEMPO_LABEL}>",
+) + tuple(f"<tempo_{i}>" for i in range(N_TEMPO_BUCKETS))
+
 # Frozen vocab: specials first (so PAD==0), then structure markers, then gender
-# markers, then ARPABET.
+# markers, then tempo markers, then ARPABET.
 PHONEME_VOCAB: tuple[str, ...] = (
     PAD_PHONEME, BOS_PHONEME, WORD_BOUNDARY_PHONEME, UNK_PHONEME,
-) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _ARPABET
+) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _TEMPO_TOKENS + _ARPABET
 
 PHONEME_TO_ID: dict[str, int] = {p: i for i, p in enumerate(PHONEME_VOCAB)}
 PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
 BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
 WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
 UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
-PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 86 (4 specials + 9 structure + 3 gender + 70 ARPABET)
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 94 (4 specials + 9 structure + 3 gender + 8 tempo + 70 ARPABET)
 
 # Structure label <-> phoneme id, the single source of truth shared by the dataset
 # (train-time injection) and inference (bracket parsing) so the two agree exactly.
@@ -168,6 +191,73 @@ def is_gender_label(label: str | None) -> bool:
     if not label:
         return False
     return _normalize_label(label) in _RECOGNIZED_GENDER_KEYS
+
+
+# Tempo label/bpm <-> phoneme id, parallel to the gender mapping above. Shared by
+# the dataset (train-time prefix injection) and inference (bracket parsing) so the
+# two agree exactly. ``<unknown_tempo>`` is index 0 of _TEMPO_TOKENS; bucket i maps
+# to ``<tempo_i>``.
+UNKNOWN_TEMPO_ID: int = PHONEME_TO_ID[f"<{UNKNOWN_TEMPO_LABEL}>"]
+_TEMPO_BUCKET_IDS: tuple[int, ...] = tuple(
+    PHONEME_TO_ID[f"<tempo_{i}>"] for i in range(N_TEMPO_BUCKETS)
+)
+TEMPO_IDS: frozenset[int] = frozenset((UNKNOWN_TEMPO_ID,) + _TEMPO_BUCKET_IDS)
+
+# Named tempo aliases a user might type for a bracket; mapped to a representative
+# bpm so they route through the same bucketing as a numeric ``[120bpm]``.
+_TEMPO_ALIASES: dict[str, float] = {
+    "slow": 65.0, "medium": 100.0, "mid": 100.0, "moderate": 100.0, "fast": 160.0,
+}
+_TEMPO_NUM_RE = re.compile(r"^\s*(?:tempo\s*[:=]?\s*)?(\d+(?:\.\d+)?)\s*(?:bpm)?\s*$", re.I)
+
+
+def bpm_to_id(bpm: float | None) -> int:
+    """Map a BPM value to its tempo-bucket marker id, falling back to <unknown_tempo>.
+
+    ``None`` or non-finite / non-positive bpm -> <unknown_tempo>. Otherwise bucket
+    by ``TEMPO_BPM_EDGES`` (bucket i = [EDGES[i-1], EDGES[i])). The train and
+    inference paths both route bpm through this, keeping the id mapping identical.
+    """
+    if bpm is None:
+        return UNKNOWN_TEMPO_ID
+    try:
+        b = float(bpm)
+    except (TypeError, ValueError):
+        return UNKNOWN_TEMPO_ID
+    if not math.isfinite(b) or b <= 0:
+        return UNKNOWN_TEMPO_ID
+    bucket = 0
+    for edge in TEMPO_BPM_EDGES:
+        if b < edge:
+            break
+        bucket += 1
+    return _TEMPO_BUCKET_IDS[bucket]
+
+
+def parse_tempo_label(label: str | None) -> float | None:
+    """Parse a tempo bracket (``120``, ``120bpm``, ``tempo:120``, ``fast``) to a bpm.
+
+    Returns ``None`` when the label isn't a tempo (so the bracket parser can route
+    it elsewhere). Named aliases map to a representative bpm; numeric forms parse
+    directly. Shared train/inference contract via ``bpm_to_id``."""
+    if not label:
+        return None
+    key = label.strip().lower()
+    if key in _TEMPO_ALIASES:
+        return _TEMPO_ALIASES[key]
+    m = _TEMPO_NUM_RE.match(key)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def is_tempo_label(label: str | None) -> bool:
+    """True if ``label`` names a tempo (numeric bpm or a known alias).
+
+    Used by the inference bracket parser to route ``[120bpm]`` / ``[fast]`` to the
+    tempo prefix slot vs ``[chorus]`` to the section slot."""
+    return parse_tempo_label(label) is not None
+
 
 # Punctuation g2p_en passes through verbatim that we fold into a word boundary
 # rather than dropping (keeps phrase structure the decoder can align to).
@@ -301,21 +391,23 @@ _MARKER_RE = re.compile(r"\[([^\[\]]+)\]")
 def text_with_markers_to_phoneme_ids(
     text: str, max_len: int | None = None, add_bos: bool = True,
 ) -> list[int]:
-    """Inference-side lyric parser: ``[female] [verse] words [chorus] words`` -> ids.
+    """Inference-side lyric parser: ``[female] [120bpm] [verse] words [chorus] ...`` -> ids.
 
     Reproduces the dataset's train-time stream exactly (see ``append_unit`` and
     ``TokenDataset._get_segment_lyric_ids``):
 
-      ``BOS  <prefix-gender>  <prefix-section>  w w  <inline-section>  w ...``
+      ``BOS  <prefix-gender>  <prefix-tempo>  <prefix-section>  w w  <inline-section>  w ...``
 
-    Prefix rules — every stream carries BOTH a gender slot and a section slot,
-    always, matching the dense train-time prefix:
+    Prefix rules — every stream carries a gender slot, a tempo slot, AND a section
+    slot, always, matching the dense train-time prefix:
     - Leading ``[label]`` markers are consumed as prefixes: one gender (``[male]``
-      / ``[female]``) and one section (``[verse]`` ...), in either order. A gender
-      not given defaults to ``<unknown_gender>``, a section to ``<no_section>``.
-    - Gender is emitted first, then section (the train-time order).
+      / ``[female]``), one tempo (``[120bpm]`` / ``[tempo:120]`` / ``[fast]``), and
+      one section (``[verse]`` ...), in any order. A gender not given defaults to
+      ``<unknown_gender>``, a tempo to ``<unknown_tempo>``, a section to
+      ``<no_section>``.
+    - Emitted in train-time order: gender, then tempo, then section.
     Remaining markers after the leading run are inline section markers (a stray
-    inline gender marker is dropped — gender is prefix-only, as in training).
+    inline gender/tempo marker is dropped — both are prefix-only, as in training).
     Brackets are stripped here and never reach g2p (the biggest train/inference
     footgun); unknown labels fold to ``<no_section>`` via ``structure_label_to_id``.
     Malformed brackets are handled defensively: an empty ``[]`` and the stray
@@ -339,27 +431,31 @@ def text_with_markers_to_phoneme_ids(
                 events.append(("text", span))
 
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
-    # Consume the leading run of markers as prefixes: at most one gender + one
-    # section. Stop at the first text span or once both slots are filled.
+    # Consume the leading run of markers as prefixes: at most one gender + one tempo
+    # + one section, in any order. Stop at the first text span or once all slots are
+    # filled.
     gender_id = UNKNOWN_GENDER_ID
+    tempo_id = UNKNOWN_TEMPO_ID
     section_id = NO_SECTION_ID
-    gender_set = section_set = False
+    gender_set = tempo_set = section_set = False
     while events and events[0][0] == "marker":
         label = events[0][1]
         if is_gender_label(label) and not gender_set:
             gender_id, gender_set = gender_label_to_id(label), True
-        elif not section_set and not is_gender_label(label):
+        elif is_tempo_label(label) and not tempo_set:
+            tempo_id, tempo_set = bpm_to_id(parse_tempo_label(label)), True
+        elif not section_set and not is_gender_label(label) and not is_tempo_label(label):
             section_id, section_set = structure_label_to_id(label), True
         else:
             break
         events = events[1:]
-    # Compact 2-marker header (no internal word-boundary): BOS <gender> <section>.
-    append_unit(ids, [gender_id, section_id])
+    # Compact 3-marker header (no internal word-boundary): BOS <gender> <tempo> <section>.
+    append_unit(ids, [gender_id, tempo_id, section_id])
 
     for kind, val in events:
         if kind == "marker":
-            if is_gender_label(val):
-                continue  # gender is prefix-only; ignore a stray inline gender marker
+            if is_gender_label(val) or is_tempo_label(val):
+                continue  # gender/tempo are prefix-only; ignore a stray inline marker
             if not append_unit_capped(ids, [structure_label_to_id(val)], max_len):
                 break
         else:
