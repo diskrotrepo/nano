@@ -38,6 +38,20 @@ def _combine_text_lyrics(text: str, lyrics: str) -> str | None:
     return text or lyrics or None
 
 
+def _norm_gender(gender: str) -> str | None:
+    """Normalize the optional vocal-gender selector to "male"/"female"/None.
+
+    Folds a few aliases; anything unrecognized (incl. "" / "auto") -> None, which
+    leaves the lyric stream's gender slot at <unknown_gender> (the train-time
+    fallback). The engine only acts on exactly "male"/"female"."""
+    g = (gender or "").strip().lower()
+    if g in ("m", "man", "boy", "guy"):
+        g = "male"
+    elif g in ("f", "woman", "girl"):
+        g = "female"
+    return g if g in ("male", "female") else None
+
+
 def _maybe_sweeten(prompt: str, sweeten: bool) -> tuple[str, dict[str, str]]:
     """Rewrite the tags prompt into LP-MusicCaps caption style via the local
     sweetener. On by default (CLAP was trained on ~40-word prose captions, so a
@@ -128,6 +142,7 @@ async def generate_endpoint(
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
+    gender: str = Form(""),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
@@ -169,6 +184,7 @@ async def generate_endpoint(
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
             lyric_cfg_scale=lyric_cfg_scale or None,
+            gender=_norm_gender(gender),
             score_clap=score_clap,
         )
     except ValueError as e:
@@ -198,6 +214,7 @@ async def extend_endpoint(
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
+    gender: str = Form(""),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
@@ -237,6 +254,7 @@ async def extend_endpoint(
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
             lyric_cfg_scale=lyric_cfg_scale or None,
+            gender=_norm_gender(gender),
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -255,6 +273,7 @@ async def cover_endpoint(
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
+    gender: str = Form(""),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
@@ -288,6 +307,7 @@ async def cover_endpoint(
             negative_text=negative_prompt.strip() or None,
             melody_cfg_scale=melody_cfg_scale or None,
             lyric_cfg_scale=lyric_cfg_scale or None,
+            gender=_norm_gender(gender),
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))

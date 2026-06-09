@@ -45,3 +45,5 @@ lyrics/
 *.mp3
 *.flac
 *.m4a
+eval/genre_gap_report.txt
+eval/genre_gap_snapshot.json

@@ -487,6 +487,8 @@ class _HomePageState extends State<HomePage> {
           help: 'Phonemized (g2p) into a token sequence for the lyric '
               'cross-attention. This is what makes the model sing words.',
         ),
+        const SizedBox(height: 10),
+        _genderSelector(),
         NanoTextField(
           label: 'negative prompt',
           controller: _negCtl,
@@ -727,6 +729,88 @@ class _HomePageState extends State<HomePage> {
         _transformToggle(),
         const SizedBox(height: 14),
         ...(_mode == NanoMode.cover ? _coverControls() : _extendControls()),
+      ],
+    );
+  }
+
+  /// auto | male | female segmented selector for vocal gender. Sets
+  /// [GenParams.gender] (''/'male'/'female'); the server injects the matching
+  /// [male]/[female] marker into the lyric stream — it takes effect even with no
+  /// lyrics (a gender-only header stream), so you can steer an instrumental
+  /// generation's vocal toward male/female.
+  Widget _genderSelector() {
+    Widget seg(String value, String label, IconData icon) {
+      final selected = _params.gender == value;
+      return Expanded(
+        child: InkWell(
+          onTap: () => setState(() => _params.gender = value),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              color: selected ? NanoColors.pink : Colors.transparent,
+              border: Border.all(
+                  color: selected ? NanoColors.pink : NanoColors.border),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon,
+                    size: 13,
+                    color: selected ? Colors.black : NanoColors.textDim),
+                const SizedBox(width: 6),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: selected ? Colors.black : NanoColors.textDim,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('vocal gender',
+                  style: TextStyle(color: NanoColors.text, fontSize: 13)),
+              const SizedBox(width: 6),
+              Tooltip(
+                message:
+                    "Steers the lyric stream's gender marker. auto leaves it "
+                    "unset (<unknown_gender>); male/female take effect even "
+                    "with no lyrics. Needs a lyric-conditioned checkpoint.",
+                waitDuration: const Duration(milliseconds: 300),
+                textStyle: const TextStyle(color: Colors.black, fontSize: 12),
+                decoration: BoxDecoration(
+                  color: NanoColors.pink,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Icon(Icons.info_outline,
+                    size: 13, color: NanoColors.textDim),
+              ),
+            ],
+          ),
+        ),
+        Row(
+          children: [
+            seg('', 'auto', Icons.help_outline),
+            const SizedBox(width: 8),
+            seg('male', 'male', Icons.male),
+            const SizedBox(width: 8),
+            seg('female', 'female', Icons.female),
+          ],
+        ),
       ],
     );
   }

@@ -32,6 +32,10 @@ class GenParams {
   // conditioning (all modes)
   String prompt = '';
   String lyrics = '';
+  // Vocal gender steers the lyric stream's gender marker. '' = auto
+  // (<unknown_gender>); 'male'/'female' inject the matching marker — works even
+  // with no lyrics (the server sends a gender-only header stream).
+  String gender = '';
   String negativePrompt = '';
   bool sweeten = true;
   AudioFile? styleAudio;
@@ -126,6 +130,7 @@ class NanoApi {
     // shared conditioning
     f['prompt'] = p.prompt;
     f['lyrics'] = p.lyrics;
+    f['gender'] = p.gender;
     f['negative_prompt'] = p.negativePrompt;
     f['sweeten'] = p.sweeten.toString();
     f['style_weight'] = p.styleWeight.toString();

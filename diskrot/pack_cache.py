@@ -382,11 +382,17 @@ def pack(
             def _load_mel(arg: tuple[Path, int]) -> "np.ndarray | None":
                 path, n_frames = arg
                 mp = mel_cache_dir / (path.stem + _MEL_EXT)
-                if not mp.exists():
-                    return None
                 try:
+                    if not mp.exists():
+                        return None
                     arr = np.load(mp)
-                except Exception:  # noqa: BLE001 — corrupt/torn write = treat as missing
+                except OSError:
+                    # Missing, corrupt/torn write, or a path too long for the
+                    # filesystem (ENAMETOOLONG on fullwidth-unicode song names —
+                    # which modal_melody also couldn't have written) = treat as
+                    # missing → zero-filled below, never dropped.
+                    return None
+                except Exception:  # noqa: BLE001 — any other load failure = missing
                     return None
                 if arr.ndim != 2 or arr.shape[0] != _N_CHROMA or arr.shape[1] != n_frames:
                     return None

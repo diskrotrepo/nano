@@ -133,11 +133,17 @@ DEFAULTS = {
     # Fill-in-the-middle (infill, the /infill path). Adds two per-codebook control
     # ids (<SUF>/<MID>) and reorders fim_prob of batches into the FIM layout so the
     # model learns to bridge a gap given prefix+suffix. FIM batches drop lyrics
-    # (frame reorder scrambles sung alignment) but keep tags + co-reordered melody,
-    # so keep fim_prob modest — singing is the headline objective. Enabling use_fim
-    # grows the vocab and is checkpoint-incompatible (fresh v8 start).
-    "use_fim": True,
-    "fim_prob": 0.15,
+    # (frame reorder scrambles sung alignment) but keep tags + co-reordered melody.
+    #
+    # DEFERRED for the v8 singing run: FIM is feature-flagged OFF here so the lyric
+    # path gets full signal (no 15% of batches dropping lyrics) and the run is
+    # cleanly attributable to lyrics + structure + melody. The /infill code path
+    # (model/fim.py, the train-loop reorder, the server guard, tests) stays intact —
+    # flip use_fim back to True for a future fresh start to add infill. Enabling
+    # use_fim grows the vocab and is checkpoint-incompatible, so it can't be hot-
+    # swapped onto this checkpoint anyway.
+    "use_fim": False,
+    "fim_prob": 0.0,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 8 (global 64 on 8 ranks)
 

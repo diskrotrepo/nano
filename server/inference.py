@@ -210,6 +210,7 @@ class InferenceEngine:
         text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
+        gender: str | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Build conditioning from text (tags + lyrics), style audio, or both.
 
@@ -217,8 +218,9 @@ class InferenceEngine:
         server). Tags go through the pooled CLAP encoder; lyrics are phonemized
         (g2p) into a token sequence for the LyricEncoder cross-attention — they no
         longer go through CLAP. Style audio (when given) blends into the tag
-        embedding. Returns ``(tag_emb [1,1,D] | None, lyric_ids [1,L] | None,
-        lyric_mask [1,L] | None)``.
+        embedding. ``gender`` ("male"/"female") rides the lyric stream as a leading
+        marker — see below. Returns ``(tag_emb [1,1,D] | None, lyric_ids [1,L] |
+        None, lyric_mask [1,L] | None)``.
         """
         # Split tags from lyrics (server joins them as "tags. lyrics")
         tags_str = ""
@@ -227,6 +229,16 @@ class InferenceEngine:
             parts = text.split(". ", 1)
             tags_str = parts[0]
             lyrics_str = parts[1] if len(parts) > 1 else ""
+
+        # A selected vocal gender rides the lyric stream as a leading [male]/
+        # [female] bracket — the same gender marker the dataset injects at train
+        # time (every stream opens BOS <gender> <section>, words or not). Prepending
+        # it here makes the stream non-empty even with no lyrics, so an instrumental
+        # generation can still steer vocal gender. text_with_markers_to_phoneme_ids
+        # consumes only the first gender prefix, so it overrides a stray [male]/
+        # [female] the user typed into the lyrics box.
+        if gender in ("male", "female"):
+            lyrics_str = f"[{gender}] {lyrics_str}".rstrip()
 
         # --- Tags (pooled CLAP, position 0) + optional style-audio blend ---
         tag_emb = None
@@ -312,6 +324,7 @@ class InferenceEngine:
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
         lyric_cfg_scale: float | None = None,
+        gender: str | None = None,
     ) -> tuple[bytes, str]:
         """Continue a clip forward from a point in time. Returns [original 0→T | new].
 
@@ -360,7 +373,7 @@ class InferenceEngine:
             raise ValueError("Overlap window is already at model context limit; reduce overlap_seconds.")
 
         prompt_dev = prompt_tokens.to(self.device)
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight, gender=gender)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt_dev, num_new_frames=new_frames,
@@ -410,6 +423,7 @@ class InferenceEngine:
         negative_text: str | None = None,
         melody_cfg_scale: float | None = None,
         lyric_cfg_scale: float | None = None,
+        gender: str | None = None,
     ) -> tuple[bytes, str]:
         """Cover a hummed/uploaded melody in the prompt's timbre. Returns (bytes, mime).
 
@@ -435,7 +449,7 @@ class InferenceEngine:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt=None, num_new_frames=new_frames,
@@ -612,7 +626,7 @@ class InferenceEngine:
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight, gender=gender)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt=seed_tokens, num_new_frames=new_frames,
