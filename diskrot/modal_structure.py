@@ -252,13 +252,14 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     nonpreemptible=True,
     retries=modal.Retries(max_retries=3, backoff_coefficient=1.0, initial_delay=10.0),
 )
-def orchestrate(flush_every: int = 50, limit: int = 0):
+def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
     """Dispatch analysis and merge results into the sharded structure dir.
 
     Runs the ``.map()`` collect/flush loop *remotely* so ``--detach`` survives
     terminal close. ``limit`` (>0) caps the number of pending files dispatched —
     use it for the calibration run. ``list_pending`` skips songs already in the
-    shards, so re-launching resumes.
+    shards, so re-launching resumes. ``batch_size`` songs share one allin1 call
+    (one demucs subprocess + one ensemble load per chunk instead of per song).
     """
     pending = list_pending.remote()
     if limit and limit > 0:
@@ -267,27 +268,28 @@ def orchestrate(flush_every: int = 50, limit: int = 0):
         print("Nothing to analyze — all files already done")
         return
 
-    print(f"Dispatching {len(pending)} files across parallel containers "
-          f"(flush_every={flush_every})...")
+    chunks = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+    print(f"Dispatching {len(pending)} files as {len(chunks)} chunks of <= {batch_size} "
+          f"across parallel containers (flush_every={flush_every})...")
     analyzer = Analyzer()
     batch: list = []
     n_seen = 0
     n_errors = 0
-    # order_outputs=False: a preempted file must not head-of-line-block the yield
+    # order_outputs=False: a preempted chunk must not head-of-line-block the yield
     # (idling other billing containers); results flush by key so order is moot.
-    # return_exceptions=True: a single poison file must not crash the orchestrator
-    # — count it; the file stays pending and is redone on the next launch.
-    for result in analyzer.analyze_file.map(
-        pending, order_outputs=False, return_exceptions=True
+    # return_exceptions=True: a poison chunk must not crash the orchestrator
+    # — count it; its files stay pending and are redone on the next launch.
+    for result in analyzer.analyze_chunk.map(
+        chunks, order_outputs=False, return_exceptions=True
     ):
-        n_seen += 1
         if isinstance(result, Exception):
             n_errors += 1
             if n_errors <= 20:
-                print(f"FILE FAILED (stays pending, redone next run): "
+                print(f"CHUNK FAILED (files stay pending, redone next run): "
                       f"{type(result).__name__}: {str(result)[:140]}")
             continue
-        batch.append(result)
+        n_seen += len(result)
+        batch.extend(result)
         if len(batch) >= flush_every:
             print(f"flushing {len(batch)} results ({n_seen}/{len(pending)} done)")
             save_results.remote(batch)
@@ -296,19 +298,19 @@ def orchestrate(flush_every: int = 50, limit: int = 0):
         print(f"final flush of {len(batch)} results ({n_seen}/{len(pending)} done)")
         save_results.remote(batch)
     if n_errors:
-        print(f"file errors: {n_errors} "
+        print(f"chunk errors: {n_errors} "
               f"(transient — affected files stay pending; re-run to finish them)")
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 50, limit: int = 0):
+def main(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` (both pieces required: ``.spawn()`` so the entrypoint
     exits without blocking, and ``--detach`` so the app isn't auto-stopped when
     the entrypoint completes). ``--limit 200`` runs the calibration subset.
     """
-    call = orchestrate.spawn(flush_every, limit)
+    call = orchestrate.spawn(flush_every, limit, batch_size)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")
