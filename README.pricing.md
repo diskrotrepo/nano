@@ -36,6 +36,8 @@ Estimates use **reserved container-time × current rate**, which is what Modal a
 | Transcribe | L4 × 50 | ~14 min / 1k | ~3,760 GPU-hr | **~$3,000** |
 | Train | H100 × 8 DDP | flat — 30–50 h wall | ~250–420 H100-hr | **~$1,000–1,650** |
 | **Structure** *(optional)* | L4 × 50 | ~21 GPU-s / song (measured) | ~1,900 GPU-hr | **~$1,500** |
+| Key-detect *(optional)* | CPU (4 core) | one-shot mmap sweep of ~140 GB chroma, ~0.5–2 h | ~2–8 core-hr | **~$1** |
+| Phonemize *(recommended)* | CPU (16 core) | ~20–200 ms/song g2p, one-shot | ~5–20 core-hr | **~$1** |
 
 ### Totals
 
@@ -54,14 +56,14 @@ Two stages are ~85% of the data-prep bill, and both are skippable:
 - **Transcribe (~$3,000)** — Demucs vocal isolation + Whisper per song. Only needed if you want the model to **sing intelligible words**. Skip it (and the `lyrics/` dir) and you lose lyric conditioning but save ~$3k.
 - **Structure (~$1,500)** — allin1 (Demucs again + a joint beat/segment model). Fully optional: without it the lyric stream just falls back to `<no_section>` markers, no other change. Measured at **~2.4 songs/sec aggregate across 50 L4s (~21 GPU-s/song, ~21.5 h wall for 182k songs)** from a live run on 2026-06-09 — cheaper than first projected, but still a four-figure line item; only run it if section-aware generation matters to you.
 
-Everything else combined (prepare + tokenize + melody + pack + auto-tag) is **~$420**, and training is **~$1,000–1,650** regardless of corpus size.
+Everything else combined (prepare + tokenize + melody + pack + auto-tag + key-detect + phonemize) is **~$420**, and training is **~$1,000–1,650** regardless of corpus size. The two newest passes (key-detect → `keys.json` for the `<key_*>` marker, phonemize → `phonemes/` for the pre-phonemized lyric cache) are CPU-only rounding errors (~$1 each) — phonemize in particular *pays for itself immediately* by keeping the 8×H100 step from stalling on in-DataLoader g2p ($3.95/hr × 8 GPUs makes even a few percent of dataloader stall worth ~$10+/day).
 
 ## Storage (recurring, not in the totals above)
 
 The corpus and its derived artifacts live on Modal volumes and bill **monthly** while they exist — separate from the one-shot compute above:
 
 - `nano-corpus` — ~2.5 TB of MP3s (322,530 files ≤ 5:30).
-- `nano-tokens` — DAC tokens + packed shards + tags + lyrics (~100–150 GB).
+- `nano-tokens` — DAC tokens + packed shards + tags + lyrics + structure + keys.json + phonemes (~100–155 GB; phonemes/ adds ~1–2 GB, keys.json ~15 MB).
 - `nano-melody` — chroma sidecars (~140 GB).
 - `nano-ckpts` — checkpoints (every ~5k steps; tens of GB).
 

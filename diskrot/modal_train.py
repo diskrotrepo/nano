@@ -166,6 +166,8 @@ def _build_cfg_kwargs(
     tags_path = "/tokens/tags.json" if text_conditioned else None
     lyrics_path = "/tokens/lyrics" if text_conditioned else None
     structure_path = "/tokens/structure" if text_conditioned else None
+    keys_path = "/tokens/keys.json" if text_conditioned else None
+    phonemes_path = "/tokens/phonemes" if text_conditioned else None
     return dict(
         fim_prob=fim_prob,
         cache_dir="/tokens",
@@ -180,6 +182,8 @@ def _build_cfg_kwargs(
         tags_path=tags_path,
         lyrics_path=lyrics_path,
         structure_path=structure_path,
+        keys_path=keys_path,
+        phonemes_path=phonemes_path,
         text_conditioned=text_conditioned,
         segment_seconds=segment_seconds,
         wandb_project=wandb_project,
@@ -405,6 +409,9 @@ def train_remote(
 
     tags_path = "/tokens/tags.json" if text_conditioned else None
     lyrics_path = "/tokens/lyrics" if text_conditioned else None
+    structure_path = "/tokens/structure" if text_conditioned else None
+    keys_path = "/tokens/keys.json" if text_conditioned else None
+    phonemes_path = "/tokens/phonemes" if text_conditioned else None
     model_cfg = _build_model_cfg(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
         dropout=dropout, text_conditioned=text_conditioned,
@@ -423,6 +430,9 @@ def train_remote(
         eval_batches=eval_batches,
         tags_path=tags_path,
         lyrics_path=lyrics_path,
+        structure_path=structure_path,
+        keys_path=keys_path,
+        phonemes_path=phonemes_path,
         segment_seconds=segment_seconds,
         fim_prob=DEFAULTS["fim_prob"],
         wandb_project=wandb_project or None,
@@ -513,6 +523,8 @@ def train_remote_multi(
         tags_path=cfg_kwargs["tags_path"],
         lyrics_path=cfg_kwargs["lyrics_path"],
         structure_path=cfg_kwargs["structure_path"],
+        keys_path=cfg_kwargs["keys_path"],
+        phonemes_path=cfg_kwargs["phonemes_path"],
     )
     tag_cache: dict = {}
     if text_conditioned and shared_bundle["tags"]:

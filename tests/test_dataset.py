@@ -85,14 +85,15 @@ def test_getitem_shape_and_dtype(synth_tokens_dir):
     # for the correctness contract.
     assert tokens.dtype == torch.int16
     assert tags == ""
-    # No lyrics/structure path → BOS + the dense <unknown_gender> + <unknown_tempo>
-    # + <no_section> prefixes (never an empty/fully-padded sequence, which would NaN
-    # the lyric cross-attention).
+    # No lyrics/structure/keys path → BOS + the dense all-unknown header (never an
+    # empty/fully-padded sequence, which would NaN the lyric cross-attention).
     from model.lyric_encoder import (
-        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
+        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
     )
     assert lyric_ids.tolist() == [
-        BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID, NO_SECTION_ID,
+        BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID,
     ]
 
 
@@ -186,8 +187,13 @@ def test_malformed_word_entries_filtered_at_load(synth_tokens_dir, tmp_path):
     assert "song_000" in ds._lyrics
     assert [w["word"] for w in ds._lyrics["song_000"]["words"]] == ["good", "alsogood"]
     assert ds._lyrics["song_000"]["gender"] == "female"
-    # song_001 has no usable words → not loaded (treated as instrumental).
+    # song_001 has no usable words → not loaded, flagged instrumental at load
+    # (feeds the <instrumental> vocal-presence marker; checked pre-split since
+    # this ds view only holds the train half).
     assert "song_001" not in ds._lyrics
+    from diskrot.dataset import _load_lyrics
+    _, instrumental = _load_lyrics(lyrics_path, verbose=False, with_instrumental=True)
+    assert "song_001" in instrumental and "song_000" not in instrumental
     # The hot path must not raise on the cleaned entry.
     assert ds._get_segment_lyrics("song_000", 0.0, 10.0) == "good alsogood"
 
@@ -221,15 +227,20 @@ def test_word_phones_cache_eviction_is_lossless(synth_tokens_dir, tmp_path):
 
 @pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
 def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
-    """_get_segment_lyric_ids returns BOS + <gender> + section prefix + phonemes for
-    overlapping words, and BOS + dense prefixes when nothing overlaps or the song is
-    instrumental (no structure entry / no gender field here → <unknown_gender> +
-    <no_section>)."""
+    """_get_segment_lyric_ids returns BOS + dense header + phonemes for
+    overlapping words, and BOS + dense header only when nothing overlaps or the
+    song is unknown (no structure/gender/key here → unknown markers; the vocal
+    slot is <vocals> for a song with words, <unknown_vocals> for one never
+    transcribed)."""
     from model.lyric_encoder import (
-        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+        BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
+        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID, VOCAL_TOKEN_TO_ID,
     )
 
-    prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID, NO_SECTION_ID]
+    prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+              UNKNOWN_KEY_ID, VOCAL_TOKEN_TO_ID["vocals"], NO_SECTION_ID]
+    unknown_prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
+                      UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID]
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({
@@ -242,12 +253,12 @@ def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
                       lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
 
     full = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
-    assert full[:4] == prefix  # BOS + <unknown_gender> + <unknown_tempo> + <no_section>
-    assert len(full) > 4  # phonemes present
-    # No overlap → dense prefix only (never a lone BOS).
+    assert full[:6] == prefix  # BOS + dense unknown header (vocal slot = <vocals>)
+    assert len(full) > 6  # phonemes present
+    # No overlap → dense prefix only (never a lone BOS); still <vocals> (per-song).
     assert ds._get_segment_lyric_ids("song_000", 10.0, 11.0) == prefix
-    # Instrumental / missing → dense prefix only.
-    assert ds._get_segment_lyric_ids("nonexistent", 0.0, 10.0) == prefix
+    # Never-transcribed / missing → dense prefix with <unknown_vocals>.
+    assert ds._get_segment_lyric_ids("nonexistent", 0.0, 10.0) == unknown_prefix
 
 
 @pytest.mark.skipif(not _g2p_available(), reason="g2p_en / nltk data not installed")
@@ -255,8 +266,8 @@ def test_segment_lyric_ids_gender_prefix(synth_tokens_dir, tmp_path):
     """A song's F0-labeled ``gender`` field becomes the dense gender prefix, and
     the train-time stream matches the inference parser's bracketed equivalent."""
     from model.lyric_encoder import (
-        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID, NO_SECTION_ID, UNKNOWN_TEMPO_ID,
-        text_with_markers_to_phoneme_ids,
+        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID, NO_SECTION_ID, UNKNOWN_KEY_ID,
+        UNKNOWN_TEMPO_ID, VOCAL_TOKEN_TO_ID, text_with_markers_to_phoneme_ids,
     )
 
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
@@ -271,10 +282,12 @@ def test_segment_lyric_ids_gender_prefix(synth_tokens_dir, tmp_path):
                       lyrics_path=lyrics_path, val_ratio=0.5, max_lyric_len=256)
 
     train_ids = ds._get_segment_lyric_ids("song_000", 0.0, 10.0)
-    assert train_ids[:4] == [
-        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID["female"], UNKNOWN_TEMPO_ID, NO_SECTION_ID,
+    assert train_ids[:6] == [
+        BOS_PHONEME_ID, GENDER_TOKEN_TO_ID["female"], UNKNOWN_TEMPO_ID,
+        UNKNOWN_KEY_ID, VOCAL_TOKEN_TO_ID["vocals"], NO_SECTION_ID,
     ]
     # train-time stream == inference parser for the equivalent bracketed string
+    # (the parser defaults the vocal slot to <vocals> when words are present)
     infer_ids = text_with_markers_to_phoneme_ids("[female] hello world")
     assert train_ids == infer_ids
 

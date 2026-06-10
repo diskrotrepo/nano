@@ -46,6 +46,20 @@ def _atomic_write_json(path: str | Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def is_valid_word(w) -> bool:
+    """A word entry usable by the train-time crop builders: dict with a string
+    ``word`` and numeric ``start``/``end`` (bools rejected). Lives here (the
+    schema producer) so every consumer — the dataset loader AND the phonemize
+    pass — filters with the IDENTICAL predicate; a mismatch would break the
+    group-count==word-count contract the pre-phonemized store relies on."""
+    return (
+        isinstance(w, dict)
+        and isinstance(w.get("word"), str)
+        and isinstance(w.get("start"), (int, float)) and not isinstance(w["start"], bool)
+        and isinstance(w.get("end"), (int, float)) and not isinstance(w["end"], bool)
+    )
+
+
 def load_lyrics_shards(lyrics_dir: str | Path) -> dict[str, dict | None]:
     """Read all ``lyrics_*.json`` shards in ``lyrics_dir`` into one merged dict."""
     lyrics_dir = Path(lyrics_dir)

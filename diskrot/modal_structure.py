@@ -92,15 +92,33 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 @app.cls(
     image=image,
+    # L4, NOT A100: the bottleneck is parallelism, and Modal's A100 supply is scarce
+    # — an A100 request only provisioned 1 container (vs 50 on L4), collapsing the
+    # fan-out. The GPU work (Demucs + segment inference) is brief and fine on an L4;
+    # the real per-track cost is madmom beat tracking, which is CPU-bound (no GPU
+    # helps it). So: abundant L4s to actually get 50 containers, and attack the CPU
+    # cost with cores + input concurrency below.
     gpu="L4",
+    # madmom DBN beat decoding is single-threaded CPU and is the per-track
+    # bottleneck (the silent gap after the fast GPU stages). 4 cores cover the two
+    # concurrent batches' beat tracking (one core each) plus Demucs/torch CPU work.
+    cpu=4.0,
     timeout=60 * 60,
-    max_containers=50,
+    max_containers=100,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     # allin1 pulls its checkpoint from the HF Hub at runtime; the token lifts the
     # anonymous rate limit that would otherwise throttle/fail a 50-container fan-out
     # (same secret modal_transcribe.py / modal_auto_tag.py already use).
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
+# Two BATCHES per container: overlaps one batch's single-threaded madmom beat
+# tracking (CPU) with the other's Demucs/segment inference (GPU) without
+# over-contending the one L4 GPU — at 4 concurrent the neural step ballooned
+# ~4s -> ~20s from GPU contention. Each input is now a chunk of songs handed to
+# allin1 in ONE analyze() call, which pays the per-call setup (demucs subprocess
+# spawn + htdemucs load + 8-fold harmonix-all ensemble construction, ~15-25s)
+# once per chunk instead of once per song.
+@modal.concurrent(max_inputs=2)
 class Analyzer:
     @modal.enter()
     def load_models(self):
@@ -110,21 +128,44 @@ class Analyzer:
         from demucs.pretrained import get_model
 
         get_model("htdemucs")
+        # Pre-build allin1's segment model once so two concurrent first-calls don't
+        # cold-load it simultaneously. Guarded: allin1's internal loader API can
+        # differ across versions; a miss just falls back to lazy load on first call.
+        try:
+            from allin1.models import load_pretrained_model
+
+            load_pretrained_model(model_name="harmonix-all", device="cuda")
+        except Exception as e:
+            print(f"allin1 model warm skipped: {e}")
 
     @modal.method()
-    def analyze_file(self, mp3_name: str) -> tuple[str, dict | None, str | None]:
-        """Analyze one file. Returns (stem, result_or_None, error_or_None)."""
+    def analyze_chunk(self, mp3_names: list[str]) -> list[tuple[str, dict | None, str | None]]:
+        """Analyze a chunk of files in one allin1 call.
+
+        Returns one (stem, result_or_None, error_or_None) per input. If the
+        batched call fails (one poison file aborts allin1's whole per-file
+        loop), fall back to per-file calls so only the bad file loses its
+        entry — the rare bad chunk re-pays the per-call setup, nothing else.
+        """
         import allin1
 
+        from diskrot.structure import analyze_batch as _analyze_batch
         from diskrot.structure import analyze_file as _analyze_file
 
-        mp3_path = Path("/corpus") / mp3_name
-        key = mp3_path.stem
+        mp3_paths = [Path("/corpus") / name for name in mp3_names]
         try:
-            result = _analyze_file(allin1.analyze, mp3_path, "cuda")
-            return (key, result, None)
-        except Exception as e:
-            return (key, None, str(e))
+            entries = _analyze_batch(allin1.analyze, mp3_paths, "cuda")
+            return [(p.stem, entry, None) for p, entry in zip(mp3_paths, entries)]
+        except Exception as batch_err:
+            print(f"batch of {len(mp3_paths)} failed ({batch_err}); retrying per-file")
+
+        out: list[tuple[str, dict | None, str | None]] = []
+        for mp3_path in mp3_paths:
+            try:
+                out.append((mp3_path.stem, _analyze_file(allin1.analyze, mp3_path, "cuda"), None))
+            except Exception as e:
+                out.append((mp3_path.stem, None, str(e)))
+        return out
 
 
 STRUCTURE_DIR = "/tokens/structure"
@@ -202,12 +243,16 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     timeout=24 * 60 * 60,
     # The driver is a single point of failure: if its container is preempted or a
     # save_results.remote() raises, the whole fan-out is orphaned (containers keep
-    # billing with nothing collecting their results). retries auto-respawns it;
+    # billing with nothing collecting their results). nonpreemptible stops Spot
+    # preemption from killing it mid-.map() (a preemption restart cancels every
+    # in-flight input — those cancellations were the per-container "errors"); same
+    # as run_tokenize / run_auto_tag. retries is the crash backstop, and
     # resume-by-skip (list_pending) makes re-execution idempotent — it just skips
     # the files already committed and continues.
+    nonpreemptible=True,
     retries=modal.Retries(max_retries=3, backoff_coefficient=1.0, initial_delay=10.0),
 )
-def orchestrate(flush_every: int = 200, limit: int = 0):
+def orchestrate(flush_every: int = 50, limit: int = 0):
     """Dispatch analysis and merge results into the sharded structure dir.
 
     Runs the ``.map()`` collect/flush loop *remotely* so ``--detach`` survives
@@ -256,7 +301,7 @@ def orchestrate(flush_every: int = 200, limit: int = 0):
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 200, limit: int = 0):
+def main(flush_every: int = 50, limit: int = 0):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` (both pieces required: ``.spawn()`` so the entrypoint

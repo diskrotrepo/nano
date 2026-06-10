@@ -9,9 +9,12 @@ Endpoints:
     POST /extend         continue forward from a point T → [original 0→T | new]
     POST /cover          re-render a hummed melody (chroma) in the prompt's timbre
 
-    /generate, /extend accept optional text (tags), lyrics, gender, bpm, and
-style_audio conditioning (gender/bpm ride the lyric stream as leading [male]/
-[120bpm] markers). /extend seeds from the overlap_seconds before a cut point T, keeps
+    /generate, /extend accept optional text (tags), lyrics, gender, bpm, key,
+vocal-presence, and style_audio conditioning (gender/bpm/key/vocals ride the
+lyric stream as leading [male]/[120bpm]/[a minor]/[instrumental] markers — key
+also accepts [key:Am]/[f# major] forms, and [instrumental]/[vocals] requests
+no-vocals/vocals; section markers like [chorus] may appear inline). /extend
+seeds from the overlap_seconds before a cut point T, keeps
 the original up to T, and generates forward (T defaults to the clip end, a
 seamless grow-the-clip). /cover conditions on the uploaded melody's chromagram
 (its audio never appears in the output) and needs a melody-trained checkpoint.

@@ -347,8 +347,11 @@ class NanoAudioGPT(nn.Module):
             )
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.ln_final = nn.RMSNorm(cfg.d_model)
-        self.heads = nn.ModuleList(
-            [nn.Linear(cfg.d_model, cfg.vocab_with_pad, bias=False) for _ in range(cfg.n_codebooks)]
+        # The K per-codebook output heads, fused into one Linear (one matmul per
+        # forward instead of K kernel launches); the forward's view+transpose
+        # recovers the per-codebook [B, K, T, V] layout.
+        self.head = nn.Linear(
+            cfg.d_model, cfg.n_codebooks * cfg.vocab_with_pad, bias=False
         )
         self.apply(self._init_weights)
 
@@ -503,7 +506,11 @@ class NanoAudioGPT(nn.Module):
             new_caches.append(new_cache)
         x = self.ln_final(x)
 
-        logits = torch.stack([head(x) for head in self.heads], dim=1)
+        logits = (
+            self.head(x)
+            .view(B, T, self.cfg.n_codebooks, self.cfg.vocab_with_pad)
+            .transpose(1, 2)  # [B, K, T, V]
+        )
         if kv_caches is not None:
             return logits, new_caches
         return logits

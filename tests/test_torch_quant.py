@@ -50,10 +50,10 @@ def test_quantize_layer_policy(bits):
     model = NanoAudioGPT(cfg).eval().to("cuda").to(dtype)
     _quantize_torch_linears(model, bits)
 
-    # attention / MLP / heads quantized
+    # attention / MLP / fused output head quantized
     assert _is_quantized(model.blocks[0].attn.qkv.weight)
     assert _is_quantized(model.blocks[0].mlp.fc1.weight)
-    assert _is_quantized(model.heads[0].weight)
+    assert _is_quantized(model.head.weight)
     # embeddings + lyric encoder left in full precision
     assert not _is_quantized(model.tok_embeds[0].weight)
     assert not _is_quantized(model.lyric_encoder.layers[0].qkv.weight)

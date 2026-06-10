@@ -211,7 +211,9 @@ class MLXNanoAudioGPT(mnn.Module):
             self.melody_encoder = _MelodyEncoder(cfg)
         self.blocks = [_Block(cfg) for _ in range(cfg.n_layers)]
         self.ln_final = _RMSNorm(cfg.d_model)
-        self.heads = [mnn.Linear(cfg.d_model, cfg.vocab_with_pad, bias=False) for _ in range(K)]
+        # Fused output head (mirrors torch's single `head` Linear; the forward's
+        # reshape+transpose recovers [B, K, T, V]).
+        self.head = mnn.Linear(cfg.d_model, K * cfg.vocab_with_pad, bias=False)
 
         # RoPE tables (non-persistent in torch — recomputed here, not loaded).
         inv_freq = 1.0 / (cfg.rope_base ** (np.arange(0, self.head_dim, 2) / self.head_dim))
@@ -254,7 +256,7 @@ class MLXNanoAudioGPT(mnn.Module):
             # [out, in, kernel]. Transpose the melody conv weights so they load
             # 1:1 into mnn.Conv1d (the forward then stays channels-last).
             if (
-                ".melody_encoder.convs." in name
+                "melody_encoder.convs." in name
                 and name.endswith(".weight")
                 and tensor.dim() == 3
             ):
@@ -420,7 +422,11 @@ class MLXNanoAudioGPT(mnn.Module):
             x = x + block.mlp.fc2(mnn.gelu(block.mlp.fc1(block.ln2(x))))
 
         x = self.ln_final(x)
-        logits = mx.stack([head(x) for head in self.heads], axis=1)  # [B, K, T, V]
+        logits = (
+            self.head(x)
+            .reshape(B, T, self.n_codebooks, -1)
+            .transpose(0, 2, 1, 3)  # [B, K, T, V]
+        )
         return logits
 
     def logits_oneshot(

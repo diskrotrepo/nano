@@ -57,6 +57,8 @@ class TrainConfig:
     tags_path: str | None = None  # path to tags.json for text conditioning
     lyrics_path: str | None = None  # path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning
     structure_path: str | None = None  # path to structure (sharded dir or JSON) for section-marker conditioning
+    keys_path: str | None = None  # path to keys.json (diskrot.key_detect) for the <key_*> header marker
+    phonemes_path: str | None = None  # path to the pre-phonemized phonemes/ dir (diskrot.phonemize)
     cfg_dropout: float = 0.1  # probability of dropping text conditioning (classifier-free guidance)
     # Fraction of training batches reordered into the FIM (infill) layout. Only
     # active when model.use_fim is True. A FIM batch drops lyric conditioning
@@ -528,10 +530,12 @@ def train_run(
         train_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="train",
                                 val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
                                 lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
+                                keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
                                 max_lyric_len=cfg.model.max_lyric_len)
         val_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="val",
                               val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
                               lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
+                              keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
                               max_lyric_len=cfg.model.max_lyric_len)
 
     pin = cfg.device == "cuda"
@@ -544,8 +548,13 @@ def train_run(
             val_ds, num_replicas=cfg.world_size, rank=cfg.local_rank,
             shuffle=True, seed=cfg.seed, drop_last=True,
         )
+        # 8 workers per rank: lyric phonemization (g2p) on a cache miss costs
+        # ~20-200 ms/song for OOV-heavy Whisper transcripts, and at corpus scale
+        # nearly every item misses the LRU — 2 workers starve the H100s. The
+        # pre-phonemized store (cfg.phonemes_path) removes most of that cost;
+        # the extra workers cover the fallback + mmap paging.
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=train_sampler,
-                                  num_workers=2, pin_memory=pin, drop_last=True,
+                                  num_workers=8, pin_memory=pin, drop_last=True,
                                   persistent_workers=True, prefetch_factor=4,
                                   collate_fn=collate_lyrics)
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, sampler=val_sampler,
@@ -555,7 +564,7 @@ def train_run(
         train_sampler = None
         val_sampler = None
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                                  num_workers=2, pin_memory=pin, drop_last=True, persistent_workers=True,
+                                  num_workers=8, pin_memory=pin, drop_last=True, persistent_workers=True,
                                   prefetch_factor=4, collate_fn=collate_lyrics)
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=True,
                                 num_workers=1, pin_memory=pin, drop_last=True, persistent_workers=True,
@@ -938,6 +947,8 @@ if __name__ == "__main__":
     p.add_argument("--tags-path", type=str, default=None, help="path to tags.json for text conditioning")
     p.add_argument("--lyrics-path", type=str, default=None, help="path to lyrics (sharded dir or legacy lyrics.json) for lyric conditioning")
     p.add_argument("--structure-path", type=str, default=None, help="path to structure (sharded dir or JSON) for section-marker conditioning")
+    p.add_argument("--keys-path", type=str, default=None, help="path to keys.json (diskrot.key_detect) for the <key_*> header marker")
+    p.add_argument("--phonemes-path", type=str, default=None, help="path to the pre-phonemized phonemes/ dir (diskrot.phonemize)")
     p.add_argument("--melody", action="store_true",
                    help="enable melody (chroma) conditioning — requires the pack to "
                         "have been built with --mel-cache-dir (parallel .mel.bin)")
@@ -962,6 +973,8 @@ if __name__ == "__main__":
         tags_path=args.tags_path,
         lyrics_path=args.lyrics_path,
         structure_path=args.structure_path,
+        keys_path=args.keys_path,
+        phonemes_path=args.phonemes_path,
         model=model_cfg,
     )
     train_run(cfg)

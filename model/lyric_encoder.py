@@ -97,27 +97,72 @@ _GENDER_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in GENDER_LABELS)
 # _ARPABET so an ARPABET edit can't silently renumber them. Adding/removing any of
 # these changes PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
 UNKNOWN_TEMPO_LABEL = "unknown_tempo"
-# Bucket boundaries (BPM): bucket i = [EDGES[i-1], EDGES[i]); bucket 0 = [-inf, 70),
-# last bucket = [170, +inf). 7 buckets total. Tunable — changing the count or edges
-# changes the vocab and is checkpoint-incompatible.
-TEMPO_BPM_EDGES: tuple[float, ...] = (70.0, 90.0, 110.0, 130.0, 150.0, 170.0)
-N_TEMPO_BUCKETS: int = len(TEMPO_BPM_EDGES) + 1  # 7
+# Bucket boundaries (BPM): bucket i = [EDGES[i-1], EDGES[i]); bucket 0 = [-inf, 60),
+# last bucket = [180, +inf). 10-BPM grid -> 14 buckets total (v8: was a 20-BPM grid
+# with 7 buckets; the raw allin1 bpm was already on disk, so finer buckets are
+# free). Tunable — changing the count or edges changes the vocab and is
+# checkpoint-incompatible.
+TEMPO_BPM_EDGES: tuple[float, ...] = (
+    60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0,
+    130.0, 140.0, 150.0, 160.0, 170.0, 180.0,
+)
+N_TEMPO_BUCKETS: int = len(TEMPO_BPM_EDGES) + 1  # 14
 _TEMPO_TOKENS: tuple[str, ...] = (
     f"<{UNKNOWN_TEMPO_LABEL}>",
 ) + tuple(f"<tempo_{i}>" for i in range(N_TEMPO_BUCKETS))
 
+# Key (tonality) markers — ride the SAME phoneme stream as the other header
+# markers, for the same reason: key is a per-song attribute the decoder can
+# cross-attend to, and it CFG-drops with the lyric stream. The chroma the melody
+# pass already packs (packed_NNN.mel.bin) is octave-invariant pitch-class energy,
+# so a per-song Krumhansl-Schmuckler estimate over its mean (diskrot.key_detect)
+# is near-free; this marker also helps the decoder resolve the key the additive
+# chroma conditioning leaves implicit. 12 pitch classes (sharps-canonical;
+# diskrot.key_detect and ``key_label_to_id`` both fold flats/enharmonics) x
+# major/minor = 24 keys; ``<unknown_key>`` is the fallback for songs without an
+# estimate, so every stream always carries a valid key slot (the same
+# dense-prefix discipline as the other header markers). Placed between the tempo
+# markers and _ARPABET so an ARPABET edit can't silently renumber them. Adding/
+# removing any of these changes PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
+UNKNOWN_KEY_LABEL = "unknown_key"
+_PITCH_CLASSES: tuple[str, ...] = (
+    "c", "c_sharp", "d", "d_sharp", "e", "f",
+    "f_sharp", "g", "g_sharp", "a", "a_sharp", "b",
+)
+_KEY_MODES: tuple[str, ...] = ("major", "minor")
+KEY_LABELS: tuple[str, ...] = (UNKNOWN_KEY_LABEL,) + tuple(
+    f"{pc}_{mode}" for mode in _KEY_MODES for pc in _PITCH_CLASSES
+)
+_KEY_TOKENS: tuple[str, ...] = tuple(f"<key_{label}>" if label != UNKNOWN_KEY_LABEL
+                                     else f"<{label}>" for label in KEY_LABELS)
+
+# Vocal-presence markers — ride the SAME phoneme stream, same rationale. Derived
+# at train time from the transcription pass: a song with usable transcribed words
+# is <vocals>, a song the pass processed but found no words in is <instrumental>,
+# and a song the pass never covered is <unknown_vocals>. This is what lets a user
+# *request* no vocals (``[instrumental]``) — without it an instrumental song and
+# an unconditioned one look identical to the model. (Whisper occasionally
+# hallucinates words on instrumentals, so the train-time label is imperfect;
+# word-confidence capture is the future fix.) Placed between the key markers and
+# _ARPABET so an ARPABET edit can't silently renumber them. Adding/removing any
+# of these changes PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
+UNKNOWN_VOCALS_LABEL = "unknown_vocals"
+VOCAL_LABELS: tuple[str, ...] = (UNKNOWN_VOCALS_LABEL, "vocals", "instrumental")
+_VOCAL_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in VOCAL_LABELS)
+
 # Frozen vocab: specials first (so PAD==0), then structure markers, then gender
-# markers, then tempo markers, then ARPABET.
+# markers, then tempo markers, then key markers, then vocal-presence markers,
+# then ARPABET.
 PHONEME_VOCAB: tuple[str, ...] = (
     PAD_PHONEME, BOS_PHONEME, WORD_BOUNDARY_PHONEME, UNK_PHONEME,
-) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _TEMPO_TOKENS + _ARPABET
+) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _TEMPO_TOKENS + _KEY_TOKENS + _VOCAL_TOKENS + _ARPABET
 
 PHONEME_TO_ID: dict[str, int] = {p: i for i, p in enumerate(PHONEME_VOCAB)}
 PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
 BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
 WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
 UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
-PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 94 (4 specials + 9 structure + 3 gender + 8 tempo + 70 ARPABET)
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 129 (4 specials + 9 structure + 3 gender + 15 tempo + 25 key + 3 vocal + 70 ARPABET)
 
 # Structure label <-> phoneme id, the single source of truth shared by the dataset
 # (train-time injection) and inference (bracket parsing) so the two agree exactly.
@@ -259,6 +304,120 @@ def is_tempo_label(label: str | None) -> bool:
     return parse_tempo_label(label) is not None
 
 
+# Key label <-> phoneme id, parallel to the gender/tempo mappings above. Shared by
+# the dataset (train-time prefix injection, fed by diskrot.key_detect's keys.json)
+# and inference (bracket parsing) so the two agree exactly.
+KEY_TOKEN_TO_ID: dict[str, int] = {
+    label: PHONEME_TO_ID[token] for label, token in zip(KEY_LABELS, _KEY_TOKENS)
+}
+ID_TO_KEY: dict[int, str] = {i: label for label, i in KEY_TOKEN_TO_ID.items()}
+UNKNOWN_KEY_ID: int = KEY_TOKEN_TO_ID[UNKNOWN_KEY_LABEL]
+KEY_IDS: frozenset[int] = frozenset(KEY_TOKEN_TO_ID.values())
+
+# Natural-letter pitch classes (semitones above C); accidentals shift +-1 mod 12,
+# which also folds enharmonics (db -> c_sharp, e# -> f, cb -> b, ...).
+_NATURAL_SEMITONE: dict[str, int] = {
+    "c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11,
+}
+# Matches a pre-normalized key string: letter, optional accidental, optional mode.
+_KEY_RE = re.compile(r"^([a-g])(#|b)?_?(major|minor|maj|min|m)?$")
+
+
+def parse_key_label(label: str | None) -> str | None:
+    """Parse a key bracket (``Am``, ``a minor``, ``F# major``, ``Bb``, ``key:Am``,
+    ``c_sharp_minor``) to its canonical sharps-form label, or ``None`` when the
+    string isn't a key (so the bracket parser can route it elsewhere). Flats and
+    spelled-out ``sharp``/``flat`` fold to the canonical sharp pitch class; a
+    missing mode means major. Shared train/inference contract via
+    ``key_label_to_id``."""
+    if not label:
+        return None
+    key = label.strip().lower()
+    if key == UNKNOWN_KEY_LABEL:
+        return UNKNOWN_KEY_LABEL
+    key = re.sub(r"^key\s*[:=]?\s*", "", key)
+    key = key.replace("♯", "#").replace("♭", "b")
+    key = key.replace("-", "_").replace(" ", "_")
+    key = key.replace("_sharp", "#").replace("_flat", "b")
+    m = _KEY_RE.match(key)
+    if not m:
+        return None
+    letter, accidental, mode = m.groups()
+    semitone = _NATURAL_SEMITONE[letter]
+    if accidental == "#":
+        semitone += 1
+    elif accidental == "b":
+        semitone -= 1
+    pc = _PITCH_CLASSES[semitone % 12]
+    return f"{pc}_{'minor' if mode in ('minor', 'min', 'm') else 'major'}"
+
+
+def key_label_to_id(label: str | None) -> int:
+    """Map a key label to its marker id, falling back to <unknown_key>.
+
+    Accepts canonical labels (``a_minor``) and the user forms ``parse_key_label``
+    handles. The train and inference paths both route key labels through this so
+    the id mapping stays identical."""
+    canonical = parse_key_label(label)
+    if canonical is None:
+        return UNKNOWN_KEY_ID
+    return KEY_TOKEN_TO_ID.get(canonical, UNKNOWN_KEY_ID)
+
+
+def is_key_label(label: str | None) -> bool:
+    """True if ``label`` names a key (canonical or a recognized user form).
+
+    Used by the inference bracket parser to route ``[a minor]`` / ``[key:Am]`` to
+    the key prefix slot vs ``[chorus]`` to the section slot. NB: bare ``[f]`` and
+    ``[m]`` route to gender (checked first) — use ``[f major]`` etc. for those keys."""
+    return parse_key_label(label) is not None
+
+
+# Vocal-presence label <-> phoneme id, parallel to the mappings above. Shared by
+# the dataset (train-time prefix injection, derived from the transcription pass)
+# and inference (bracket parsing) so the two agree exactly.
+VOCAL_TOKEN_TO_ID: dict[str, int] = {
+    label: PHONEME_TO_ID[f"<{label}>"] for label in VOCAL_LABELS
+}
+ID_TO_VOCAL: dict[int, str] = {i: label for label, i in VOCAL_TOKEN_TO_ID.items()}
+UNKNOWN_VOCALS_ID: int = VOCAL_TOKEN_TO_ID[UNKNOWN_VOCALS_LABEL]
+VOCAL_IDS: frozenset[int] = frozenset(VOCAL_TOKEN_TO_ID.values())
+
+# Aliases a user might type. Deliberately does NOT include ``inst`` — that's an
+# allin1 *section* label, and the bracket parser checks vocal labels before
+# section labels, so claiming it here would steal ``[inst]`` from the section slot.
+_VOCAL_ALIASES: dict[str, str] = {
+    "vocal": "vocals", "voice": "vocals", "sung": "vocals",
+    "no_vocals": "instrumental", "no_vocal": "instrumental",
+}
+_RECOGNIZED_VOCAL_KEYS: frozenset[str] = frozenset(VOCAL_TOKEN_TO_ID) | frozenset(_VOCAL_ALIASES)
+
+
+def vocal_label_to_id(label: str | None) -> int:
+    """Map a vocal-presence label to its marker id, falling back to <unknown_vocals>.
+
+    Normalizes case/whitespace and folds aliases (``no vocals`` -> instrumental).
+    The train and inference paths both route vocal labels through this so the id
+    mapping stays identical."""
+    if not label:
+        return UNKNOWN_VOCALS_ID
+    key = _normalize_label(label)
+    key = _VOCAL_ALIASES.get(key, key)
+    return VOCAL_TOKEN_TO_ID.get(key, UNKNOWN_VOCALS_ID)
+
+
+def is_vocal_label(label: str | None) -> bool:
+    """True if ``label`` names vocal presence (canonical or alias).
+
+    Used by the inference bracket parser to route ``[instrumental]`` / ``[vocals]``
+    to the vocal prefix slot vs ``[chorus]`` to the section slot. Distinct from
+    ``vocal_label_to_id`` because that folds *unrecognized* labels to
+    <unknown_vocals> too."""
+    if not label:
+        return False
+    return _normalize_label(label) in _RECOGNIZED_VOCAL_KEYS
+
+
 # Punctuation g2p_en passes through verbatim that we fold into a word boundary
 # rather than dropping (keeps phrase structure the decoder can align to).
 _BOUNDARY_PUNCT = frozenset({",", ".", "!", "?", ";", ":", "-", "...", " "})
@@ -391,23 +550,30 @@ _MARKER_RE = re.compile(r"\[([^\[\]]+)\]")
 def text_with_markers_to_phoneme_ids(
     text: str, max_len: int | None = None, add_bos: bool = True,
 ) -> list[int]:
-    """Inference-side lyric parser: ``[female] [120bpm] [verse] words [chorus] ...`` -> ids.
+    """Inference-side lyric parser: ``[female] [120bpm] [a minor] [vocals] [verse] words [chorus] ...`` -> ids.
 
     Reproduces the dataset's train-time stream exactly (see ``append_unit`` and
     ``TokenDataset._get_segment_lyric_ids``):
 
-      ``BOS  <prefix-gender>  <prefix-tempo>  <prefix-section>  w w  <inline-section>  w ...``
+      ``BOS  <gender>  <tempo>  <key>  <vocals>  <prefix-section>  w w  <inline-section>  w ...``
 
-    Prefix rules — every stream carries a gender slot, a tempo slot, AND a section
-    slot, always, matching the dense train-time prefix:
+    Prefix rules — every stream carries a gender slot, a tempo slot, a key slot,
+    a vocal-presence slot, AND a section slot, always, matching the dense
+    train-time prefix:
     - Leading ``[label]`` markers are consumed as prefixes: one gender (``[male]``
-      / ``[female]``), one tempo (``[120bpm]`` / ``[tempo:120]`` / ``[fast]``), and
-      one section (``[verse]`` ...), in any order. A gender not given defaults to
-      ``<unknown_gender>``, a tempo to ``<unknown_tempo>``, a section to
-      ``<no_section>``.
-    - Emitted in train-time order: gender, then tempo, then section.
+      / ``[female]``), one tempo (``[120bpm]`` / ``[tempo:120]`` / ``[fast]``), one
+      key (``[a minor]`` / ``[key:Am]`` / ``[f# major]``), one vocal presence
+      (``[vocals]`` / ``[instrumental]``), and one section (``[verse]`` ...), in
+      any order. A slot not given defaults to its unknown marker
+      (``<unknown_gender>`` / ``<unknown_tempo>`` / ``<unknown_key>`` /
+      ``<unknown_vocals>`` / ``<no_section>``) — except the vocal slot, which
+      defaults to ``<vocals>`` when the text contains words (matching the
+      train-time invariant that transcribed words always co-occur with
+      ``<vocals>``).
+    - Emitted in train-time order: gender, tempo, key, vocals, then section.
     Remaining markers after the leading run are inline section markers (a stray
-    inline gender/tempo marker is dropped — both are prefix-only, as in training).
+    inline gender/tempo/key/vocal marker is dropped — all are prefix-only, as in
+    training).
     Brackets are stripped here and never reach g2p (the biggest train/inference
     footgun); unknown labels fold to ``<no_section>`` via ``structure_label_to_id``.
     Malformed brackets are handled defensively: an empty ``[]`` and the stray
@@ -432,30 +598,45 @@ def text_with_markers_to_phoneme_ids(
 
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
     # Consume the leading run of markers as prefixes: at most one gender + one tempo
-    # + one section, in any order. Stop at the first text span or once all slots are
-    # filled.
+    # + one key + one vocal + one section, in any order. Stop at the first text span
+    # or once all slots are filled.
     gender_id = UNKNOWN_GENDER_ID
     tempo_id = UNKNOWN_TEMPO_ID
+    key_id = UNKNOWN_KEY_ID
+    vocal_id = UNKNOWN_VOCALS_ID
     section_id = NO_SECTION_ID
-    gender_set = tempo_set = section_set = False
+    gender_set = tempo_set = key_set = vocal_set = section_set = False
     while events and events[0][0] == "marker":
         label = events[0][1]
         if is_gender_label(label) and not gender_set:
             gender_id, gender_set = gender_label_to_id(label), True
         elif is_tempo_label(label) and not tempo_set:
             tempo_id, tempo_set = bpm_to_id(parse_tempo_label(label)), True
-        elif not section_set and not is_gender_label(label) and not is_tempo_label(label):
+        elif is_key_label(label) and not key_set:
+            key_id, key_set = key_label_to_id(label), True
+        elif is_vocal_label(label) and not vocal_set:
+            vocal_id, vocal_set = vocal_label_to_id(label), True
+        elif not section_set and not is_gender_label(label) and not is_tempo_label(label) \
+                and not is_key_label(label) and not is_vocal_label(label):
             section_id, section_set = structure_label_to_id(label), True
         else:
             break
         events = events[1:]
-    # Compact 3-marker header (no internal word-boundary): BOS <gender> <tempo> <section>.
-    append_unit(ids, [gender_id, tempo_id, section_id])
+    if not vocal_set and any(kind == "text" for kind, _ in events):
+        # Words but no explicit vocal bracket: default to <vocals>. At train time
+        # every song with transcribed words carries <vocals>, so a lyric'd request
+        # left at <unknown_vocals> would be out-of-distribution; an explicit
+        # [instrumental] (contradictory but allowed) still overrides.
+        vocal_id = VOCAL_TOKEN_TO_ID["vocals"]
+    # Compact 5-marker header (no internal word-boundary):
+    # BOS <gender> <tempo> <key> <vocals> <section>.
+    append_unit(ids, [gender_id, tempo_id, key_id, vocal_id, section_id])
 
     for kind, val in events:
         if kind == "marker":
-            if is_gender_label(val) or is_tempo_label(val):
-                continue  # gender/tempo are prefix-only; ignore a stray inline marker
+            if (is_gender_label(val) or is_tempo_label(val)
+                    or is_key_label(val) or is_vocal_label(val)):
+                continue  # gender/tempo/key/vocals are prefix-only; ignore a stray inline marker
             if not append_unit_capped(ids, [structure_label_to_id(val)], max_len):
                 break
         else:

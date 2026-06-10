@@ -37,47 +37,108 @@ def _load_tags(tags_path: str | Path | None, verbose: bool = True) -> dict[str, 
     return tags
 
 
-def _is_valid_word(w) -> bool:
-    """A word entry usable by the crop builders: dict with a string ``word`` and
-    numeric ``start``/``end`` (bools rejected). Guards the hot paths
-    ``_get_segment_lyrics``/``_get_segment_lyric_ids`` against a malformed entry
-    raising KeyError/TypeError mid-training — we filter once at load instead."""
-    return (
-        isinstance(w, dict)
-        and isinstance(w.get("word"), str)
-        and isinstance(w.get("start"), (int, float)) and not isinstance(w["start"], bool)
-        and isinstance(w.get("end"), (int, float)) and not isinstance(w["end"], bool)
-    )
+def _load_phonemes(
+    phonemes_path: str | Path | None, verbose: bool = True,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Load the pre-phonemized per-word groups (diskrot.phonemize) compactly.
 
-
-def _load_lyrics(lyrics_path: str | Path | None, verbose: bool = True) -> dict[str, dict]:
-    if lyrics_path is None:
+    Returns ``{name: (flat int16 phoneme ids, int32 group offsets)}`` — word k's
+    group is ``flat[offsets[k]:offsets[k+1]]``. The numpy form (instead of 322k
+    Python list-of-lists) keeps the parent bundle small and fork-COW-stable for
+    the DataLoader workers. Sparse: a song without an entry (or whose group
+    count no longer matches its words — a re-transcribe made it stale) falls
+    back to live g2p at crop time, so a partial/absent pass is always safe."""
+    if phonemes_path is None:
         return {}
+    pp = Path(phonemes_path)
+    if not pp.exists():
+        return {}
+    if pp.is_dir():
+        from diskrot.phonemize import load_phoneme_shards
+        raw = load_phoneme_shards(pp)
+    else:
+        raw = json.loads(pp.read_text())
+    phonemes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name, groups in raw.items():
+        if not isinstance(groups, list):
+            continue
+        offsets = np.zeros(len(groups) + 1, dtype=np.int32)
+        for i, g in enumerate(groups):
+            offsets[i + 1] = offsets[i] + len(g)
+        flat = np.fromiter(
+            (pid for g in groups for pid in g), dtype=np.int16, count=int(offsets[-1]),
+        )
+        phonemes[name] = (flat, offsets)
+    if verbose:
+        print(f"[phonemes] loaded {len(phonemes)} pre-phonemized entries from {pp}",
+              flush=True)
+    return phonemes
+
+
+def _load_keys(keys_path: str | Path | None, verbose: bool = True) -> dict[str, str]:
+    """Load per-song key labels (diskrot.key_detect's keys.json) for the
+    ``<key_*>`` header marker. Sparse: a song without an entry gets
+    ``<unknown_key>`` at crop time, so a partial/absent pass is fine."""
+    if keys_path is None:
+        return {}
+    kp = Path(keys_path)
+    if not kp.exists():
+        return {}
+    raw = json.loads(kp.read_text())
+    keys = {name: val["key"] for name, val in raw.items()
+            if isinstance(val, dict) and isinstance(val.get("key"), str)}
+    if verbose:
+        print(f"[keys] loaded {len(keys)} entries from {kp}", flush=True)
+    return keys
+
+
+# Word-entry validity lives in transcribe_lyrics.is_valid_word (the schema
+# producer) so the dataset loader and diskrot.phonemize filter with the
+# IDENTICAL predicate — the pre-phonemized store's group-count==word-count
+# contract depends on it. Imported inside _load_lyrics (its only user here).
+
+
+def _load_lyrics(
+    lyrics_path: str | Path | None, verbose: bool = True, with_instrumental: bool = False,
+):
+    """Load usable lyric entries, keyed by song name.
+
+    With ``with_instrumental=True`` returns ``(lyrics, instrumental)`` where
+    ``instrumental`` is the set of names the transcription pass *processed but
+    found no usable words in* — the train-time signal for the ``<instrumental>``
+    vocal-presence marker (distinct from "never transcribed", which stays
+    ``<unknown_vocals>``). Default return shape is just the dict, for callers
+    that predate the marker (e.g. scripts/eval_lyric_wer.py)."""
+    from diskrot.transcribe_lyrics import is_valid_word, load_lyrics_shards
+
+    if lyrics_path is None:
+        return ({}, set()) if with_instrumental else {}
     lp = Path(lyrics_path)
     if not lp.exists():
-        return {}
-    if lp.is_dir():
-        from diskrot.transcribe_lyrics import load_lyrics_shards
-        raw = load_lyrics_shards(lp)
-    else:
-        raw = json.loads(lp.read_text())
+        return ({}, set()) if with_instrumental else {}
+    raw = load_lyrics_shards(lp) if lp.is_dir() else json.loads(lp.read_text())
     lyrics: dict[str, dict] = {}
+    instrumental: set[str] = set()
     n_dropped_words = 0
     for key, val in raw.items():
-        if not isinstance(val, dict) or not val.get("words"):
+        if not isinstance(val, dict):
             continue
-        words = val["words"]
-        clean = [w for w in words if _is_valid_word(w)] if isinstance(words, list) else []
+        words = val.get("words")
+        clean = [w for w in words if is_valid_word(w)] if isinstance(words, list) else []
         n_dropped_words += len(words) - len(clean) if isinstance(words, list) else 0
         if not clean:
-            continue  # no usable words — treat as instrumental/unlyriced
+            # Transcribed but no usable words — instrumental (or hallucination-free
+            # silence). Feeds the <instrumental> vocal-presence marker.
+            instrumental.add(key)
+            continue
         lyrics[key] = {**val, "words": clean} if len(clean) != len(words) else val
     if verbose:
-        msg = f"[lyrics] loaded {len(lyrics)} entries from {lp}"
+        msg = (f"[lyrics] loaded {len(lyrics)} entries "
+               f"({len(instrumental)} instrumental) from {lp}")
         if n_dropped_words:
             msg += f" (dropped {n_dropped_words} malformed word entries)"
         print(msg, flush=True)
-    return lyrics
+    return (lyrics, instrumental) if with_instrumental else lyrics
 
 
 def _load_structure(
@@ -208,6 +269,8 @@ def load_mmap_bundle(
     tags_path: str | Path | None = None,
     lyrics_path: str | Path | None = None,
     structure_path: str | Path | None = None,
+    keys_path: str | Path | None = None,
+    phonemes_path: str | Path | None = None,
 ) -> dict:
     """Parent-process bundle for the v2 sharded mmap path.
 
@@ -230,15 +293,19 @@ def load_mmap_bundle(
           f"(melody={'on' if has_melody else 'off'}) ({time.time()-t0:.1f}s)",
           flush=True)
     structure, bpm = _load_structure(structure_path)
+    lyrics, instrumental = _load_lyrics(lyrics_path, with_instrumental=True)
     return {
         "packed_dir": str(packed_dir),
         "train_entries": train_entries,
         "val_entries": val_entries,
         "shard_metas": shard_metas,
         "tags": _load_tags(tags_path),
-        "lyrics": _load_lyrics(lyrics_path),
+        "lyrics": lyrics,
+        "instrumental": instrumental,
         "structure": structure,
         "bpm": bpm,
+        "keys": _load_keys(keys_path),
+        "phonemes": _load_phonemes(phonemes_path),
         "has_melody": has_melody,
     }
 
@@ -254,6 +321,8 @@ class TokenDataset(Dataset):
         tags_path: str | Path | None = None,
         lyrics_path: str | Path | None = None,
         structure_path: str | Path | None = None,
+        keys_path: str | Path | None = None,
+        phonemes_path: str | Path | None = None,
         max_lyric_len: int = 256,
     ):
         from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
@@ -275,6 +344,8 @@ class TokenDataset(Dataset):
             tags_path=tags_path,
             lyrics_path=lyrics_path,
             structure_path=structure_path,
+            keys_path=keys_path,
+            phonemes_path=phonemes_path,
         )
         # Delegate to from_mmap and steal its state into self.
         ds = TokenDataset.from_mmap(bundle, split, segment_frames, max_lyric_len)
@@ -320,6 +391,18 @@ class TokenDataset(Dataset):
         # songs without a bpm aren't in the map and get <unknown_tempo> at crop time.
         all_bpm = bundle.get("bpm", {})
         ds._bpm = {n: all_bpm[n] for n in name_set if n in all_bpm}
+        # Per-song key labels (diskrot.key_detect), used for the <key_*> header
+        # marker. Sparse: missing -> <unknown_key> at crop time.
+        all_keys = bundle.get("keys", {})
+        ds._keys = {n: all_keys[n] for n in name_set if n in all_keys}
+        # Names the transcription pass processed but found no usable words in —
+        # the <instrumental> vocal-presence signal (in _lyrics -> <vocals>,
+        # never transcribed -> <unknown_vocals>).
+        ds._instrumental = bundle.get("instrumental", set()) & name_set
+        # Pre-phonemized per-word groups (diskrot.phonemize) in compact numpy
+        # form — consulted before live g2p in _get_segment_lyric_ids.
+        all_phonemes = bundle.get("phonemes", {})
+        ds._phonemes = {n: all_phonemes[n] for n in name_set if n in all_phonemes}
         # Per-song phoneme groups (one list[int] per word), built lazily on first
         # access and reused across crops — g2p runs once per song while it stays
         # hot. Bounded LRU (OrderedDict): each forked DataLoader worker fills its
@@ -391,35 +474,49 @@ class TokenDataset(Dataset):
         Stream format (must stay byte-identical to the inference parser
         ``text_with_markers_to_phoneme_ids``):
 
-            BOS  <gender>  <tempo>  <active-section>  w w  <inline-section>  w ...
+            BOS  <gender>  <tempo>  <key>  <vocals>  <active-section>  w w  <inline-section>  w ...
 
         - Always starts with BOS, then exactly one gender marker (the song's
           F0-labeled vocal gender, ``<unknown_gender>`` if instrumental /
           unlabeled), one tempo marker (the allin1 bpm bucketed, ``<unknown_tempo>``
-          if no bpm), and exactly one section marker for the section active at
-          ``start_sec`` (``<no_section>`` in a gap / for songs without a structure
-          entry). This dense prefix means even a boundary-free or instrumental crop
-          carries all three slots, never a fully-padded row.
+          if no bpm), one key marker (the key_detect estimate, ``<unknown_key>``
+          if none), one vocal-presence marker (``<vocals>`` if the song has usable
+          transcribed words, ``<instrumental>`` if transcription found none,
+          ``<unknown_vocals>`` if never transcribed), and exactly one section
+          marker for the section active at ``start_sec`` (``<no_section>`` in a
+          gap / for songs without a structure entry). This dense prefix means even
+          a boundary-free or instrumental crop carries all five slots, never a
+          fully-padded row.
         - Any section boundary that falls inside the crop is injected inline before
-          the first word at/after the boundary. (Gender is per-song, prefix-only.)
+          the first word at/after the boundary. (Gender/tempo/key/vocals are
+          per-song, prefix-only.)
         Markers and words are appended via the shared ``append_unit`` separator
         rule; truncated to max_lyric_len.
         """
         from model.lyric_encoder import (
-            BOS_PHONEME_ID, append_unit, append_unit_capped, bpm_to_id,
-            gender_label_to_id, structure_label_to_id, text_to_word_phoneme_groups,
+            BOS_PHONEME_ID, VOCAL_TOKEN_TO_ID, UNKNOWN_VOCALS_ID, append_unit,
+            append_unit_capped, bpm_to_id, gender_label_to_id, key_label_to_id,
+            structure_label_to_id, text_to_word_phoneme_groups,
         )
 
         segs = self._structure.get(name)
         entry = self._lyrics.get(name)
         gender = entry.get("gender") if isinstance(entry, dict) else None
         bpm = self._bpm.get(name)
-        # Compact 3-marker header (no internal word-boundary):
-        # BOS <gender> <tempo> <section>.
+        if entry:
+            vocal_id = VOCAL_TOKEN_TO_ID["vocals"]
+        elif name in self._instrumental:
+            vocal_id = VOCAL_TOKEN_TO_ID["instrumental"]
+        else:
+            vocal_id = UNKNOWN_VOCALS_ID
+        # Compact 5-marker header (no internal word-boundary):
+        # BOS <gender> <tempo> <key> <vocals> <section>.
         ids = [BOS_PHONEME_ID]
         append_unit(ids, [
             gender_label_to_id(gender),
             bpm_to_id(bpm),
+            key_label_to_id(self._keys.get(name)),
+            vocal_id,
             structure_label_to_id(_active_label_at(segs, start_sec)),
         ])
 
@@ -427,7 +524,16 @@ class TokenDataset(Dataset):
             return ids
         groups = self._word_phones.get(name)
         if groups is None:
-            groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
+            # Lookup order: pre-phonemized store (diskrot.phonemize) -> live g2p.
+            # A stale store entry (group count != word count after a re-transcribe)
+            # falls back to g2p — same ids either way, g2p is deterministic.
+            pre = self._phonemes.get(name)
+            if pre is not None and len(pre[1]) - 1 == len(entry["words"]):
+                flat, offs = pre
+                groups = [flat[offs[i]:offs[i + 1]].tolist()
+                          for i in range(len(offs) - 1)]
+            else:
+                groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
             self._word_phones[name] = groups
             if len(self._word_phones) > self._word_phones_cap:
                 self._word_phones.popitem(last=False)  # evict least-recently-used

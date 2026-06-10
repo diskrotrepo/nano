@@ -88,16 +88,12 @@ def _segments_from_result(result) -> list[dict]:
     return sorted(segs, key=lambda s: s["start"])
 
 
-def analyze_file(analyze_fn, mp3_path: str | Path, device: str) -> dict | None:
-    """Run allin1 on one file. Returns ``{"segments":[...], "bpm":...}`` or None.
+def _result_to_entry(result) -> dict | None:
+    """Serialize one allin1 result to ``{"segments":[...], "bpm":...}`` or None.
 
     Returns None when allin1 produces no usable sections (rare; e.g. very short
     or pathological audio) so the caller can record it and not retry forever.
     """
-    result = analyze_fn(str(mp3_path), device=device)
-    # allin1.analyze returns a single result for a single path input.
-    if isinstance(result, list):
-        result = result[0]
     segments = _segments_from_result(result)
     if not segments:
         return None
@@ -106,6 +102,30 @@ def analyze_file(analyze_fn, mp3_path: str | Path, device: str) -> dict | None:
     if bpm is not None:
         out["bpm"] = bpm
     return out
+
+
+def analyze_file(analyze_fn, mp3_path: str | Path, device: str) -> dict | None:
+    """Run allin1 on one file. Returns ``{"segments":[...], "bpm":...}`` or None."""
+    result = analyze_fn(str(mp3_path), device=device)
+    # allin1.analyze returns a single result for a single path input.
+    if isinstance(result, list):
+        result = result[0]
+    return _result_to_entry(result)
+
+
+def analyze_batch(analyze_fn, mp3_paths: list[str | Path], device: str) -> list[dict | None]:
+    """Run allin1 on many files in ONE call. Returns entries parallel to input.
+
+    Per-file output is identical to ``analyze_file`` — allin1 separates, extracts
+    spectrograms, and infers per file regardless of batching — but a single call
+    pays the per-call setup (demucs subprocess spawn + htdemucs load, plus the
+    8-fold harmonix-all ensemble construction) once for the whole batch instead
+    of once per song.
+    """
+    results = analyze_fn([str(p) for p in mp3_paths], device=device)
+    if not isinstance(results, list):  # single-path input yields a bare result
+        results = [results]
+    return [_result_to_entry(r) for r in results]
 
 
 def _flush_shards(structure_dir: Path, structure: dict, dirty: set[int]) -> None:

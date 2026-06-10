@@ -2,18 +2,20 @@
 
 The dependency map for a full training run — **what gates what, and what can run at the same time.** For the actual commands and per-step detail, see [README.modal.md](README.modal.md).
 
-Melody and lyrics are mandatory here. The structure pass is optional.
+Melody and lyrics are mandatory here. The structure and key-detect passes are
+optional; phonemize is cheap and strongly recommended (it removes a real
+training-throughput bottleneck).
 
 ## The graph
 
 ```
-Upload ──► Prepare ──► Tokenize ──► Melody ──► Pack ──► Train
-                          │                      ▲        ▲
-                          └──────────────────────┘        │
-   (after Prepare, in parallel with Tokenize): ───────────┤
-       Auto-tag   (corpus only) ─────────► tags.json ─────┤
-       Transcribe (corpus only) ─────────► lyrics/   ─────┤
-       Structure  (corpus only, OPTIONAL) ► structure/ ───┘
+Upload ──► Prepare ──► Tokenize ──► Melody ──► Pack ──┬──────────► Train
+                          │                      ▲    │              ▲
+                          └──────────────────────┘    └► Key-detect ─┤
+   (after Prepare, in parallel with Tokenize): ──────────────────────┤
+       Auto-tag   (corpus only) ─────────► tags.json ────────────────┤
+       Transcribe (corpus only) ─────────► lyrics/ ──► Phonemize ────┤
+       Structure  (corpus only, OPTIONAL) ► structure/ ──────────────┘
 ```
 
 ## Critical path
@@ -38,7 +40,9 @@ The longest mandatory chain — everything else fits inside its shadow:
 | Auto-tag | L4 GPU | Prepare (corpus only) | the entire Tokenize → Melody → Pack chain |
 | Transcribe | L4 GPU | Prepare (corpus only) | the entire Tokenize → Melody → Pack chain |
 | Structure | L4 GPU | Prepare (corpus only) | the entire Tokenize → Melody → Pack chain |
-| Train | 8× H100 | Pack + tags.json + lyrics/ (+ structure/) | — |
+| Key-detect | CPU | Pack (reads the packed chroma) | Auto-tag, Transcribe, Structure, Phonemize |
+| Phonemize | CPU | Transcribe (reads lyrics/) | the entire token chain, Key-detect |
+| Train | 8× H100 | Pack + tags.json + lyrics/ + phonemes/ (+ structure/ + keys.json) | — |
 
 Auto-tag, Transcribe, and Structure read the **corpus only**, so they can all kick off the moment Prepare finishes and run concurrently with the Tokenize → Melody → Pack chain. Don't run them serially — you'd idle expensive GPU time.
 
@@ -72,7 +76,14 @@ modal run --detach diskrot/modal_transcribe.py    # → lyrics/
 modal run --detach diskrot/modal_structure.py     # → structure/  (optional)
 ```
 
-**Wave 2 — join** (starts only once Pack, `tags.json`, and `lyrics/` are all done — plus `structure/` if you ran it):
+**Wave 1.5 — cheap CPU derivations** (each waits only on its input, runs alongside everything else):
+
+```bash
+modal run --detach diskrot/modal_key_detect.py    # → keys.json   (waits on Pack; optional)
+modal run --detach diskrot/modal_phonemize.py     # → phonemes/   (waits on Transcribe; recommended)
+```
+
+**Wave 2 — join** (starts only once Pack, `tags.json`, `lyrics/`, and `phonemes/` are done — plus `structure/`/`keys.json` if you ran them):
 
 ```bash
 modal volume create nano-ckpts
@@ -82,10 +93,11 @@ modal run --detach diskrot/modal_train.py --n-gpus 8
 Pull the trained checkpoint when it's done:
 
 ```bash
-modal volume get nano-ckpts /v7_1500m/best.pt ./checkpoints/latest.pt --force
+modal volume get nano-ckpts /v8_sing/best.pt ./checkpoints/latest.pt --force
 ```
 
 ## Mandatory vs optional
 
 - **Mandatory:** Upload, Prepare, Tokenize, Melody, Pack, Auto-tag (tags), Transcribe (lyrics), Train.
-- **Optional:** Structure. Without it the lyric stream just falls back to `<no_section>` markers — no other change.
+- **Recommended:** Phonemize. Without it the lyric stream is identical, but every DataLoader cache miss runs live g2p (~20–200 ms/song on OOV-heavy transcripts) — at corpus scale that can starve the 8×H100 step. A few CPU dollars buys it back.
+- **Optional:** Structure (falls back to `<no_section>` markers), Key-detect (falls back to `<unknown_key>`). No other change without them.

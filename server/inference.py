@@ -234,12 +234,15 @@ class InferenceEngine:
         # A selected vocal gender / tempo rides the lyric stream as a leading
         # [male]/[female] / [NNNbpm] bracket — the same dense header markers the
         # dataset injects at train time (every stream opens BOS <gender> <tempo>
-        # <section>, words or not). Prepending them here makes the stream non-empty
-        # even with no lyrics, so an instrumental generation can still steer gender
-        # and tempo. text_with_markers_to_phoneme_ids consumes only the first
+        # <key> <vocals> <section>, words or not). Prepending them here makes the
+        # stream non-empty even with no lyrics, so an instrumental generation can
+        # still steer gender and tempo. (Key and vocal presence have no dedicated
+        # request params — type [a minor] / [instrumental] into the lyrics box and
+        # the parser routes them to their header slots.)
+        # text_with_markers_to_phoneme_ids consumes only the first
         # gender/tempo prefix (in any order), so these override a stray marker the
-        # user typed into the lyrics box. Omitting either leaves its slot at
-        # <unknown_gender>/<unknown_tempo> — exactly the train-time fallback.
+        # user typed into the lyrics box. Omitting a slot leaves it at its unknown
+        # marker — exactly the train-time fallback.
         if gender in ("male", "female"):
             lyrics_str = f"[{gender}] {lyrics_str}".rstrip()
         if bpm is not None and bpm > 0:

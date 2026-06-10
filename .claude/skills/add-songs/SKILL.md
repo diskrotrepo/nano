@@ -2,10 +2,11 @@
 name: add-songs
 description: >-
   Add MP3s to the nano training corpus and run them through the full data-prep
-  pipeline (upload, prepare, tokenize, optional melody/auto-tag/transcribe, pack).
-  Use this skill when the user wants to add training data, ingest songs, build or
-  grow the corpus, prepare data for training, run tokenize/melody/pack/tag/transcribe,
-  or asks how to get their MP3s into the model.
+  pipeline (upload, prepare, tokenize, optional melody/auto-tag/transcribe/
+  structure/key-detect, phonemize, pack). Use this skill when the user wants to
+  add training data, ingest songs, build or grow the corpus, prepare data for
+  training, run tokenize/melody/pack/tag/transcribe/structure/phonemize, or asks
+  how to get their MP3s into the model.
 allowed-tools: Read, Bash
 ---
 
@@ -32,7 +33,7 @@ same data helps; variety does not — do **not** curate for genre/style diversit
 | Volume | Holds |
 |---|---|
 | `nano-corpus` | Raw MP3 files |
-| `nano-tokens` | `.pt` token files, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/` |
+| `nano-tokens` | `.pt` token files, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/`, `structure/`, `keys.json`, `phonemes/` |
 | `nano-melody` | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its inode cap) |
 | `nano-ckpts` | Training checkpoints |
 
@@ -125,12 +126,41 @@ Demucs (vocal isolation) → Whisper, into a sharded `lyrics/` dir. This is by f
 the costliest step — **skip it unless you will actually use lyric conditioning at
 inference.**
 
+### 8. Structure — *optional*, needed for section markers (`[chorus]` etc.)
+```bash
+modal run --detach diskrot/modal_structure.py     # --limit 200 first to calibrate
+```
+allin1 (Demucs + joint beat/segment model) → sharded `structure/` dir with
+per-song sections + bpm (the tempo marker source). Loaded at train time, not
+packed — a partial pass just yields `<no_section>`. Expensive (L4 fan-out).
+
+### 9. Phonemize — *recommended* if you ran transcribe (step 7)
+```bash
+modal run --detach diskrot/modal_phonemize.py
+# or locally: python -m diskrot.phonemize --lyrics-path ./lyrics --out-dir ./phonemes
+```
+Pre-runs g2p per song into a sharded `phonemes/` dir so the DataLoader doesn't
+pay ~20–200 ms/song of live g2p at train time (which can starve the 8×H100
+step). CPU, ~$1, resumable. Re-run after any re-transcribe.
+
+### 10. Key detect — *optional*, needs the melody-packed shards (steps 4+5)
+```bash
+modal run --detach diskrot/modal_key_detect.py
+# or locally: python -m diskrot.key_detect --cache-dir ./token_cache
+```
+Krumhansl key estimate over the packed chroma → `keys.json`, the `<key_*>`
+header-marker source (enables "[a minor]" prompts). CPU, ~$1, resumable; songs
+without an estimate get `<unknown_key>`.
+
 ## Decision points
 
 - **Need tags?** Only if you'll train/serve text-conditioned (the default). Run step 6.
-- **Need lyrics?** Only if you'll use lyric conditioning. Run step 7 (expensive).
+- **Need lyrics?** Only if you'll use lyric conditioning. Run step 7 (expensive),
+  then step 9 (phonemize — cheap, protects training throughput).
 - **Need melody / `/cover`?** Run step 4 (melody) then repack (step 5) so the chroma
   sidecar lands. Cheap (CPU) — worth it if you want the hum→re-render capability.
+  With the sidecar packed, step 10 (key detect) is ~free and adds key control.
+- **Need section markers (`[verse]`/`[chorus]`)?** Run step 8 (expensive).
 - **Local vs Modal?** Modal for real fan-out scale; local for a smoke corpus to
   exercise the pipeline.
 
@@ -138,7 +168,8 @@ inference.**
 
 On `nano-tokens` you should have `packed/packed_index.json` (required); if you ran
 the melody step, `packed/` also has `packed_NNN.mel.bin` (and `packed_index.json`
-reports `"has_melody": true`); and if you ran step 6, `tags.json`. Quick check:
+reports `"has_melody": true`); and per optional pass: `tags.json` (step 6),
+`lyrics/` (7), `structure/` (8), `phonemes/` (9), `keys.json` (10). Quick check:
 ```bash
 modal volume ls nano-tokens
 modal volume ls nano-tokens packed | head

@@ -17,7 +17,9 @@ Cost for the data-prep steps scales roughly linearly with corpus size, so the ta
 | 3. Tokenize | L4 × 50 | ~1.5 min, ~$0.07–0.10 |
 | 4. Auto-tag (optional) | L4 × 20 | ~0.5 min, ~$0.02 |
 | 4b. Transcribe lyrics (optional) | L4 × 50 | ~14 min, ~$5–7 |
+| 4c. Phonemize (recommended, after 4b) | CPU × 16 | negligible (~$1 full corpus) |
 | 5. Pack (sharded mmap) | CPU | negligible |
+| 5b. Key detect (optional, after 5) | CPU × 4 | negligible (~$1 full corpus) |
 | 6. Train (flat — corpus-independent) | H100 × 8 DDP | a few thousand USD for the full 400k-step run |
 
 GPU rates used above (as of 2026-05): H100 ≈ $5.92/hr, A100-40 ≈ $3.10/hr, L4 ≈ $0.30/hr, debian_slim CPU ≈ $0.10/hr.
@@ -122,6 +124,16 @@ modal run --detach diskrot/modal_transcribe.py
 
 Writes a sharded `lyrics/` dir (`lyrics_NNN.json`, 256 shards keyed by a stable hash of the stem) to the `nano-tokens` volume; each entry is `{stem: {"text": ..., "words": [{word, start, end}, ...]}}` and instrumental tracks map to `null`. Sharding keeps each flush O(batch) instead of rewriting one giant JSON, and writes are atomic (temp+rename) so a kill can corrupt at most one shard. The `.map()` collect/flush loop runs in a spawned remote function, so `--detach` survives terminal close. Re-running skips files already present. **This is the single most expensive step** (~$5–7 per 1,000 songs) — skip it unless you actually plan to use lyric conditioning at inference.
 
+## 4c. Phonemize (recommended after transcribe)
+
+Pre-runs g2p over every transcribed song and writes the per-word phoneme-id groups to a sharded `phonemes/` dir ([modal_phonemize.py](diskrot/modal_phonemize.py)):
+
+```bash
+modal run --detach diskrot/modal_phonemize.py
+```
+
+Why: the dataset otherwise phonemizes lazily inside the DataLoader workers, and OOV-heavy Whisper transcripts cost ~20–200 ms/song there — at corpus scale that can starve the 8×H100 training step. This pass is a ~$1 CPU one-shot that turns it into a pure lookup. Resumable (per-song skip, atomic shard rewrites); training falls back to live g2p for any song not covered, so partial is safe. Re-run it after any re-transcribe (stale entries are detected by word count and redone).
+
 ## 5. Pack (sharded mmap layout)
 
 At scale the token corpus no longer fits in RAM as one shared-memory tensor, so we write a sharded, mmap-friendly layout and let the kernel page tokens in on demand. See [diskrot/pack_cache.py](diskrot/pack_cache.py) for the format (`packed/packed_NNN.bin` + per-shard JSON + a global `packed_index.json`).
@@ -140,9 +152,19 @@ python -m diskrot.pack_cache --cache-dir /tokens
 
 The packer is **deterministic** (same `.pt` set → byte-identical shards) and **resumable**: each shard is written atomically (temp file → `os.replace`, with the per-shard `.json` written last as a commit marker) and committed to the volume as it lands, and a re-run **skips shards already complete-and-valid on disk** rather than rebuilding them. So a kill or Modal worker preemption mid-pack costs only the in-flight shard — just re-run (or let the `retries` on `pack_remote` restart it) and it continues from the last committed shard. A truncated or half-written shard is detected (size/membership check) and rebuilt; adding files shifts shards in the alphabetical tail, and only the shifted shards are rebuilt. It is still **not an in-place update** — re-running validates every shard — but it is no longer "rebuild from scratch", and an interrupted run never has to start over. The trainer's parent process auto-detects the `packed/` dir and switches to `load_mmap_bundle`; a cache layout without `packed/` falls back to the legacy in-RAM path (only viable on a tiny smoke-test corpus).
 
+## 5b. Key detect (optional, after pack)
+
+Estimates each song's musical key from the packed chroma sidecar (mean chroma → Krumhansl-Schmuckler) and writes `keys.json` — the source of the `<key_*>` header marker that enables "generate in A minor" prompts ([modal_key_detect.py](diskrot/modal_key_detect.py)):
+
+```bash
+modal run --detach diskrot/modal_key_detect.py
+```
+
+CPU-only, one container, ~$1; needs the pack to carry the melody sidecar (`packed_NNN.mel.bin`). Resumable; songs without an estimate just get `<unknown_key>` at train time.
+
 ## 6. Train
 
-Trains the ~1.5B parameter transformer (d_model=2048, n_layers=22, n_heads=16, d_ff=8192) over 30-second segments with RoPE (`max_seq_len=8192`) so inference can extrapolate to ~95s single-shot generation. Defaults to 400K steps with early stopping at `patience=20`, gradient checkpointing on, and checkpoints under `/ckpts/v7_1500m/` — the `DEFAULTS` dict in [diskrot/modal_train.py](diskrot/modal_train.py#L83-L99) is the source of truth. Text conditioning is enabled by default (requires step 4 auto-tagging).
+Trains the ~1.5B parameter transformer (d_model=2048, n_layers=22, n_heads=16, d_ff=8192) over 30-second segments with RoPE (`max_seq_len=8192`) so inference can extrapolate to ~95s single-shot generation. Defaults to 400K steps with early stopping at `patience=20`, gradient checkpointing on, and checkpoints under `/ckpts/v8_sing/` — the `DEFAULTS` dict in [diskrot/modal_train.py](diskrot/modal_train.py) is the source of truth. Text conditioning is enabled by default (requires step 4 auto-tagging).
 
 This is an 8×H100 DDP job. Single-GPU is technically possible but not recommended — the per-GPU memory footprint of the 1.5B model at 30s segments + bf16 + grad-checkpointing is tight on 80 GB H100s even at the per-rank batch of 8:
 
