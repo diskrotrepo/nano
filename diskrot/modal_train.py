@@ -13,11 +13,11 @@ Run the default ~1.5B model (single H100):
 Override architecture / hyperparams via CLI:
     modal run --detach diskrot/modal_train.py \\
       --d-model 2048 --n-layers 22 --n-heads 16 --d-ff 8192 \\
-      --batch-size 64 --lr 3.0e-4 --warmup-steps 5000 \\
-      --eval-batches 50 --ckpt-subdir v7_1500m
+      --batch-size 32 --lr 2.1e-4 --warmup-steps 5000 \\
+      --eval-batches 50 --ckpt-subdir v8_sing
 
 Multi-GPU DDP on 8×H100 (per-rank batch_size; global = n_gpus × that):
-    modal run --detach diskrot/modal_train.py --n-gpus 8 --batch-size 8
+    modal run --detach diskrot/modal_train.py --n-gpus 8 --batch-size 4
 
 Pull checkpoints back when training is done (substitute the subdir):
     modal volume get nano-ckpts /v7_1500m/best.pt ./checkpoints/best.pt
@@ -88,25 +88,31 @@ wandb_secret = modal.Secret.from_name("wandb")
 
 
 # ~1.5B model on 8×H100 DDP, served via the sharded mmap dataset path,
-# 30s segments with RoPE so inference can extrapolate to 90s single-shot
-# generation. At the recommended corpus scale the token count is roughly
-# Chinchilla-matched to 1.5B, so this is the right-sized model for the data —
-# the prior 287M was heavily over-data'd. Gradient checkpointing is on because 1.5B × 30s
-# segments × bf16 is tight on 80 GB H100s without it; the ~25% recompute cost
-# is well worth the headroom. Batch is conservative (global 64, per-rank 8 on
-# 8 ranks) to fit 1.5B at 30s; raise toward 96 if memory allows, drop to 48
-# (per-rank 6) on OOM.
+# 60s segments with RoPE so the model natively holds ~1-minute single-shots
+# (a 60s crop covers a full section + transition; see the section-length
+# rationale — 30s clipped the long-tail 16-bar verses). At the recommended
+# corpus scale the token count is roughly Chinchilla-matched to 1.5B, so this is
+# the right-sized model for the data — the prior 287M was heavily over-data'd.
+# Gradient checkpointing is on because 1.5B × 60s segments × bf16 is tight on
+# 80 GB H100s without it; the ~25% recompute cost is well worth the headroom.
+# Batch is global 32 / per-rank 4 on 8 ranks: 60s doubles the sequence vs the
+# old 30s run, so the batch is halved (64→32) to keep the per-rank token load
+# (4×5160) equal to the old 8×2580 that fit. Drop to per-rank 2 (global 16) on
+# OOM; raise toward per-rank 6 if memory allows (re-sqrt-scale lr if you do).
 DEFAULTS = {
     "d_model": 2048,
     "n_layers": 22,
     "n_heads": 16,                 # head_dim = 128 (even, RoPE-safe; 2048 % 16 == 0)
     "d_ff": 8192,
     "dropout": 0.05,
-    "max_seq_len": 8192,           # RoPE table covers ~95s at 86 Hz
+    "max_seq_len": 8192,           # RoPE table covers ~95s at 86 Hz (60s seg = 5168 frames, fits)
     "use_gradient_checkpointing": True,
-    "segment_seconds": 30.0,
-    "batch_size": 64,              # global; per-rank = 8 on 8 ranks
-    "lr": 3.0e-4,
+    "segment_seconds": 60.0,       # 60s = 5160 frames; native ~1-min single-shot
+    "batch_size": 32,              # global; per-rank = 4 on 8 ranks. Halved from 64
+                                   # because 60s doubles the sequence — per-rank token
+                                   # load (4×5160) is identical to the old 30s 8×2580
+                                   # that fit, so memory holds. tokens/step unchanged.
+    "lr": 2.1e-4,                  # sqrt-scaled for the halved global batch (3.0e-4×√½)
     "warmup_steps": 5000,
     "steps": 400_000,
     "patience": 20,
@@ -145,7 +151,7 @@ DEFAULTS = {
     "use_fim": False,
     "fim_prob": 0.0,
 }
-DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 8 (global 64 on 8 ranks)
+DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 4 (global 32 on 8 ranks)
 
 
 def _build_cfg_kwargs(
@@ -429,7 +435,7 @@ def train_remote(
 # Multi-GPU DDP — 8×H100 in a single container, ranks coordinated via mp.spawn.
 # batch_size on this path is *per-rank*; the global batch is n_gpus× that. lr
 # should be sqrt-scaled against the global batch the same way as the single-GPU
-# path (global stays 64 with per-rank 8 on 8 ranks, so the tuned lr holds).
+# path (global 32 with per-rank 4 on 8 ranks; lr is sqrt-scaled to 2.1e-4 to match).
 @app.function(
     image=image,
     gpu="H100:8",
@@ -442,7 +448,7 @@ def train_remote(
 )
 def train_remote_multi(
     steps: int = DEFAULTS["steps"],
-    batch_size: int = DDP_PER_RANK_BATCH,  # per-rank; global = 8 × per-rank = 64
+    batch_size: int = DDP_PER_RANK_BATCH,  # per-rank; global = 8 × per-rank = 32
     lr: float = DEFAULTS["lr"],
     warmup_steps: int = DEFAULTS["warmup_steps"],
     patience: int = DEFAULTS["patience"],
