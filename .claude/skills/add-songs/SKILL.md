@@ -126,6 +126,18 @@ Demucs (vocal isolation) → Whisper, into a sharded `lyrics/` dir. This is by f
 the costliest step — **skip it unless you will actually use lyric conditioning at
 inference.**
 
+### 7b. Filter hallucinated lyrics — *recommended* after step 7 completes
+```bash
+modal run diskrot/modal_filter_lyrics.py          # dry-run report first
+modal run diskrot/modal_filter_lyrics.py --apply  # then rewrite shards
+# or locally: python -m diskrot.filter_lyrics --lyrics-dir ./lyrics [--apply]
+```
+Nulls Whisper-invented captions over instrumentals ("Thank you." etc. — ~24% of
+with-words entries) so they train as `<instrumental>`, not `<vocals>` with
+garbage words. CPU, seconds, idempotent. **Only after the transcribe fleet has
+fully finished** (its orchestrator's in-memory flush clobbers concurrent edits),
+and before phonemize.
+
 ### 8. Structure — *optional*, needed for section markers (`[chorus]` etc.)
 ```bash
 modal run --detach diskrot/modal_structure.py     # --limit 200 first to calibrate
@@ -156,7 +168,8 @@ without an estimate get `<unknown_key>`.
 
 - **Need tags?** Only if you'll train/serve text-conditioned (the default). Run step 6.
 - **Need lyrics?** Only if you'll use lyric conditioning. Run step 7 (expensive),
-  then step 9 (phonemize — cheap, protects training throughput).
+  then 7b (filter hallucinations — cheap) and step 9 (phonemize — cheap, protects
+  training throughput).
 - **Need melody / `/cover`?** Run step 4 (melody) then repack (step 5) so the chroma
   sidecar lands. Cheap (CPU) — worth it if you want the hum→re-render capability.
   With the sidecar packed, step 10 (key detect) is ~free and adds key control.

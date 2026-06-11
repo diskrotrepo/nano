@@ -17,7 +17,8 @@ Cost for the data-prep steps scales roughly linearly with corpus size, so the ta
 | 3. Tokenize | L4 × 50 | ~1.5 min, ~$0.07–0.10 |
 | 4. Auto-tag (optional) | L4 × 20 | ~0.5 min, ~$0.02 |
 | 4b. Transcribe lyrics (optional) | L4 × 50 | ~14 min, ~$5–7 |
-| 4c. Phonemize (recommended, after 4b) | CPU × 16 | negligible (~$1 full corpus) |
+| 4c. Filter lyrics (recommended, after 4b) | CPU | negligible (seconds, one container) |
+| 4d. Phonemize (recommended, after 4c) | CPU × 16 | negligible (~$1 full corpus) |
 | 5. Pack (sharded mmap) | CPU | negligible |
 | 5b. Key detect (optional, after 5) | CPU × 4 | negligible (~$1 full corpus) |
 | 6. Train (flat — corpus-independent) | H100 × 8 DDP | a few thousand USD for the full 400k-step run |
@@ -124,7 +125,18 @@ modal run --detach diskrot/modal_transcribe.py
 
 Writes a sharded `lyrics/` dir (`lyrics_NNN.json`, 256 shards keyed by a stable hash of the stem) to the `nano-tokens` volume; each entry is `{stem: {"text": ..., "words": [{word, start, end}, ...]}}` and instrumental tracks map to `null`. Sharding keeps each flush O(batch) instead of rewriting one giant JSON, and writes are atomic (temp+rename) so a kill can corrupt at most one shard. The `.map()` collect/flush loop runs in a spawned remote function, so `--detach` survives terminal close. Re-running skips files already present. **This is the single most expensive step** (~$5–7 per 1,000 songs) — skip it unless you actually plan to use lyric conditioning at inference.
 
-## 4c. Phonemize (recommended after transcribe)
+## 4c. Filter hallucinated lyrics (recommended after transcribe)
+
+Whisper invents captions over instrumental audio — "Thank you.", "Thanks for watching!", "We'll be right back." — and any entry with usable words trains as `<vocals>` with those words attended, so each one mislabels an instrumental song *and* feeds it garbage lyrics (~24% of with-words entries in the 2026-06 full-corpus sweep). This pass nulls them back to the transcribed-but-wordless convention (trains as `<instrumental>`) ([modal_filter_lyrics.py](diskrot/modal_filter_lyrics.py)):
+
+```bash
+modal run diskrot/modal_filter_lyrics.py            # dry-run report
+modal run diskrot/modal_filter_lyrics.py --apply    # rewrite shards
+```
+
+Flags entries with fewer than 6 valid words, or a known caption-artifact phrase ("thank you for watching", "subscribe", …) in a transcript under 30 words — long real lyrics that merely mention such a phrase survive. Rewrites are atomic per shard and the pass is idempotent. **Run it only after the transcribe fleet has fully finished** (the transcribe orchestrator holds shard contents in memory and its next flush would clobber concurrent edits), and before phonemize so junk never enters the phoneme store.
+
+## 4d. Phonemize (recommended after transcribe + filter)
 
 Pre-runs g2p over every transcribed song and writes the per-word phoneme-id groups to a sharded `phonemes/` dir ([modal_phonemize.py](diskrot/modal_phonemize.py)):
 
