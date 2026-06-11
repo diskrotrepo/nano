@@ -117,6 +117,9 @@ LOCK_STALE_SEC = 24 * 60 * 60
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    # Globs the full corpus and parses every lyrics shard; at full coverage
+    # that's >1 GB of JSON — Modal's 300s default timeout is not enough.
+    timeout=30 * 60,
 )
 def list_pending() -> list[str]:
     """Return mp3 filenames not yet in the sharded lyrics dir."""
@@ -132,6 +135,11 @@ def list_pending() -> list[str]:
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    # A 2000-result batch hash-spreads over all 256 shards, so each flush
+    # read-merge-rewrites ~the whole lyrics dir; per-flush time grows with
+    # corpus coverage and crossed Modal's 300s default overnight 2026-06-10
+    # (~100k songs, ~1.6 MB/shard), killing the orchestrator mid-run.
+    timeout=30 * 60,
 )
 def save_results(results: list[tuple[str, dict | None, str | None]]):
     """Merge a batch of results into the sharded lyrics dir.
