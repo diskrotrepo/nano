@@ -14,7 +14,7 @@ Upload ──► Prepare ──► Tokenize ──► Melody ──► Pack ─�
                           └──────────────────────┘    └► Key-detect ─┤
    (after Prepare, in parallel with Tokenize): ──────────────────────┤
        Auto-tag   (corpus only) ─────────► tags.json ────────────────┤
-       Transcribe (corpus only) ─────────► lyrics/ ──► Phonemize ────┤
+       Transcribe (corpus only) ► lyrics/ ► Filter ► Phonemize ──────┤
        Structure  (corpus only, OPTIONAL) ► structure/ ──────────────┘
 ```
 
@@ -41,7 +41,8 @@ The longest mandatory chain — everything else fits inside its shadow:
 | Transcribe | L4 GPU | Prepare (corpus only) | the entire Tokenize → Melody → Pack chain |
 | Structure | L4 GPU | Prepare (corpus only) | the entire Tokenize → Melody → Pack chain |
 | Key-detect | CPU | Pack (reads the packed chroma) | Auto-tag, Transcribe, Structure, Phonemize |
-| Phonemize | CPU | Transcribe (reads lyrics/) | the entire token chain, Key-detect |
+| Filter-lyrics | CPU | Transcribe **fully complete** (rewrites lyrics/ in place) | the entire token chain, Key-detect |
+| Phonemize | CPU | Filter-lyrics (reads the cleaned lyrics/) | the entire token chain, Key-detect |
 | Train | 8× H100 | Pack + tags.json + lyrics/ + phonemes/ (+ structure/ + keys.json) | — |
 
 Auto-tag, Transcribe, and Structure read the **corpus only**, so they can all kick off the moment Prepare finishes and run concurrently with the Tokenize → Melody → Pack chain. Don't run them serially — you'd idle expensive GPU time.
@@ -80,8 +81,11 @@ modal run --detach diskrot/modal_structure.py     # → structure/  (optional)
 
 ```bash
 modal run --detach diskrot/modal_key_detect.py    # → keys.json   (waits on Pack; optional)
-modal run --detach diskrot/modal_phonemize.py     # → phonemes/   (waits on Transcribe; recommended)
+modal run diskrot/modal_filter_lyrics.py --apply  # nulls Whisper-hallucinated captions in lyrics/ (recommended; dry-run without --apply)
+modal run --detach diskrot/modal_phonemize.py     # → phonemes/   (waits on Filter-lyrics; recommended)
 ```
+
+⚠️ Filter-lyrics is the one Wave 1.5 step with a hard ordering constraint: it must wait until the Transcribe fleet has **fully finished** — the transcribe orchestrator holds shard contents in memory and its next flush would clobber concurrent edits. Run it, then Phonemize, as a serial pair after Transcribe drains.
 
 **Wave 2 — join** (starts only once Pack, `tags.json`, `lyrics/`, and `phonemes/` are done — plus `structure/`/`keys.json` if you ran them):
 
@@ -99,5 +103,5 @@ modal volume get nano-ckpts /v8_sing/best.pt ./checkpoints/latest.pt --force
 ## Mandatory vs optional
 
 - **Mandatory:** Upload, Prepare, Tokenize, Melody, Pack, Auto-tag (tags), Transcribe (lyrics), Train.
-- **Recommended:** Phonemize. Without it the lyric stream is identical, but every DataLoader cache miss runs live g2p (~20–200 ms/song on OOV-heavy transcripts) — at corpus scale that can starve the 8×H100 step. A few CPU dollars buys it back.
+- **Recommended:** Filter-lyrics and Phonemize. Filter-lyrics nulls Whisper-hallucinated captions over instrumentals ("Thank you." etc. — ~24% of with-words entries in the 2026-06 sweep) so they train as `<instrumental>` instead of vocal songs with garbage words. Phonemize: without it the lyric stream is identical, but every DataLoader cache miss runs live g2p (~20–200 ms/song on OOV-heavy transcripts) — at corpus scale that can starve the 8×H100 step. A few CPU dollars buys both back.
 - **Optional:** Structure (falls back to `<no_section>` markers), Key-detect (falls back to `<unknown_key>`). No other change without them.

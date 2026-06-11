@@ -19,6 +19,15 @@ Override architecture / hyperparams via CLI:
 Multi-GPU DDP on 8×H100 (per-rank batch_size; global = n_gpus × that):
     modal run --detach diskrot/modal_train.py --n-gpus 8 --batch-size 4
 
+Fine-tune from an existing checkpoint (fresh optimizer/step, new subdir):
+    modal run --detach diskrot/modal_train.py --n-gpus 8 \\
+      --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
+
+LoRA-train (frozen base + adapters; single H100 is plenty; see README.finetune.md):
+    modal run --detach diskrot/modal_train.py \\
+      --init-from v8_sing/best.pt --lora --ckpt-subdir v8_lora \\
+      [--data-subdir my_corpus]
+
 Pull checkpoints back when training is done (substitute the subdir):
     modal volume get nano-ckpts /v7_1500m/best.pt ./checkpoints/best.pt
 """
@@ -160,17 +169,34 @@ def _build_cfg_kwargs(
     segment_seconds: float = 10.0,
     fim_prob: float = DEFAULTS["fim_prob"],
     wandb_project: str | None = None, wandb_run_name: str | None = None,
+    init_from: str = "",
+    lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_targets: str = "",
+    lora_train_text_proj: bool = False,
+    data_subdir: str = "",
 ) -> dict:
     """Shared TrainConfig builder for both single- and multi-GPU paths.
-    Returns a plain dict so it survives mp.spawn pickling."""
-    tags_path = "/tokens/tags.json" if text_conditioned else None
-    lyrics_path = "/tokens/lyrics" if text_conditioned else None
-    structure_path = "/tokens/structure" if text_conditioned else None
-    keys_path = "/tokens/keys.json" if text_conditioned else None
-    phonemes_path = "/tokens/phonemes" if text_conditioned else None
+    Returns a plain dict so it survives mp.spawn pickling.
+
+    ``init_from`` is a path relative to the nano-ckpts volume (e.g.
+    "v8_sing/best.pt") — fine-tune / LoRA-train from that checkpoint; the
+    architecture then comes FROM the checkpoint and the --d-model etc. flags
+    are advisory. ``data_subdir`` re-roots the token cache and every
+    conditioning path under /tokens/{data_subdir}, so a fine-tune corpus can
+    be packed beside the main one (same layout, one directory down)."""
+    root = f"/tokens/{data_subdir}" if data_subdir else "/tokens"
+    tags_path = f"{root}/tags.json" if text_conditioned else None
+    lyrics_path = f"{root}/lyrics" if text_conditioned else None
+    structure_path = f"{root}/structure" if text_conditioned else None
+    keys_path = f"{root}/keys.json" if text_conditioned else None
+    phonemes_path = f"{root}/phonemes" if text_conditioned else None
+    from model.lora import DEFAULT_TARGETS
+
     return dict(
         fim_prob=fim_prob,
-        cache_dir="/tokens",
+        cache_dir=root,
         ckpt_dir=f"/ckpts/{ckpt_subdir}",
         device="cuda",
         steps=steps,
@@ -188,6 +214,12 @@ def _build_cfg_kwargs(
         segment_seconds=segment_seconds,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
+        init_from=f"/ckpts/{init_from}" if init_from else None,
+        lora=lora,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_targets=lora_targets or DEFAULT_TARGETS,
+        lora_train_text_proj=lora_train_text_proj,
     )
 
 
@@ -404,41 +436,37 @@ def train_remote(
     use_gradient_checkpointing: bool = True,
     wandb_project: str = "",
     wandb_run_name: str = "",
+    # Fine-tune / LoRA — see _build_cfg_kwargs. init_from is relative to the
+    # nano-ckpts volume; with it set, the architecture flags above are
+    # advisory (train_run takes GPTConfig from the checkpoint).
+    init_from: str = "",
+    lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_targets: str = "",
+    lora_train_text_proj: bool = False,
+    data_subdir: str = "",
 ):
     from diskrot.train import TrainConfig, train_run
 
-    tags_path = "/tokens/tags.json" if text_conditioned else None
-    lyrics_path = "/tokens/lyrics" if text_conditioned else None
-    structure_path = "/tokens/structure" if text_conditioned else None
-    keys_path = "/tokens/keys.json" if text_conditioned else None
-    phonemes_path = "/tokens/phonemes" if text_conditioned else None
+    cfg_kwargs = _build_cfg_kwargs(
+        steps, batch_size, lr, warmup_steps, patience, eval_batches,
+        ckpt_subdir, text_conditioned,
+        segment_seconds=segment_seconds,
+        wandb_project=wandb_project or None,
+        wandb_run_name=wandb_run_name or None,
+        init_from=init_from, lora=lora, lora_r=lora_r, lora_alpha=lora_alpha,
+        lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
+        data_subdir=data_subdir,
+    )
+    cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
         dropout=dropout, text_conditioned=text_conditioned,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
-    cfg = TrainConfig(
-        cache_dir="/tokens",
-        ckpt_dir=f"/ckpts/{ckpt_subdir}",
-        device="cuda",
-        steps=steps,
-        batch_size=batch_size,
-        lr=lr,
-        warmup_steps=warmup_steps,
-        patience=patience,
-        eval_batches=eval_batches,
-        tags_path=tags_path,
-        lyrics_path=lyrics_path,
-        structure_path=structure_path,
-        keys_path=keys_path,
-        phonemes_path=phonemes_path,
-        segment_seconds=segment_seconds,
-        fim_prob=DEFAULTS["fim_prob"],
-        wandb_project=wandb_project or None,
-        wandb_run_name=wandb_run_name or None,
-        model=model_cfg,
-    )
+    cfg = TrainConfig(**cfg_kwargs, model=model_cfg)
     train_run(cfg, ckpt_callback=ckpts_vol.commit)
 
 
@@ -477,6 +505,18 @@ def train_remote_multi(
     use_gradient_checkpointing: bool = True,
     wandb_project: str = "",
     wandb_run_name: str = "",
+    # Fine-tune / LoRA — see _build_cfg_kwargs. NOTE: with init_from set, the
+    # architecture flags are advisory inside train_run, but the parent's CLAP
+    # precompute below still uses --d-model — it must match the base ckpt.
+    # Each rank loads the base checkpoint to CPU during startup (transient
+    # ~6 GB × n_gpus at 1.5B fp32).
+    init_from: str = "",
+    lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_targets: str = "",
+    lora_train_text_proj: bool = False,
+    data_subdir: str = "",
 ):
     import torch
     import torch.multiprocessing as mp
@@ -496,6 +536,9 @@ def train_remote_multi(
         segment_seconds=segment_seconds,
         wandb_project=wandb_project or None,
         wandb_run_name=wandb_run_name or None,
+        init_from=init_from, lora=lora, lora_r=lora_r, lora_alpha=lora_alpha,
+        lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
+        data_subdir=data_subdir,
     )
     model_kwargs = dict(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff, dropout=dropout,
@@ -570,7 +613,24 @@ def main(
     use_gradient_checkpointing: bool = True,
     wandb_project: str = "",
     wandb_run_name: str = "",
+    # Fine-tune: start from a checkpoint on nano-ckpts (e.g. "v8_sing/best.pt")
+    # with a fresh optimizer/step. Use a NEW --ckpt-subdir for the run (an
+    # existing latest.pt there would resume instead). Architecture flags are
+    # then advisory — GPTConfig comes from the checkpoint.
+    init_from: str = "",
+    # LoRA: freeze the base, train adapters only (requires --init-from).
+    # Single GPU (the default n_gpus=1) is the recommended LoRA path.
+    lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_targets: str = "",
+    lora_train_text_proj: bool = False,
+    # Train on a fine-tune corpus packed under /tokens/{data_subdir} instead
+    # of the main pack (same layout: token_cache shards, tags.json, lyrics/ …).
+    data_subdir: str = "",
 ):
+    if lora and not init_from:
+        raise SystemExit("--lora requires --init-from (e.g. --init-from v8_sing/best.pt)")
     if batch_size <= 0:
         batch_size = DDP_PER_RANK_BATCH if n_gpus > 1 else DEFAULTS["batch_size"]
         print(f"[main] batch_size auto-selected = {batch_size} "
@@ -585,6 +645,9 @@ def main(
         use_gradient_checkpointing=use_gradient_checkpointing,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
+        init_from=init_from, lora=lora, lora_r=lora_r, lora_alpha=lora_alpha,
+        lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
+        data_subdir=data_subdir,
     )
     if n_gpus > 1:
         fc = train_remote_multi.spawn(**common, n_gpus=n_gpus)
@@ -592,5 +655,10 @@ def main(
         fc = train_remote.spawn(**common)
     print(f"training launched (detached) — function call id: {fc.object_id}")
     print("monitor with: modal app logs nano-train")
-    print(f"pull checkpoints: modal volume get nano-ckpts /{ckpt_subdir}/best.pt ./checkpoints/best.pt")
+    if lora:
+        print(f"merge adapters when done: modal run diskrot/modal_merge_lora.py "
+              f"--base {init_from} --lora {ckpt_subdir}/best.pt")
+        print(f"then pull: modal volume get nano-ckpts /{ckpt_subdir}/merged_inference.pt ./checkpoints/latest.pt")
+    else:
+        print(f"pull checkpoints: modal volume get nano-ckpts /{ckpt_subdir}/best.pt ./checkpoints/best.pt")
     print(f"inspect trajectory: modal run diskrot/modal_inspect_ckpts.py --prefix {ckpt_subdir}")

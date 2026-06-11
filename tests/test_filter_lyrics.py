@@ -71,7 +71,8 @@ def test_filter_lyrics_dry_run_then_apply(tmp_path):
 
     stats = filter_lyrics(lyrics_dir, apply=False, verbose=False)
     assert stats == {"checked": 3, "flagged": 1, "by_reason": {"short": 1},
-                     "shards_rewritten": 0}
+                     "shards_rewritten": 0, "already_null": 1,
+                     "vocal_ready": 2, "total_transcribed": 4}
     data = json.loads((lyrics_dir / "lyrics_000.json").read_text())
     assert data["halluc_song"] is not None  # dry run wrote nothing
 

@@ -25,6 +25,14 @@ from torch.utils.data.distributed import DistributedSampler
 from model.codec import DACodec
 from model.delay_pattern import build_train_inputs
 from model.fim import fim_reorder_batch
+from model.lora import (
+    DEFAULT_TARGETS,
+    LoRAConfig,
+    inject_lora,
+    load_lora_state,
+    lora_state_dict,
+    mark_only_lora_trainable,
+)
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
 from diskrot.dataset import TokenDataset, collate_lyrics
@@ -68,6 +76,26 @@ class TrainConfig:
     fim_prob: float = 0.0
 
     seed: int = 42
+
+    # Fine-tuning: load model weights (and the GPTConfig, which the checkpoint
+    # carries) from this checkpoint, then start a FRESH run — new optimizer,
+    # step 0, fresh LR schedule and early-stop counters. Ignored when
+    # {ckpt_dir}/latest.pt exists: resume always wins, so an interrupted
+    # fine-tune relaunched with the same command picks up where it left off.
+    init_from: str | None = None
+    # LoRA: freeze the base model and train low-rank adapters only (requires
+    # init_from — adapters train on top of a pretrained base). Checkpoints are
+    # adapter-only (no "model" key, ~100 MB instead of multi-GB); fold them
+    # into a standard checkpoint with diskrot.merge_lora before serving.
+    lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
+    lora_targets: str = DEFAULT_TARGETS
+    # The CLAP tag projection is frozen in LoRA mode by default. Set True to
+    # train it with the adapters — it's then saved in the LoRA checkpoint and
+    # preferred over the base's copy by the merge tool.
+    lora_train_text_proj: bool = False
 
     # Distributed (multi-GPU) — DDP is active when world_size > 1.
     # batch_size is interpreted as the *per-rank* batch; global batch is
@@ -253,6 +281,8 @@ def _build_ckpt_dict(
     best_val_step: int,
     evals_without_improvement: int,
     prev_val_loss: float | None,
+    lora_payload: dict | None = None,
+    init_from: str | None = None,
 ) -> dict:
     """Build the checkpoint dict used by both the best-checkpoint and
     step-checkpoint save sites. Single source of truth for the on-disk
@@ -262,9 +292,15 @@ def _build_ckpt_dict(
     Why: the two save sites previously duplicated this dict literally,
     drifting easily and dropping fields (B2: ``prev_val_loss`` was missing
     from BOTH writers AND the reader, so resume always lost the comparison
-    baseline)."""
+    baseline).
+
+    ``lora_payload`` switches the schema to an adapter-only LoRA checkpoint:
+    the (frozen, multi-GB) base weights are NOT saved — ``"model"`` is omitted
+    and ``"lora" = {config, state, base_ckpt}`` records the adapter weights
+    plus where the base lives. ``"cfg"`` stays a pure GPTConfig dict either
+    way, so ``GPTConfig(**ckpt["cfg"])`` always works. ``init_from`` is a
+    provenance-only key on fine-tune runs (no reader depends on it)."""
     ckpt = {
-        "model": _unwrapped_state_dict(model),
         "optim": optim.state_dict(),
         "step": step,
         "cfg": cfg_model_dict,
@@ -273,6 +309,12 @@ def _build_ckpt_dict(
         "evals_without_improvement": evals_without_improvement,
         "prev_val_loss": prev_val_loss,
     }
+    if lora_payload is not None:
+        ckpt["lora"] = lora_payload
+    else:
+        ckpt["model"] = _unwrapped_state_dict(model)
+    if init_from:
+        ckpt["init_from"] = init_from
     if text_encoder is not None:
         ckpt["text_proj"] = text_encoder.proj.state_dict()
     return ckpt
@@ -295,6 +337,144 @@ def _restore_train_state(ckpt: dict) -> dict:
         "evals_without_improvement": ckpt.get("evals_without_improvement", 0),
         "prev_val_loss": ckpt.get("prev_val_loss", None),
     }
+
+
+def _strip_wrapper_prefixes(state_dict: dict) -> dict:
+    """Normalize legacy torch.compile (``_orig_mod.``) and DDP (``module.``)
+    prefixes; checkpoints written by this script are already saved bare."""
+    return {
+        k.removeprefix("_orig_mod.").removeprefix("module."): v
+        for k, v in state_dict.items()
+    }
+
+
+@dataclass
+class StartupPlan:
+    """How train_run should start, resolved by [[_resolve_startup]].
+
+    - mode="resume": continue an interrupted run from {ckpt_dir}/latest.pt
+      (``ckpt`` carries the optimizer state + loop scalars to restore).
+    - mode="init": fine-tune — ``base_state`` are pretrained weights to load,
+      but the optimizer/step/schedule start fresh (``ckpt`` is None).
+    - mode="scratch": today's from-zero path (everything None).
+
+    ``lora_cfg`` non-None means LoRA is active (inject adapters, freeze base);
+    ``lora_state`` carries saved adapter weights on a LoRA resume.
+    ``model_cfg`` non-None means the architecture comes from a checkpoint and
+    overrides the flag-built GPTConfig.
+    """
+    mode: str
+    ckpt: dict | None = None
+    base_state: dict | None = None
+    model_cfg: GPTConfig | None = None
+    lora_cfg: LoRAConfig | None = None
+    lora_state: dict | None = None
+    text_proj_state: dict | None = None
+    base_ckpt_path: str | None = None
+
+
+def _flag_lora_cfg(cfg: TrainConfig) -> LoRAConfig:
+    return LoRAConfig(r=cfg.lora_r, alpha=cfg.lora_alpha,
+                      dropout=cfg.lora_dropout, targets=cfg.lora_targets)
+
+
+def _load_base_ckpt(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"base checkpoint {path} not found — pass --init-from with the "
+            "path to the pretrained checkpoint (full or *_inference slim)"
+        )
+    return torch.load(p, map_location="cpu", weights_only=False)
+
+
+def _print_cfg_diff(flag_cfg: GPTConfig, ckpt_cfg: GPTConfig) -> None:
+    diffs = [
+        f"  {k}: {flag_cfg.__dict__[k]} (flags) -> {v} (checkpoint)"
+        for k, v in ckpt_cfg.__dict__.items()
+        if flag_cfg.__dict__.get(k) != v
+    ]
+    if diffs:
+        print("GPTConfig taken from the checkpoint; differs from flags/defaults on:")
+        for d in diffs:
+            print(d)
+
+
+def _resolve_startup(cfg: TrainConfig, verbose: bool = True) -> StartupPlan:
+    """Decide how this run starts. Precedence: an existing
+    ``{ckpt_dir}/latest.pt`` ALWAYS wins (so re-running the launch command
+    resumes an interrupted run, fine-tune or not); else ``cfg.init_from``
+    starts a fresh fine-tune from those weights; else train from scratch.
+
+    Checkpoints are loaded to CPU — the model lives on cfg.device and
+    ``load_state_dict`` copies across; optimizer state is moved to the param
+    device by ``Optimizer.load_state_dict``.
+    """
+    latest = Path(cfg.ckpt_dir) / "latest.pt"
+    if latest.exists():
+        ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+        if "lora" in ckpt:
+            # Resume an interrupted LoRA run: rebuild the frozen base from the
+            # recorded path (or --init-from), re-inject, restore adapters.
+            lora_cfg = LoRAConfig.from_dict(ckpt["lora"]["config"])
+            if cfg.lora and _flag_lora_cfg(cfg) != lora_cfg:
+                if verbose:
+                    print(f"WARNING: lora flags differ from the resumed checkpoint; "
+                          f"the checkpoint wins ({lora_cfg})")
+            base_path = cfg.init_from or ckpt["lora"].get("base_ckpt")
+            if not base_path:
+                raise FileNotFoundError(
+                    f"{latest} is a LoRA checkpoint with no recorded base — "
+                    "pass --init-from with the base checkpoint path"
+                )
+            base = _load_base_ckpt(base_path)
+            # A LoRA ckpt carries text_proj iff the run trained it — the ckpt
+            # wins over the CLI flag here too, so a bare relaunch keeps
+            # training (and saving) the projection it was training before.
+            cfg.lora_train_text_proj = "text_proj" in ckpt
+            return StartupPlan(
+                mode="resume", ckpt=ckpt,
+                base_state=_strip_wrapper_prefixes(base["model"]),
+                model_cfg=GPTConfig(**ckpt["cfg"]),
+                lora_cfg=lora_cfg,
+                lora_state=ckpt["lora"]["state"],
+                text_proj_state=ckpt.get("text_proj", base.get("text_proj")),
+                base_ckpt_path=base_path,
+            )
+        if cfg.lora:
+            raise RuntimeError(
+                f"--lora was passed but {latest} is a full (non-LoRA) checkpoint — "
+                "use a fresh --ckpt-dir for the LoRA run"
+            )
+        if cfg.init_from and verbose:
+            print(f"{latest} exists — resuming it and ignoring --init-from")
+        return StartupPlan(
+            mode="resume", ckpt=ckpt,
+            base_state=_strip_wrapper_prefixes(ckpt["model"]),
+            text_proj_state=ckpt.get("text_proj"),
+            base_ckpt_path=ckpt.get("init_from"),
+        )
+
+    if cfg.init_from:
+        ckpt = _load_base_ckpt(cfg.init_from)
+        model_cfg = GPTConfig(**ckpt["cfg"])
+        if verbose:
+            _print_cfg_diff(cfg.model, model_cfg)
+        return StartupPlan(
+            mode="init",
+            base_state=_strip_wrapper_prefixes(ckpt["model"]),
+            model_cfg=model_cfg,
+            lora_cfg=_flag_lora_cfg(cfg) if cfg.lora else None,
+            text_proj_state=ckpt.get("text_proj"),
+            base_ckpt_path=cfg.init_from,
+        )
+
+    if cfg.lora:
+        raise ValueError(
+            "--lora requires --init-from: adapters train on top of a "
+            "pretrained base, not from scratch"
+        )
+    return StartupPlan(mode="scratch")
 
 
 def _broadcast_flag(flag: bool, src: int = 0, device: str = "cuda") -> bool:
@@ -511,6 +691,24 @@ def train_run(
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
+    # Resolve resume / fine-tune / scratch BEFORE anything reads cfg.model:
+    # when starting from a checkpoint, the architecture comes from the ckpt's
+    # cfg dict (flags are advisory) and the datasets below read
+    # cfg.model.max_lyric_len.
+    plan = _resolve_startup(cfg, verbose=main)
+    if plan.model_cfg is not None:
+        cfg.model = plan.model_cfg
+        # A conditioning axis that's on in the ckpt but has no data wired up
+        # would silently train its cross-attention against nothing.
+        if main:
+            if cfg.model.use_text_conditioning and cfg.tags_path is None:
+                print("WARNING: checkpoint enables text conditioning but "
+                      "--tags-path is not set — tags train without signal")
+            if cfg.model.use_lyric_conditioning and cfg.lyrics_path is None:
+                print("WARNING: checkpoint enables lyric conditioning but "
+                      "--lyrics-path is not set — lyrics train without signal")
+    lora_active = plan.lora_cfg is not None
+
     segment_frames = int(cfg.segment_seconds * DACodec.FRAME_RATE_HZ)
     if main:
         print(f"segment_frames={segment_frames} (delayed seq len = {segment_frames + cfg.model.n_codebooks - 2})")
@@ -520,7 +718,7 @@ def train_run(
 
     if shared_bundle is not None:
         if main:
-            print(f"using preloaded mmap bundle (skipping per-rank disk load)",
+            print("using preloaded mmap bundle (skipping per-rank disk load)",
                   flush=True)
         train_ds = TokenDataset.from_mmap(
             shared_bundle, "train", segment_frames, cfg.model.max_lyric_len)
@@ -575,6 +773,27 @@ def train_run(
     if main:
         print(f"model: {n_params/1e6:.2f}M params on {cfg.device}")
 
+    # Pretrained weights (fine-tune init or LoRA base) load BEFORE the LoRA
+    # injection (LoRALinear reuses the loaded weight Parameters) and before the
+    # DDP wrap / torch.compile below.
+    if plan.base_state is not None:
+        model.load_state_dict(plan.base_state)
+        plan.base_state = None  # free the CPU copy (~6 GB at 1.5B fp32)
+        if main and plan.mode == "init":
+            print(f"initialized weights from {plan.base_ckpt_path} (fresh "
+                  f"optimizer/step — fine-tune run)")
+
+    if lora_active:
+        replaced = inject_lora(model, plan.lora_cfg)
+        if plan.lora_state is not None:
+            load_lora_state(model, plan.lora_state)
+        n_trainable, n_total = mark_only_lora_trainable(model)
+        if main:
+            print(f"LoRA active: r={plan.lora_cfg.r} alpha={plan.lora_cfg.alpha} "
+                  f"targets={plan.lora_cfg.targets} — {len(replaced)} layers, "
+                  f"trainable {n_trainable/1e6:.2f}M / {n_total/1e6:.2f}M "
+                  f"({100 * n_trainable / n_total:.2f}%)")
+
     # text conditioning
     text_encoder: CLAPTextEncoder | None = None
     tag_cache: dict[str, torch.Tensor] = {}
@@ -591,6 +810,10 @@ def train_run(
         # Broadcast happens regardless of resume: if a checkpoint is loaded
         # later, all ranks load the same on-disk weights, so they stay in sync.
         _broadcast_module_params(text_encoder.proj, src=0)
+        # Pretrained projection (resume or fine-tune init). Loading after the
+        # broadcast is fine: every rank loads the same on-disk weights.
+        if plan.text_proj_state is not None:
+            text_encoder.proj.load_state_dict(plan.text_proj_state)
         if main:
             print(f"text conditioning enabled (cfg_dropout={cfg.cfg_dropout})")
         if precomputed_tag_cache is not None:
@@ -663,15 +886,39 @@ def train_run(
         if main:
             print("torch.compile enabled")
 
-    # only train the model params + text_encoder projection (CLAP itself is frozen)
-    trainable = list(model.parameters())
-    if text_encoder is not None:
+    # Only train params that require grad (everything in full/scratch mode;
+    # just the adapters in LoRA mode) + the text_encoder projection (CLAP
+    # itself is always frozen). The proj is frozen too in LoRA mode unless
+    # opted in — its grad all-reduce in the step loop is skipped when frozen.
+    proj_trainable = text_encoder is not None and (
+        not lora_active or cfg.lora_train_text_proj
+    )
+    if text_encoder is not None and not proj_trainable:
+        text_encoder.proj.requires_grad_(False)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if proj_trainable:
         trainable += list(text_encoder.proj.parameters())
     optim = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay,
                               betas=(0.9, 0.95), fused=(cfg.device == "cuda"))
 
     amp_enabled = cfg.device == "cuda"
     scaler = torch.amp.GradScaler(cfg.device, enabled=amp_enabled)
+
+    def _lora_payload() -> dict | None:
+        """Adapter-only checkpoint payload (None in full/scratch mode). The
+        frozen base is referenced by path, not copied — see _build_ckpt_dict."""
+        if not lora_active:
+            return None
+        return {
+            "config": plan.lora_cfg.to_dict(),
+            "state": lora_state_dict(_unwrap(model)),
+            "base_ckpt": plan.base_ckpt_path,
+        }
+
+    # In LoRA mode with a frozen proj, the checkpoint must NOT carry text_proj
+    # (the merge tool would prefer it over the base's; the base's copy is the
+    # trained one). _build_ckpt_dict skips it when handed None.
+    ckpt_text_encoder = text_encoder if proj_trainable else None
 
     Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
     pad_id = cfg.model.pad_id
@@ -682,28 +929,22 @@ def train_run(
     evals_without_improvement = 0
     prev_val_loss: float | None = None
     val_history: deque[float] = deque(maxlen=5)
-    resume_path = Path(cfg.ckpt_dir) / "latest.pt"
-    if resume_path.exists():
-        ckpt = torch.load(resume_path, map_location=cfg.device, weights_only=False)
-        state_dict = ckpt["model"]
-        # Normalize any legacy compile/DDP prefixes; checkpoints written by this
-        # script are already saved bare via ``_unwrapped_state_dict``.
-        state_dict = {
-            k.removeprefix("_orig_mod.").removeprefix("module."): v
-            for k, v in state_dict.items()
-        }
-        _unwrap(model).load_state_dict(state_dict)
-        optim.load_state_dict(ckpt["optim"])
-        if text_encoder is not None and "text_proj" in ckpt:
-            text_encoder.proj.load_state_dict(ckpt["text_proj"])
-        restored = _restore_train_state(ckpt)
+    if plan.mode == "resume":
+        # Model (and LoRA adapter) weights were already loaded before the DDP
+        # wrap; here we restore the optimizer + loop scalars. Optimizer state
+        # was loaded to CPU — Optimizer.load_state_dict moves it to the param
+        # device. init mode restores nothing: fresh optimizer, step 0, fresh
+        # warmup/cosine schedule and early-stop counters.
+        optim.load_state_dict(plan.ckpt["optim"])
+        restored = _restore_train_state(plan.ckpt)
         step = restored["step"]
         best_val_loss = restored["best_val_loss"]
         best_val_step = restored["best_val_step"]
         evals_without_improvement = restored["evals_without_improvement"]
         prev_val_loss = restored["prev_val_loss"]
+        plan.ckpt = None  # free the CPU copy
         if main:
-            print(f"resumed from {resume_path} at step {step}")
+            print(f"resumed from {Path(cfg.ckpt_dir) / 'latest.pt'} at step {step}")
     t0 = time.time()
     running: torch.Tensor | None = None
     running_count = 0
@@ -779,8 +1020,9 @@ def train_run(
         # DDP wraps `model` and auto-averages its grads via .backward()'s comm
         # hook. text_encoder.proj is OUTSIDE that wrapper, so its grads are
         # per-rank — we have to all-reduce them ourselves before the optim step
-        # to keep ranks in sync.
-        if text_encoder is not None:
+        # to keep ranks in sync. Skipped when proj is frozen (LoRA mode): no
+        # grads exist and no rank enters the collective, so no deadlock.
+        if proj_trainable:
             _all_reduce_module_grads(text_encoder.proj)
         # Clip the same combined param list the optimizer trains
         # (model + text_encoder.proj if present). Clipping only model.parameters()
@@ -882,12 +1124,14 @@ def train_run(
                 if main:
                     best_path = Path(cfg.ckpt_dir) / "best.pt"
                     ckpt_data = _build_ckpt_dict(
-                        model=model, optim=optim, text_encoder=text_encoder,
+                        model=model, optim=optim, text_encoder=ckpt_text_encoder,
                         cfg_model_dict=cfg.model.__dict__,
                         step=step, best_val_loss=best_val_loss,
                         best_val_step=best_val_step,
                         evals_without_improvement=evals_without_improvement,
                         prev_val_loss=prev_val_loss,
+                        lora_payload=_lora_payload(),
+                        init_from=cfg.init_from or plan.base_ckpt_path,
                     )
                     torch.save(ckpt_data, best_path)
                     print(f"  checkup at step {step:>6}  score {val_loss:.4f}  "
@@ -914,12 +1158,14 @@ def train_run(
         if step % cfg.ckpt_every == 0 or step == cfg.steps:
             if main:
                 ckpt = _build_ckpt_dict(
-                    model=model, optim=optim, text_encoder=text_encoder,
+                    model=model, optim=optim, text_encoder=ckpt_text_encoder,
                     cfg_model_dict=cfg.model.__dict__,
                     step=step, best_val_loss=best_val_loss,
                     best_val_step=best_val_step,
                     evals_without_improvement=evals_without_improvement,
                     prev_val_loss=prev_val_loss,
+                    lora_payload=_lora_payload(),
+                    init_from=cfg.init_from or plan.base_ckpt_path,
                 )
                 p = Path(cfg.ckpt_dir) / f"step_{step:07d}.pt"
                 torch.save(ckpt, p)
@@ -952,11 +1198,29 @@ if __name__ == "__main__":
     p.add_argument("--melody", action="store_true",
                    help="enable melody (chroma) conditioning — requires the pack to "
                         "have been built with --mel-cache-dir (parallel .mel.bin)")
+    p.add_argument("--init-from", type=str, default=None,
+                   help="fine-tune: load model weights + GPTConfig from this checkpoint "
+                        "and start a fresh run (new optimizer/step/schedule). Ignored "
+                        "when {ckpt-dir}/latest.pt exists — resume always wins")
+    p.add_argument("--lora", action="store_true",
+                   help="freeze the base and train LoRA adapters only (requires "
+                        "--init-from). Saves small adapter-only checkpoints; merge "
+                        "with `python -m diskrot.merge_lora` before serving")
+    p.add_argument("--lora-r", type=int, default=16, help="LoRA rank")
+    p.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha (scaling = alpha/r)")
+    p.add_argument("--lora-dropout", type=float, default=0.0, help="dropout on the LoRA path")
+    p.add_argument("--lora-targets", type=str, default=DEFAULT_TARGETS,
+                   help="comma-separated Linear-name suffixes under model.blocks to adapt")
+    p.add_argument("--lora-train-text-proj", action="store_true",
+                   help="also train the CLAP tag projection in LoRA mode (frozen by default)")
     args = p.parse_args()
 
     # Tags drive the pooled-CLAP path (use_text_conditioning); lyrics drive the
     # phoneme LyricEncoder path (use_lyric_conditioning) — independent flags now.
     # Melody drives the additive chroma path (use_melody_conditioning).
+    # With --init-from, this flag-built GPTConfig is advisory only: train_run
+    # replaces it with the checkpoint's cfg (so a fine-tune/LoRA run always
+    # matches the base architecture and conditioning axes).
     model_cfg = GPTConfig(
         use_text_conditioning=args.tags_path is not None,
         use_lyric_conditioning=args.lyrics_path is not None,
@@ -975,6 +1239,13 @@ if __name__ == "__main__":
         structure_path=args.structure_path,
         keys_path=args.keys_path,
         phonemes_path=args.phonemes_path,
+        init_from=args.init_from,
+        lora=args.lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_targets=args.lora_targets,
+        lora_train_text_proj=args.lora_train_text_proj,
         model=model_cfg,
     )
     train_run(cfg)

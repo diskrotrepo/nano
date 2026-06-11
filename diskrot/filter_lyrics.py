@@ -96,7 +96,7 @@ def filter_lyrics(
     after each shard rewrite. Returns
     ``{"checked", "flagged", "by_reason", "shards_rewritten"}``."""
     lyrics_dir = Path(lyrics_dir)
-    n_checked = n_flagged = n_shards = 0
+    n_checked = n_flagged = n_shards = n_null = 0
     by_reason: dict[str, int] = {}
 
     for shard in sorted(lyrics_dir.glob("lyrics_*.json")):
@@ -104,6 +104,7 @@ def filter_lyrics(
         flagged = []
         for name, entry in data.items():
             if entry is None:
+                n_null += 1
                 continue
             n_checked += 1
             reason = hallucination_reason(entry)
@@ -124,15 +125,26 @@ def filter_lyrics(
             print(f"[filter] {shard.name}: {len(flagged)} hallucinated"
                   f"{' -> nulled' if apply else ' (dry run)'}", flush=True)
 
+    n_ready = n_checked - n_flagged
+    n_total = n_null + n_checked
     if verbose:
         mode = "applied" if apply else "DRY RUN (pass --apply to write)"
         print(f"[filter] {mode}: {n_flagged}/{n_checked} with-words entries "
               f"flagged {by_reason}, {n_shards} shard(s) rewritten", flush=True)
+        pct = (lambda n: f"{100 * n / n_total:.1f}%") if n_total else (lambda n: "-")
+        print(f"[filter] lyric dataset health: {n_total} songs transcribed\n"
+              f"[filter]   instrumental (null):        {n_null:>7} ({pct(n_null)})\n"
+              f"[filter]   hallucinated (-> null):     {n_flagged:>7} ({pct(n_flagged)})\n"
+              f"[filter]   vocal-ready (real lyrics):  {n_ready:>7} ({pct(n_ready)})",
+              flush=True)
     return {
         "checked": n_checked,
         "flagged": n_flagged,
         "by_reason": by_reason,
         "shards_rewritten": n_shards,
+        "already_null": n_null,
+        "vocal_ready": n_ready,
+        "total_transcribed": n_total,
     }
 
 

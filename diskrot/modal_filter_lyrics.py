@@ -34,6 +34,7 @@ image = (
 )
 
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
+corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
 
 
 @app.function(
@@ -41,9 +42,11 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     cpu=2.0,
     memory=4 * 1024,
     timeout=60 * 30,
-    volumes={"/tokens": tokens_vol},
+    volumes={"/tokens": tokens_vol, "/corpus": corpus_vol},
 )
 def filter_remote(apply: bool = False) -> dict:
+    from pathlib import Path
+
     from diskrot.filter_lyrics import filter_lyrics
 
     stats = filter_lyrics(
@@ -52,6 +55,13 @@ def filter_remote(apply: bool = False) -> dict:
     )
     if apply:
         tokens_vol.commit()  # idempotent safety net
+    # Corpus coverage: songs with no shard entry at all were never transcribed
+    # (they train as <unknown_vocals>, NOT <instrumental> — different marker).
+    n_mp3s = sum(1 for _ in Path("/corpus").glob("*.mp3"))
+    stats["corpus_mp3s"] = n_mp3s
+    stats["never_transcribed"] = n_mp3s - stats["total_transcribed"]
+    print(f"[filter]   never transcribed:          {stats['never_transcribed']:>7} "
+          f"(of {n_mp3s} corpus mp3s -> <unknown_vocals> at train time)", flush=True)
     return stats
 
 
