@@ -8,6 +8,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -58,6 +59,19 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 class Transcriber:
     @modal.enter()
     def load_models(self):
+        # Eagerly import scipy.signal and warm the librosa kernels the per-song
+        # path otherwise hits lazily (resample, pyin). A lazy import that dies
+        # mid-song (import race / transient memory pressure) leaves sys.modules
+        # permanently broken — the container then insta-fails every input with
+        # "name '_signal_api' is not defined" and eats the queue at ~3s/song
+        # (observed 2026-06-10, ~84% of a run's results dropped).
+        import numpy as np
+        import scipy.signal  # noqa: F401
+        import librosa
+
+        librosa.resample(np.zeros(1600, dtype=np.float32), orig_sr=44100, target_sr=16000)
+        librosa.pyin(np.zeros(8000, dtype=np.float32), sr=16000, fmin=65.0, fmax=1047.0)
+
         from demucs.apply import apply_model
         from demucs.pretrained import get_model
         from faster_whisper import WhisperModel
@@ -66,7 +80,10 @@ class Transcriber:
         self.demucs_model.to("cuda")
         self.demucs_model.eval()
         self.apply_fn = apply_model
-        self.whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        # large-v3-turbo: 4 decoder layers vs 32, ~4-6x faster ASR at near-identical
+        # transcription quality. The first ~30k songs were done with large-v3; the
+        # transcript mix is fine for training data.
+        self.whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
 
     @modal.method()
     def transcribe_file(self, mp3_name: str) -> tuple[str, dict | None, str | None]:
@@ -79,6 +96,13 @@ class Transcriber:
             vocals = _separate_vocals(self.demucs_model, self.apply_fn, mp3_path, "cuda")
             result = _transcribe(self.whisper_model, vocals)
             return (key, result, None)
+        except NameError as e:
+            # Poisoned module state (a lazy import died and left sys.modules
+            # broken): every later input in this container would insta-fail the
+            # same way. Die so Modal replaces the container; this input stays
+            # pending and is redone on a healthy one.
+            print(f"poisoned container ({e}); exiting so Modal replaces it", flush=True)
+            os._exit(13)
         except Exception as e:
             return (key, None, str(e))
 
@@ -169,30 +193,39 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     timeout=24 * 60 * 60,
 )
-def _acquire_lock() -> bool:
+def _acquire_lock(call_id: str) -> bool:
     """Best-effort single-orchestrator lease on the volume.
 
     Returns False if a fresh lock from another orchestrator is present (refuse to
     start so two runs don't race read-merge-write on the same shard). A lock older
-    than ``LOCK_STALE_SEC`` is a dead run and is reclaimed. Best-effort: two runs
-    that start within the same reload window can both acquire — that's a rare
-    operator double-launch, and the synchronous flush path bounds the damage.
+    than ``LOCK_STALE_SEC`` is a dead run and is reclaimed. The lock is re-entrant
+    by ``call_id``: a restarted orchestrate attempt (same function call, new
+    runner) reclaims its own lock instead of refusing and stranding the run.
+    Best-effort: two runs that start within the same reload window can both
+    acquire — that's a rare operator double-launch, and the synchronous flush
+    path bounds the damage.
     """
     from diskrot.transcribe_lyrics import _atomic_write_json
 
     tokens_vol.reload()
     lock = Path(LOCK_PATH)
     if lock.exists():
+        owner = None
         try:
-            age = time.time() - json.loads(lock.read_text()).get("started_at", 0)
+            data = json.loads(lock.read_text())
+            owner = data.get("call_id")
+            age = time.time() - data.get("started_at", 0)
         except Exception:
             age = 0  # unreadable lock — treat as fresh and refuse, to be safe
-        if age < LOCK_STALE_SEC:
+        if owner == call_id:
+            print("Re-acquiring own lock after orchestrator restart.")
+        elif age < LOCK_STALE_SEC:
             print(f"Another orchestrator holds the lock (age {age:.0f}s < "
                   f"{LOCK_STALE_SEC}s) — refusing to start. Stop it first or wait.")
             return False
-        print(f"Reclaiming stale lock (age {age:.0f}s).")
-    _atomic_write_json(LOCK_PATH, {"started_at": time.time()})
+        else:
+            print(f"Reclaiming stale lock (age {age:.0f}s).")
+    _atomic_write_json(LOCK_PATH, {"started_at": time.time(), "call_id": call_id})
     tokens_vol.commit()
     return True
 
@@ -213,6 +246,12 @@ def _release_lock() -> None:
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     timeout=24 * 60 * 60,
+    # The orchestrator is the run's single point of failure: a preempted-and-
+    # restarted orchestrate would refuse on its own fresh lock and silently end
+    # the run. 3x CPU/mem pricing on one small container is nothing next to the
+    # L4 fleet. (GPU workers can't opt out, but their preemption is harmless —
+    # the file just stays pending.)
+    nonpreemptible=True,
 )
 def orchestrate(flush_every: int = 2000):
     """Dispatch transcription and merge results into the sharded lyrics dir.
@@ -233,7 +272,7 @@ def orchestrate(flush_every: int = 2000):
     loss. A lease lock (see ``_acquire_lock``) refuses a concurrent second run.
     ``list_pending`` skips songs already in the shards, so re-launching resumes.
     """
-    if not _acquire_lock.remote():
+    if not _acquire_lock.remote(modal.current_function_call_id()):
         return
     try:
         pending = list_pending.remote()
