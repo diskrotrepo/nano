@@ -81,12 +81,14 @@ Each stream drops independently for classifier-free guidance (10% each during tr
 - `dac_roundtrip.py` — DAC encode/decode sanity check. Writes orig + reconstructed WAVs.
 - `eval_checkpoint.py` — Evaluate a checkpoint (loss / generation sanity check).
 - `eval_train_vs_val.py` — Compare train vs val loss for a checkpoint (overfitting check).
+- `lyrics_audit.py` — Lyric-data health audit (Modal CPU, read-only): per-stream coverage of the packed corpus (tags/structure/keys/lyrics/phonemes), instrumental/hallucinated/vocal-ready breakdown, gender + word-count distributions, top keys. Safe mid-transcribe. `modal run scripts/lyrics_audit.py`.
 
 ### Claude skills (`.claude/skills/`)
 Task runbooks that orchestrate the CLIs above (link the READMEs, don't duplicate them):
 - `add-songs` — full data-prep pipeline (upload → prepare → tokenize → pack → tag → transcribe).
 - `train-model` — launch/monitor/resume training; extract a slim model + download the best checkpoint. Includes `references/reading-logs.md`.
 - `eval-checkpoint` — route to the right diagnostic (sample quality, overfitting, lyric ablation, sampling sweep, genre coverage, codec fidelity).
+- `eval-lyrics` — lyric data health (coverage audit, hallucination filter, gender/word-count distributions) + routing to the model-side lyric evals.
 - `run-tests` — pytest suite, benchmark marker, `synth_tokens_dir` fixture.
 - `serve-model` — local/Modal inference server and the generation endpoints.
 

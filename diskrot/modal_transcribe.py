@@ -303,7 +303,7 @@ def _release_lock() -> None:
     # the file just stays pending.)
     nonpreemptible=True,
 )
-def orchestrate(flush_every: int = 5000, chunk_size: int = 15000):
+def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
     """Dispatch transcription and merge results into the sharded lyrics dir.
 
     Runs the ``.map()`` collect/flush loop *remotely* (not in local_entrypoint)
@@ -311,14 +311,17 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 15000):
     this loop locally, so closing the terminal killed the result-collector even
     though the worker containers kept running and billing.
 
-    Dispatches in **chunks** (default 15k ≈ 1.5h of fleet work) inside a
+    Dispatches in **chunks** (default 3k ≈ 20-30 min of fleet work) inside a
     **sweep loop** that re-lists pending files until they stop shrinking.
     One giant ``.map()`` held ~190k inputs outstanding for ~20h, and twice on
     2026-06-11 a server-side event cancelled tens of thousands of queued inputs
     en masse (``RemoteError: Function call was cancelled...``) roughly an hour
     into the run. Chunking caps the exposure (a storm can only kill the current
     chunk) and the sweep loop automatically re-queues whatever was cancelled —
-    no more manual "final sweep" relaunches.
+    no more manual "final sweep" relaunches. 15k chunks still lost the back
+    ~60% of every chunk to the waves (inputs queued ≳1.5h get reaped); 3k
+    keeps queue residence under ~30 min, below the observed kill window,
+    while paying the end-of-chunk straggler idle 5× less often than 1k would.
 
     Flushes partial results every ``flush_every`` completions (default 5000).
     The flushing path uses synchronous ``save_results.remote(...)`` so two writers
@@ -415,7 +418,7 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 15000):
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 5000, chunk_size: int = 15000):
+def main(flush_every: int = 5000, chunk_size: int = 3000):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are

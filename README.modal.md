@@ -136,6 +136,8 @@ modal run diskrot/modal_filter_lyrics.py --apply    # rewrite shards
 
 Flags entries with fewer than 6 valid words, or a known caption-artifact phrase ("thank you for watching", "subscribe", …) in a transcript under 30 words — long real lyrics that merely mention such a phrase survive. Rewrites are atomic per shard and the pass is idempotent. **Run it only after the transcribe fleet has fully finished** (the transcribe orchestrator holds shard contents in memory and its next flush would clobber concurrent edits), and before phonemize so junk never enters the phoneme store.
 
+To see the overall state of the lyric data at any point — per-stream coverage of the packed corpus, instrumental/hallucinated/vocal-ready breakdown, gender and word-count distributions — run the read-only audit ([scripts/lyrics_audit.py](scripts/lyrics_audit.py), safe even mid-transcribe): `modal run scripts/lyrics_audit.py`.
+
 ## 4d. Phonemize (recommended after transcribe + filter)
 
 Pre-runs g2p over every transcribed song and writes the per-word phoneme-id groups to a sharded `phonemes/` dir ([modal_phonemize.py](diskrot/modal_phonemize.py)):
