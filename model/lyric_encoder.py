@@ -451,9 +451,23 @@ def text_to_phoneme_ids(
     if not text or not text.strip():
         return []
     g2p = _get_g2p()
+    try:
+        syms = list(g2p(text))
+    except Exception:
+        # g2p_en expands digit runs via inflect, which raises NumOutOfRangeError
+        # on absurd numbers (real Whisper-transcript garbage). Retry per word so
+        # a single bad token drops only itself — deterministically, on both the
+        # train and inference paths.
+        syms = []
+        for w in text.split():
+            try:
+                syms.extend(g2p(w))
+            except Exception:
+                continue
+            syms.append(" ")
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
     prev_boundary = True  # suppress a leading boundary token
-    for sym in g2p(text):
+    for sym in syms:
         pid = PHONEME_TO_ID.get(sym)
         if pid is not None:
             ids.append(pid)
@@ -484,24 +498,34 @@ def text_to_word_phoneme_groups(words: list[str]) -> list[list[int]]:
     if not words:
         return []
     g2p = _get_g2p()
-    groups: list[list[int]] = [[]]
-    for sym in g2p(" ".join(words)):
-        if sym == " ":
-            groups.append([])
-            continue
-        pid = PHONEME_TO_ID.get(sym)
-        if pid is not None:
-            groups[-1].append(pid)
-        # non-space punctuation / artifacts: dropped (don't split the word; UNK
-        # is reserved, never emitted — keeps train/inference id streams identical)
-    if len(groups) == len(words):
-        return groups
+    try:
+        groups: list[list[int]] = [[]]
+        for sym in g2p(" ".join(words)):
+            if sym == " ":
+                groups.append([])
+                continue
+            pid = PHONEME_TO_ID.get(sym)
+            if pid is not None:
+                groups[-1].append(pid)
+            # non-space punctuation / artifacts: dropped (don't split the word; UNK
+            # is reserved, never emitted — keeps train/inference id streams identical)
+        if len(groups) == len(words):
+            return groups
+    except Exception:
+        # g2p_en's inflect number expansion raises on absurd digit runs (Whisper
+        # garbage) — fall through to per-word, where the bad word yields [].
+        pass
     # Alignment drift — phonemize each word independently (loses some context but
     # guarantees the per-word grouping the dataset needs).
-    return [
-        [PHONEME_TO_ID[s] for s in g2p(w) if s in PHONEME_TO_ID]
-        for w in words
-    ]
+    return [_word_phoneme_ids(g2p, w) for w in words]
+
+
+def _word_phoneme_ids(g2p, word: str) -> list[int]:
+    """Phonemize one word; a word g2p can't handle yields an empty group."""
+    try:
+        return [PHONEME_TO_ID[s] for s in g2p(word) if s in PHONEME_TO_ID]
+    except Exception:
+        return []
 
 
 # --- Structure-marker stream assembly -----------------------------------------

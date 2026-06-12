@@ -44,6 +44,7 @@ from model.lyric_encoder import (
     parse_tempo_label,
     structure_label_to_id,
     text_to_phoneme_ids,
+    text_to_word_phoneme_groups,
     text_with_markers_to_phoneme_ids,
     vocal_label_to_id,
 )
@@ -415,6 +416,29 @@ def test_no_bos_option_and_no_leading_or_trailing_boundary():
 def test_max_len_truncates():
     long_line = "singing the blues all night long forever and ever amen"
     assert len(text_to_phoneme_ids(long_line, max_len=7)) == 7
+
+
+# g2p_en expands digit runs via inflect.number_to_words, which raises
+# NumOutOfRangeError past ~10^66 — and Whisper transcripts contain such garbage
+# (killed the 2026-06-12 phonemize corpus pass). One bad token must only drop
+# itself, never the song (or the whole pass).
+_INFLECT_BOMB = "9" * 80
+
+
+@g2p_required
+def test_text_to_phoneme_ids_survives_inflect_bomb():
+    ids = text_to_phoneme_ids(f"hello {_INFLECT_BOMB} world")
+    assert ids, "surrounding words should still phonemize"
+    assert all(0 <= i < PHONEME_VOCAB_SIZE for i in ids)
+
+
+@g2p_required
+def test_word_groups_survive_inflect_bomb_and_keep_alignment():
+    words = ["hello", _INFLECT_BOMB, "world"]
+    groups = text_to_word_phoneme_groups(words)
+    assert len(groups) == len(words), "1:1 word→group alignment must hold"
+    assert groups[0] and groups[2], "good words should still phonemize"
+    assert groups[1] == [], "the bad word yields an empty group"
 
 
 # --- encoder -----------------------------------------------------------------
