@@ -33,6 +33,8 @@ Pull checkpoints back when training is done (substitute the subdir):
 """
 from __future__ import annotations
 
+import threading
+
 import modal
 
 app = modal.App("nano-train")
@@ -63,8 +65,14 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
     .pip_install(
-        "torch>=2.4",
-        "torchaudio>=2.4",
+        # Pinned EXACTLY (not >=): the torch version is part of every
+        # torch.compile cache key, so an incidental image rebuild that pulled a
+        # newer torch would invalidate the whole nano-compile-cache volume and
+        # silently re-pay the ~35-min cold compile. Bump deliberately (and
+        # expect one cold compile to reseed when you do). triton ships with
+        # torch (3.7.0 with this pair) — no separate pin needed.
+        "torch==2.12.0",
+        "torchaudio==2.11.0",
         "librosa>=0.10",
         "descript-audio-codec>=1.0.0",
         "numpy>=1.26",
@@ -80,11 +88,35 @@ image = (
     .run_commands("pip install 'protobuf>=4.25,<5'")
     .run_function(_prefetch_clap)
     .run_function(_prefetch_g2p)
+    # Persist torch.compile artifacts (Inductor FX graphs + Triton kernels) on
+    # the nano-compile-cache volume so container restarts — the 24h-timeout
+    # auto-retries, preemption resumes, manual relaunches — compile warm
+    # (~minutes) instead of re-paying the ~35-min cold window on 8 idle GPUs.
+    # Cache keys include code/torch-version/GPU-arch hashes, so a model edit
+    # just re-pays one cold compile and reseeds. mp.spawn workers inherit env.
+    .env({
+        "TORCHINDUCTOR_CACHE_DIR": "/compile-cache/inductor",
+        "TRITON_CACHE_DIR": "/compile-cache/triton",
+        "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",  # explicit; default varies by torch version
+    })
     .add_local_python_source("model", "diskrot")
 )
 
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 ckpts_vol = modal.Volume.from_name("nano-ckpts", create_if_missing=True)
+# torch.compile cache (see image .env above). All 8 DDP ranks write the same
+# dir concurrently; Inductor's file locking is built for concurrent processes —
+# worst case on a network volume is duplicated compile work, not corruption.
+compile_cache_vol = modal.Volume.from_name("nano-compile-cache", create_if_missing=True)
+
+
+def _commit_quietly(vol: modal.Volume) -> None:
+    """Commit a volume, swallowing transient RPC errors — a cache commit must
+    never kill the run (cf. the volume.commit crash-storm in tokenize/transcribe)."""
+    try:
+        vol.commit()
+    except Exception as e:
+        print(f"[compile-cache] commit failed (ignored): {e}", flush=True)
 
 # WandB secret: mounted into training containers so train.py's _init_wandb()
 # sees WANDB_API_KEY and can call wandb.init(). The secret must already exist;
@@ -121,8 +153,14 @@ DEFAULTS = {
                                    # because 60s doubles the sequence — per-rank token
                                    # load (4×5160) is identical to the old 30s 8×2580
                                    # that fit, so memory holds. tokens/step unchanged.
-    "lr": 2.1e-4,                  # sqrt-scaled for the halved global batch (3.0e-4×√½)
-    "warmup_steps": 5000,
+    # Stability (2026-06-12): both v8 launches at the sqrt-scaled 2.1e-4 target
+    # diverged cb0-first during warmup (onset ~5e-5–1.2e-4, the second one even
+    # with the zero-gated conditioning init; Adam beta2 was already 0.95). Fix =
+    # QK-norm (the structural piece, see GPTConfig.use_qk_norm) + a lower peak
+    # and gentler ramp for margin.
+    "lr": 1.5e-4,
+    "warmup_steps": 10_000,
+    "use_qk_norm": True,
     "steps": 400_000,
     "patience": 20,
     "eval_batches": 50,
@@ -235,6 +273,7 @@ def _build_model_cfg(
     melody_n_bins: int = DEFAULTS["melody_n_bins"],
     melody_enc_layers: int = DEFAULTS["melody_enc_layers"],
     use_fim: bool = DEFAULTS["use_fim"],
+    use_qk_norm: bool = DEFAULTS["use_qk_norm"],
 ):
     from model.nano_audio_gpt import GPTConfig
 
@@ -257,6 +296,7 @@ def _build_model_cfg(
         max_lyric_len=max_lyric_len,
         melody_n_bins=melody_n_bins,
         melody_enc_layers=melody_enc_layers,
+        use_qk_norm=use_qk_norm,
     )
 
 
@@ -405,7 +445,8 @@ def _precompute_clap_cache(unique_tags: list[str], d_model: int,
     image=image,
     gpu="H100",
     timeout=60 * 60 * 12,  # 12 hours
-    volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol},
+    volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol,
+             "/compile-cache": compile_cache_vol},
     secrets=[wandb_secret],
     # Self-heal on worker preemption. train_run() auto-resumes from latest.pt
     # (and wandb resume="allow"), so a restart picks up at the last checkpoint
@@ -467,7 +508,10 @@ def train_remote(
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
     cfg = TrainConfig(**cfg_kwargs, model=model_cfg)
-    train_run(cfg, ckpt_callback=ckpts_vol.commit)
+    try:
+        train_run(cfg, ckpt_callback=ckpts_vol.commit)
+    finally:
+        _commit_quietly(compile_cache_vol)  # persist the seeded compile cache
 
 
 # Multi-GPU DDP — 8×H100 in a single container, ranks coordinated via mp.spawn.
@@ -478,7 +522,8 @@ def train_remote(
     image=image,
     gpu="H100:8",
     timeout=60 * 60 * 24,  # 24 hours
-    volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol},
+    volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol,
+             "/compile-cache": compile_cache_vol},
     secrets=[wandb_secret],
     # Self-heal on worker preemption — see train_remote(). Auto-resume from
     # latest.pt makes a restart cheap; the DDP ranks re-spawn fresh each time.
@@ -574,11 +619,25 @@ def train_remote_multi(
         unique_tags = sorted(set(shared_bundle["tags"].values()))
         tag_cache = _precompute_clap_cache(unique_tags, d_model, n_gpus=n_gpus)
 
-    mp.spawn(
-        _ddp_worker,
-        args=(n_gpus, cfg_kwargs, model_kwargs, shared_bundle, tag_cache),
-        nprocs=n_gpus, join=True,
-    )
+    # Periodically persist the torch.compile cache while the ranks run, so the
+    # ~35-min cold-compile artifacts survive even if this container dies mid-run
+    # (a daemon thread; the join below ends it with the process).
+    stop_commits = threading.Event()
+
+    def _cache_committer():
+        while not stop_commits.wait(600):
+            _commit_quietly(compile_cache_vol)
+
+    threading.Thread(target=_cache_committer, daemon=True).start()
+    try:
+        mp.spawn(
+            _ddp_worker,
+            args=(n_gpus, cfg_kwargs, model_kwargs, shared_bundle, tag_cache),
+            nprocs=n_gpus, join=True,
+        )
+    finally:
+        stop_commits.set()
+        _commit_quietly(compile_cache_vol)
     # Final commit from the parent process catches anything rank 0 wrote after
     # its last incremental commit.
     ckpts_vol.commit()

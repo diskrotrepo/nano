@@ -64,6 +64,12 @@ class MelodyEncoder(nn.Module):
         # starts as a small learnable vector rather than exactly zero.
         with torch.no_grad():
             self.null.normal_(std=0.02)
+        # Zero-gamma gate: with ln_final's gain at zero the encoded melody is
+        # exactly zero at init — an additive no-op for the decoder — and fades
+        # in smoothly as the gain learns. Zeroing out_proj would NOT gate this:
+        # RMSNorm rescales any nonzero input back to unit RMS. (Same stability
+        # hardening as the zeroed cross-attn out-projs in NanoAudioGPT.)
+        nn.init.zeros_(self.ln_final.weight)
 
     @staticmethod
     def _init_weights(m: nn.Module) -> None:

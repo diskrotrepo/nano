@@ -7,6 +7,7 @@ the next token for each codebook. Sized to ~1.5B params with the default config
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -112,6 +113,16 @@ class GPTConfig:
     use_fim: bool = False
     rope_base: float = 10000.0
     use_gradient_checkpointing: bool = True
+    # QK-norm: RMSNorm on the per-head queries/keys of self-attention and both
+    # cross-attentions (Gemma 2 / OLMo 2 / Qwen style). Bounds attention logits
+    # regardless of LR — both 2026-06-12 v8 launches diverged cb0-first with the
+    # classic logit-growth signature (onset ~5e-5–1.2e-4, even after the
+    # zero-gated conditioning init and with Adam beta2 already 0.95); this is
+    # the structural fix. Default False so pre-qk-norm checkpoint cfg dicts
+    # (v7) still load everywhere GPTConfig(**ckpt["cfg"]) is called; the train
+    # entrypoints (DEFAULTS / TrainConfig) enable it explicitly, and v8+
+    # checkpoints carry the key in their saved cfg.
+    use_qk_norm: bool = False
 
     @property
     def n_control(self) -> int:
@@ -147,6 +158,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = cfg.d_model // cfg.n_heads
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # Per-head-dim gains, shared across heads (Qwen style). See
+        # GPTConfig.use_qk_norm for why.
+        self.q_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
+        self.k_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
         self.dropout = cfg.dropout
 
     def forward(
@@ -161,6 +176,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # QK-norm before RoPE (and before the cache write, so cached keys are
+        # already normed — decode steps see the identical transform).
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Apply RoPE *before* writing to cache so cached keys carry their
         # original positions; subsequent decode steps don't need to re-rotate.
@@ -205,6 +226,11 @@ class CrossAttention(nn.Module):
         self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.kv_proj = nn.Linear(cfg.d_model, 2 * cfg.d_model, bias=False)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # See GPTConfig.use_qk_norm. RMSNorm(0) == 0, so the zeros-uncond
+        # convention (zero cond embedding == skipping the block exactly,
+        # tests/test_cfg_uncond.py) survives the norm.
+        self.q_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
+        self.k_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
         self.dropout = cfg.dropout
 
     def forward(
@@ -225,6 +251,9 @@ class CrossAttention(nn.Module):
         k, v = self.kv_proj(cond).split(D, dim=-1)
         k = k.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=kv_mask,
@@ -354,6 +383,23 @@ class NanoAudioGPT(nn.Module):
             cfg.d_model, cfg.n_codebooks * cfg.vocab_with_pad, bias=False
         )
         self.apply(self._init_weights)
+        # Stability hardening (v8 diverged at lr ~4e-5 without it, cb0-led):
+        # (1) GPT-2 depth-scaled init on the residual out-projs — each block
+        # adds up to 4 streams to the residual, so shrink every contribution by
+        # 1/sqrt(2*n_layers) to keep activation variance flat across the stack.
+        # (2) Conditioning cross-attns start as exact no-ops (zero out_proj,
+        # ControlNet/Flamingo-style): step-0 dynamics match an unconditioned
+        # decoder and the paths open up as their gradients arrive. The melody
+        # path is gated the same way inside MelodyEncoder (zero ln_final gain —
+        # zeroing a pre-norm Linear would NOT gate, the norm re-amplifies).
+        resid_std = 0.02 / math.sqrt(2 * cfg.n_layers)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.proj.weight, std=resid_std)
+            nn.init.normal_(block.mlp.fc2.weight, std=resid_std)
+            if block.has_cross_attn:
+                nn.init.zeros_(block.cross_attn.out_proj.weight)
+            if block.has_lyric_attn:
+                nn.init.zeros_(block.lyric_attn.out_proj.weight)
 
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
@@ -387,6 +433,7 @@ class NanoAudioGPT(nn.Module):
         B: int,
         T: int,
         start_pos: int,
+        keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The per-frame melody term added to the decoder input, shape [B, T, D].
 
@@ -411,6 +458,11 @@ class NanoAudioGPT(nn.Module):
                 enc = torch.cat([enc, self.melody_encoder.null_emb(B, T - Tc)], dim=1)
             elif Tc > T:
                 enc = enc[:, :T, :]
+            if keep is not None:
+                # CFG gate: keep=0 -> exactly the null path (the dropped /
+                # unconditional state), but the encoder ran, so one compiled
+                # graph serves both and its params are never DDP-"unused".
+                enc = keep * enc + (1 - keep) * self.melody_encoder.null_emb(B, T)
             return enc
         return self.melody_encoder.null_emb(B, T)
 
@@ -445,8 +497,10 @@ class NanoAudioGPT(nn.Module):
         lyric_mask: torch.Tensor | None = None,
         lyric_emb: torch.Tensor | None = None,
         lyric_kv_mask: torch.Tensor | None = None,
+        lyric_keep: torch.Tensor | None = None,
         melody: torch.Tensor | None = None,
         melody_emb: torch.Tensor | None = None,
+        melody_keep: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
@@ -468,6 +522,13 @@ class NanoAudioGPT(nn.Module):
         melody_emb: pre-built full delayed-length melody term [B, seq, D] (from
             encode_melody_delayed). Used on the generate path to encode once and
             slice per decode step. Takes precedence over ``melody``.
+        lyric_keep / melody_keep: optional 0/1 scalar tensors — the train-time
+            CFG-dropout gates. The encoders ALWAYS run and the contribution is
+            multiplied by keep (0 -> exactly the unconditional state: zero lyric
+            cond / the melody null), so torch.compile sees ONE graph per stream
+            and every parameter participates in every step (which is what lets
+            DDP run with find_unused_parameters=False). ``None`` = keep=1
+            behavior — the inference paths never pass these.
         returns: logits [B, K, T, V] or (logits, new_caches)
         """
         B, K, T = tokens.shape
@@ -483,6 +544,11 @@ class NanoAudioGPT(nn.Module):
             and self.cfg.use_lyric_conditioning
         ):
             lyric_emb, lyric_kv_mask = self.encode_lyrics(lyric_ids, lyric_mask)
+        if lyric_emb is not None and lyric_keep is not None:
+            # CFG gate: keep=0 zeroes the cond sequence, and zero K/V through
+            # the bias-free cross-attn is exactly zero output — identical to
+            # skipping the stream, but the encoder stays in the autograd graph.
+            lyric_emb = lyric_emb * lyric_keep
 
         x = self.tok_embeds[0](tokens[:, 0])
         for k in range(1, K):
@@ -491,7 +557,8 @@ class NanoAudioGPT(nn.Module):
         # (delayed position p ↔ frame p). The slice inside _melody_add keeps the
         # prefill / single-step decode paths aligned, exactly like the RoPE slice.
         if self.cfg.use_melody_conditioning:
-            x = x + self._melody_add(melody, melody_emb, B, T, start_pos)
+            x = x + self._melody_add(melody, melody_emb, B, T, start_pos,
+                                     keep=melody_keep)
         x = self.drop(x)
 
         cos, sin = self.rotary(start_pos, T)

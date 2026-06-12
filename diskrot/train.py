@@ -111,7 +111,9 @@ class TrainConfig:
     wandb_project: str | None = None
     wandb_run_name: str | None = None
 
-    model: GPTConfig = field(default_factory=GPTConfig)
+    # use_qk_norm=True is the bespoke model's shape (GPTConfig's own default
+    # stays False only so pre-qk-norm checkpoint cfg dicts keep loading).
+    model: GPTConfig = field(default_factory=lambda: GPTConfig(use_qk_norm=True))
 
 
 def _setup_dist(cfg: TrainConfig) -> bool:
@@ -524,6 +526,30 @@ def _all_reduce_module_grads(module: torch.nn.Module) -> None:
         dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
 
+def split_decay_param_groups(
+    named_params, weight_decay: float,
+) -> list[dict]:
+    """AdamW param groups: weight decay only on matrix-shaped weights.
+
+    ndim < 2 catches every RMSNorm gain (incl. QK-norm) — decaying those
+    actively shrinks the gains the stability fixes rely on; the melody
+    encoder's learned ``null`` ([1,1,D]) is excluded by name for the same
+    reason. Embeddings and Linear/Conv weights keep cfg.weight_decay
+    (nanoGPT-style). Guarded by tests/test_param_groups.py."""
+    decay, no_decay = [], []
+    for name, p in named_params:
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or name.endswith(".null"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def _cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
@@ -646,7 +672,8 @@ def _evaluate(
             if use_melody and melody is not None:
                 mel = melody.to(cfg.device, non_blocking=True)
 
-            with torch.amp.autocast(cfg.device, enabled=amp_enabled):
+            # bf16 to match the train loop (see train_run's scaler comment).
+            with torch.amp.autocast(cfg.device, dtype=torch.bfloat16, enabled=amp_enabled):
                 logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
                                lyric_mask=l_mask, melody=mel)
                 _, per_cb = _loss_fn(logits, targets, pad_id)
@@ -866,25 +893,32 @@ def train_run(
             print(f"melody (chroma) conditioning enabled (n_bins={cfg.model.melody_n_bins}, "
                   f"cfg_dropout={cfg.cfg_dropout})")
 
-    # Wrap in DDP *before* torch.compile so the compiled graph includes the
-    # DDP comm hooks. device_ids selects this rank's GPU.
+    # REGIONAL compilation, before the DDP wrap: compile each decoder Block
+    # in place (nn.Module.compile keeps state-dict keys clean — no _orig_mod
+    # interior prefixes) instead of one monolithic 22-layer graph. The blocks
+    # are identical code, so dynamo compiles ONE block program and reuses it
+    # 22x — cold compile drops from tens of minutes to single digits. The thin
+    # eager remainder (embedding sum, melody add, head) is a few percent of
+    # step time at most; DDP's comm hooks live at the autograd level, so
+    # gradient-overlap behavior is unchanged by compiling under the wrapper.
+    if cfg.device == "cuda":
+        for blk in model.blocks:
+            blk.compile()
+        if main:
+            print(f"torch.compile enabled (regional: {len(model.blocks)} blocks)")
+
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
 
-        # find_unused_parameters=True is required: CFG dropout (10% of steps)
-        # sets text_emb=None which skips cross-attention entirely, so those
-        # params get no gradient that step. Without this flag, DDP crashes on
-        # the first dropped step with "Expected to have finished reduction in
-        # the prior iteration before starting a new one." Tiny perf cost (~5%)
-        # — the alternative is feeding a learned-zero embedding during CFG
-        # dropout, which would also need a matching change in the inference
-        # path's unconditional branch ([nano_audio_gpt.py:334,347]).
-        model = DDP(model, device_ids=[cfg.local_rank], find_unused_parameters=True)
-
-    if cfg.device == "cuda":
-        model = torch.compile(model)
-        if main:
-            print("torch.compile enabled")
+        # find_unused_parameters=False is safe (and ~5%/step cheaper — no extra
+        # autograd-graph traversal) because every param now participates in
+        # every step: dropped-text steps pass a zeros embedding through the
+        # cross-attn, and dropped-lyric/melody steps run the encoders with a
+        # keep=0 gate (see the conditioning block in the loop). If DDP ever
+        # crashes with "Expected to have finished reduction", a stream
+        # regressed to a skip-style None path — fix the caller, don't flip
+        # this back to True.
+        model = DDP(model, device_ids=[cfg.local_rank], find_unused_parameters=False)
 
     # Only train params that require grad (everything in full/scratch mode;
     # just the adapters in LoRA mode) + the text_encoder projection (CLAP
@@ -895,14 +929,28 @@ def train_run(
     )
     if text_encoder is not None and not proj_trainable:
         text_encoder.proj.requires_grad_(False)
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    named = list(model.named_parameters())
     if proj_trainable:
-        trainable += list(text_encoder.proj.parameters())
-    optim = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay,
-                              betas=(0.9, 0.95), fused=(cfg.device == "cuda"))
+        named += [(f"text_proj.{n}", p)
+                  for n, p in text_encoder.proj.named_parameters()]
+    trainable = [p for _, p in named if p.requires_grad]
+    # Two groups: no weight decay on norm gains / the melody null (see
+    # split_decay_param_groups). NOTE: changes the optimizer state-dict group
+    # layout — resumes of pre-split checkpoints' optim state are incompatible
+    # (v8 starts fresh; no live run predates this).
+    optim = torch.optim.AdamW(
+        split_decay_param_groups(named, cfg.weight_decay),
+        lr=cfg.lr, betas=(0.9, 0.95), fused=(cfg.device == "cuda"),
+    )
 
     amp_enabled = cfg.device == "cuda"
-    scaler = torch.amp.GradScaler(cfg.device, enabled=amp_enabled)
+    # bf16, NOT the fp16 autocast-on-CUDA default: fp16's narrow exponent range
+    # on a 2B-param × 5167-token model was the root-cause candidate for the
+    # 2026-06-12 warmup divergences (cb0-led — the deepest gradient path
+    # saturates first; v7 at half the depth×seq survived the same code). H100
+    # bf16 removes the overflow class and the GradScaler with it — the disabled
+    # scaler object is kept so the scale/unscale_/step call sites stay uniform.
+    scaler = torch.amp.GradScaler(cfg.device, enabled=False)
 
     def _lora_payload() -> dict | None:
         """Adapter-only checkpoint payload (None in full/scratch mode). The
@@ -948,6 +996,11 @@ def train_run(
     t0 = time.time()
     running: torch.Tensor | None = None
     running_count = 0
+    max_gnorm: torch.Tensor | None = None  # window-max pre-clip grad norm
+    # Pre-built CFG keep gates (see the conditioning block in the loop) — one
+    # H2D copy each at startup instead of a tiny blocking copy per step.
+    keep_one = torch.ones((), device=cfg.device)
+    keep_zero = torch.zeros((), device=cfg.device)
     # Rolling sum of time spent in next(train_iter); reported per log_every and
     # logged to wandb as ``dataloader_wait_ms``. Catches I/O regressions on the
     # mmap dataset path (if it climbs to ~100ms+, mmap throughput isn't keeping
@@ -986,33 +1039,50 @@ def train_run(
             )
         inputs, targets = build_train_inputs(batch, pad_id)
 
-        # Tag + lyric conditioning, each dropped INDEPENDENTLY for classifier-free
-        # guidance (teaches tags-only / lyrics-only / both / neither so inference
-        # can guide each axis). "Drop lyrics" = pass None so the lyric encoder +
-        # cross-attn are skipped this step (find_unused_parameters covers it).
+        # Tag + lyric + melody conditioning, each dropped INDEPENDENTLY for
+        # classifier-free guidance (teaches every on/off combination so
+        # inference can guide each axis). "Drop" never passes None: text gets a
+        # ZEROS embedding (bias-free projections make attending over zero K/V
+        # exactly zero — bit-identical to skipping, guarded by
+        # tests/test_cfg_uncond.py), lyrics/melody get keep=0 gates below. The
+        # forward's argument TYPES are therefore identical on every step — one
+        # compiled graph total, no dynamo variant explosion, no eager fallback.
+        # Inference's uncond branch still passes None — same math, no drift.
+        B_in = inputs.shape[0]
+        d_model = cfg.model.d_model
         text_emb = None
-        if text_encoder is not None and _rng.random() >= cfg.cfg_dropout:
-            text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
-        l_ids = l_mask = None
-        if (cfg.model.use_lyric_conditioning and not do_fim
-                and _rng.random() >= cfg.cfg_dropout):
+        if text_encoder is not None:
+            if _rng.random() >= cfg.cfg_dropout:
+                text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
+            else:
+                text_emb = torch.zeros((B_in, 1, d_model), device=cfg.device)
+        # Lyrics and melody: the encoders ALWAYS run; a 0/1 keep tensor zeroes
+        # the contribution on dropped steps (keep=0 is exactly the uncond
+        # state: zero lyric cond / the melody null). One compiled graph per
+        # stream instead of a branch pair, and every param participates every
+        # step — which is what lets DDP run find_unused_parameters=False.
+        # (Tensor VALUES don't create dynamo guards; None-vs-tensor does.)
+        # On a FIM batch the lyric stream is dropped (alignment can't survive
+        # the reorder); mel_dev is the co-reordered chroma.
+        l_ids = l_mask = lyric_keep = None
+        if cfg.model.use_lyric_conditioning:
             l_ids = lyric_ids.to(cfg.device, non_blocking=True)
             l_mask = lyric_mask.to(cfg.device, non_blocking=True)
-        # Melody dropped INDEPENDENTLY too (its own Bernoulli). "Drop melody" =
-        # pass None so forward adds the learned null instead of the chroma — the
-        # unconditional state inference's CFG baseline also uses. On a FIM batch
-        # mel_dev is the co-reordered chroma.
-        mel = None
-        if (cfg.model.use_melody_conditioning and mel_dev is not None
-                and _rng.random() >= cfg.cfg_dropout):
+            lyric_drop = do_fim or _rng.random() < cfg.cfg_dropout
+            lyric_keep = keep_zero if lyric_drop else keep_one
+        mel = melody_keep = None
+        if cfg.model.use_melody_conditioning and mel_dev is not None:
             mel = mel_dev
+            melody_keep = (keep_zero if _rng.random() < cfg.cfg_dropout
+                           else keep_one)
 
         for g in optim.param_groups:
             g["lr"] = _cosine_lr(step, cfg)
 
-        with torch.amp.autocast(cfg.device, enabled=amp_enabled):
+        with torch.amp.autocast(cfg.device, dtype=torch.bfloat16, enabled=amp_enabled):
             logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
-                           lyric_mask=l_mask, melody=mel)
+                           lyric_mask=l_mask, lyric_keep=lyric_keep,
+                           melody=mel, melody_keep=melody_keep)
             loss, per_cb = _loss_fn(logits, targets, pad_id)
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -1028,7 +1098,10 @@ def train_run(
         # (model + text_encoder.proj if present). Clipping only model.parameters()
         # leaves proj's grad uncapped, which can produce unstable updates when a
         # rare-tag batch yields a huge CLAP-projection gradient.
-        torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+        gnorm = torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+        # Track the window max pre-clip norm — a ramp here is the divergence
+        # precursor (the 2026-06-12 failures were diagnosed blind without it).
+        max_gnorm = gnorm if max_gnorm is None else torch.maximum(max_gnorm, gnorm)
         scaler.step(optim)
         scaler.update()
 
@@ -1047,13 +1120,16 @@ def train_run(
             cb_str = " ".join(f"{x:.2f}" for x in per_cb.tolist())
             avg_io_ms = (dataloader_wait_s / cfg.log_every) * 1000
             cur_lr = optim.param_groups[0]["lr"]
+            gnorm_val = max_gnorm.item() if max_gnorm is not None else float("nan")
             print(f"step {step:>6}/{cfg.steps}  loss {avg_loss:.4f}  "
-                  f"lr {cur_lr:.2e}  tok/s {tps/1e3:.1f}k  cb[{cb_str}]",
+                  f"lr {cur_lr:.2e}  grad {gnorm_val:.2f}  tok/s {tps/1e3:.1f}k  "
+                  f"cb[{cb_str}]",
                   flush=True)
             if wandb is not None:
                 log_payload = {
                     "train/loss": avg_loss,
                     "train/lr": cur_lr,
+                    "train/grad_norm_max": gnorm_val,
                     "train/tokens_per_sec": tps,
                     "train/dataloader_wait_ms": avg_io_ms,
                     "train/epoch": epoch,
@@ -1067,6 +1143,7 @@ def train_run(
                 wandb.log(log_payload, step=step)
             running, running_count, t0 = None, 0, time.time()
             dataloader_wait_s = 0.0
+            max_gnorm = None
 
         if step % cfg.eval_every == 0:
             # All ranks evaluate their shard; we average loss + per-codebook

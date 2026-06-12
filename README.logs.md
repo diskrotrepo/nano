@@ -64,9 +64,10 @@ Proves all 8 ranks initialized NCCL and joined the process group. If this line i
 ### `model: XX.XX M params on cuda`
 Confirms model is on GPU. Param count should be ~2.0B (2013.8M measured at v8 startup: the v7 decoder's 1514.3M + per-block lyric cross-attention ~369M + lyric/melody encoders ~130M), matching the `DEFAULTS` in [modal_train.py](diskrot/modal_train.py#L83-L99) (~1.14B / 1145.2M if text conditioning is off). A wildly different number means an architecture override on the CLI didn't land as intended.
 
-### `step N/T loss L lr LR tok/s X.Xk cb[a b c d e f g h i]`
+### `step N/T loss L lr LR grad G tok/s X.Xk cb[a b c d e f g h i]`
 - **`loss`** — average over the last `log_every=25` steps. Watch for it to start in the 5–7 range and drop into 3.5–4.5 ("recognizably musical" per README.modal.md).
-- **`lr`** — current cosine-decayed learning rate (warmup for the first `warmup_steps`, 5000 on Modal).
+- **`lr`** — current cosine-decayed learning rate (warmup for the first `warmup_steps`, 10,000 on Modal).
+- **`grad`** — window-max pre-clip gradient norm. Healthy is a stable O(0.1–1) band; a steady ramp across windows is the divergence precursor (the 2026-06-12 failures had to be diagnosed without this — don't ignore it). Values pinned at the clip value (1.0) every window mean the clip is doing real work.
 - **`tok/s`** — aggregate token throughput across all ranks. On 8×H100 DDP expect ~6–7× single-H100 (NCCL overhead). If `tok/s` is only ~1× a single-H100 run, DDP is broken or one rank is starving the others.
 - **`cb[...]`** — per-codebook losses (9 values). Codebook 0 is usually highest (carries most signal); later codebooks should be lower. If they're all equal, something's wrong with the delay pattern.
 
