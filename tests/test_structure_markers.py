@@ -49,12 +49,13 @@ g2p_required = pytest.mark.skipif(
 def _make_ds(synth_tokens_dir, tmp_path, words, segments, bpm=None, gender=None, key=None):
     """Build a TokenDataset over a tiny synth corpus with the given lyrics +
     structure (and optional bpm/gender/key) for song_000. ``words=[]`` exercises
-    the transcribed-but-wordless (instrumental) path."""
+    the transcribed-but-wordless (instrumental) path; ``words=None`` writes a
+    null entry — the on-disk instrumental convention."""
     tokens_dir = synth_tokens_dir(n_files=2, T=1000)
     pack(tokens_dir, verbose=False)
     lyrics_path = tmp_path / "lyrics.json"
-    lyric_entry = {"words": words}
-    if gender is not None:
+    lyric_entry = {"words": words} if words is not None else None
+    if gender is not None and lyric_entry is not None:
         lyric_entry["gender"] = gender
     lyrics_path.write_text(json.dumps({"song_000": lyric_entry}))
     structure_path = tmp_path / "structure.json"
@@ -227,6 +228,18 @@ def test_instrumental_marker_and_equivalence(synth_tokens_dir, tmp_path):
     # song_001 was never transcribed (no lyrics.json entry) -> <unknown_vocals>.
     other = ds._get_segment_lyric_ids("song_001", 0.0, 5.0)
     assert other[4] == UNKNOWN_VOCALS_ID
+
+
+@g2p_required
+def test_null_lyric_entry_is_instrumental(synth_tokens_dir, tmp_path):
+    """A NULL lyric entry is the on-disk instrumental convention (written by
+    transcribe and the hallucination filter) and must feed the instrumental set
+    exactly like an empty-words dict. Regression: 2026-06-12 — nulls were
+    silently dropped, so all 173k instrumentals trained as <unknown_vocals>."""
+    segments = [{"start": 0.0, "end": 10.0, "label": "verse"}]
+    ds = _make_ds(synth_tokens_dir, tmp_path, None, segments)  # null entry
+    assert "song_000" in ds._instrumental and "song_000" not in ds._lyrics
+    assert ds._get_segment_lyric_ids("song_000", 0.0, 5.0)[4] == INSTRUMENTAL_ID
 
 
 @g2p_required

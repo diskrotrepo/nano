@@ -121,6 +121,12 @@ def _load_lyrics(
     instrumental: set[str] = set()
     n_dropped_words = 0
     for key, val in raw.items():
+        if val is None:
+            # The on-disk instrumental convention: transcribe (and the
+            # hallucination filter) write null for transcribed-but-wordless
+            # songs. Distinct from ABSENT = never transcribed = <unknown_vocals>.
+            instrumental.add(key)
+            continue
         if not isinstance(val, dict):
             continue
         words = val.get("words")
