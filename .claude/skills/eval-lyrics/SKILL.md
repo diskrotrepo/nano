@@ -16,7 +16,7 @@ Two distinct questions live here. Route first:
 | Question | Command |
 |---|---|
 | **Data**: how healthy is the lyric corpus right now? (coverage, hallucination rate, gender, word counts) | `modal run scripts/lyrics_audit.py` |
-| **Data**: exactly what would the hallucination filter null? | `modal run diskrot/modal_filter_lyrics.py` (dry-run report) |
+| **Data**: exactly what would the hallucination filter null? | `modal run --detach diskrot/modal_filter_lyrics.py` (dry-run report, prints to remote logs) |
 | **Model**: does a checkpoint sing intelligible words? (WER) | `modal run scripts/eval_lyric_wer.py` — details in the **eval-checkpoint** skill |
 | **Model**: is lyric conditioning earning its compute? (val-loss ablation) | `modal run scripts/eval_lyrics_ablation.py` — details in the **eval-checkpoint** skill |
 
@@ -58,7 +58,7 @@ the transcribe pass itself, so only re-running transcribe adds it.
   fleet has fully finished** — its orchestrator holds shard contents in
   memory and the next flush would clobber concurrent edits. Dry-run is
   read-only and always safe; `--apply` is the dangerous one.
-- Required order: transcribe → `modal run diskrot/modal_filter_lyrics.py
+- Required order: transcribe → `modal run --detach diskrot/modal_filter_lyrics.py
   --apply` → `modal run --detach diskrot/modal_phonemize.py` → re-audit →
   train. Phonemize after the filter, so junk never enters the phoneme store.
 
