@@ -38,17 +38,22 @@ accumulates — always pipe through a grep filter, never page raw logs.)
 2. **Val trajectory** (the verdict): checkups every 1000 steps must trend DOWN.
    Two+ consecutive strikes while LR is still climbing through warmup = the
    2026-06-12 divergence signature — stop the run, don't wait out patience.
-   Healthy v8 reference: first checkup ≈ 6.75 (already under the floor).
+   Healthy v8 reference (the successful bf16+qk-norm launch): 6.75@1k,
+   6.69@2k, 5.11@8k, 4.93@10k (warmup end, full LR) — every checkup a new best.
    Diverged v8 reference: 7.17 → 7.87 → 8.70 by step 3000.
+   The step line's `grad` field is the leading indicator: healthy ≈ flat
+   0.3–2.5 band (clip=1.0 occasionally touched is fine); a ramp across windows
+   precedes divergence by thousands of steps.
 3. **Per-codebook order**: cb0 must be the LOWEST (it converges first; docs:
    "converge in order"). cb0 highest and climbing = the divergence canary —
    it led the 2026-06 explosion by ~800 steps. All nine equal after thousands
    of steps = delay-pattern suspicion.
-4. **Throughput**: steady-state `tok/s` ≈ 1.9–2.0M on 8×H100 (60s segments,
-   global batch 32, ~1.3 steps/s). Lines well below that intermittently =
-   eager-fallback steps (dynamo recompile_limit overflow — fixed by the
-   zeros-uncond CFG convention) or a starving rank. Ignore the step-25 line
-   (compile-polluted average).
+4. **Throughput**: steady-state `tok/s` ≈ 1.6–1.7M on 8×H100 with the
+   bf16+qk-norm recipe (60s segments, global batch 32, ~1.1 steps/s; the old
+   fp16 run measured ~2.0M — qk-norm/bf16 cost ~20%). Isolated low windows in
+   the first few thousand steps = late first-hit variant compiles (finite,
+   self-quiescing). Persistently low/erratic after that = a starving rank.
+   Ignore the step-25 line (compile-polluted average).
 5. **ETA**: steps/s from the spacing of recent step lines (each line = 25
    steps), then `(target - current) / steps_per_s`. State it with the caveat
    that val-driven early stopping (patience 20) may end the run first.
