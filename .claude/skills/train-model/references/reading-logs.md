@@ -8,7 +8,7 @@ the one-screen version.
 
 `[parent] v2 sharded layout detected` → `[bundle]` train/val split → mmap open →
 `[tags] loaded N entries` → `[clap-parent] sharding N tags across 8 GPUs` (~90 s)
-→ workers spawn → `DDP active: world_size=8` + `model: 1514.xx M params` →
+→ workers spawn → `DDP active: world_size=8` + `model: 2013.xx M params` →
 `torch.compile` → first `step` line → training.
 
 ## The one thing that trips everyone up
@@ -48,5 +48,8 @@ GPUs per the "Diagnosing silent runs" section of
 `[modal-client] ... Heartbeat attempt failed` (local CLI hiccup), `terminate
 called without an active exception` right after `[clap-parent] done` (CLAP shard
 worker teardown — parent survives; only worry if the task count drops),
+`find_unused_parameters=True ... did not find any unused parameters` (false
+positive — the flag is REQUIRED for CFG-dropout steps; never turn it off),
+`Profiler record function ... will be ignored` (torch.compile noise),
 mpg123/id3 and `PySoundFile failed` warnings (tokenize only),
 `weights_only=False` FutureWarning (DAC loader, pinned/safe).

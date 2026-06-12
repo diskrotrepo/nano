@@ -62,7 +62,7 @@ Emitted by the **parent process** of the DDP path. Only visible during setup pha
 Proves all 8 ranks initialized NCCL and joined the process group. If this line is missing, DDP did not start — workers may be silently stuck in CUDA init or NCCL discovery. Source: [train.py](diskrot/train.py).
 
 ### `model: XX.XX M params on cuda`
-Confirms model is on GPU. Param count should be ~1.5B (1514.3M), matching the `DEFAULTS` in [modal_train.py](diskrot/modal_train.py#L83-L99) (~1.14B / 1145.2M if text conditioning is off). A wildly different number means an architecture override on the CLI didn't land as intended.
+Confirms model is on GPU. Param count should be ~2.0B (2013.8M measured at v8 startup: the v7 decoder's 1514.3M + per-block lyric cross-attention ~369M + lyric/melody encoders ~130M), matching the `DEFAULTS` in [modal_train.py](diskrot/modal_train.py#L83-L99) (~1.14B / 1145.2M if text conditioning is off). A wildly different number means an architecture override on the CLI didn't land as intended.
 
 ### `step N/T loss L lr LR tok/s X.Xk cb[a b c d e f g h i]`
 - **`loss`** — average over the last `log_every=25` steps. Watch for it to start in the 5–7 range and drop into 3.5–4.5 ("recognizably musical" per README.modal.md).
@@ -117,6 +117,8 @@ If `modal app logs ap-...` shows zero lines after several minutes:
 
 - **`[modal-client] ... Heartbeat attempt failed`** — your local CLI's monitor hiccupping, not the remote container. The detached training run doesn't care. Safe to ignore.
 - **`terminate called without an active exception`** right after `[clap-parent] done` — a CLAP shard worker process exiting with a joinable C++ thread. The parent survives and proceeds to spawn the DDP ranks; only worry if the app's task count actually drops.
+- **`Warning: find_unused_parameters=True ... did not find any unused parameters`** (reducer.cpp, per rank) — false positive, do NOT turn the flag off. CFG dropout skips a conditioning stream's cross-attn on ~10% of steps, leaving those params gradient-less; without the flag DDP crashes on the first dropped step. See the comment at [train.py:874-882](diskrot/train.py#L874-L882).
+- **`Profiler record function ... will be ignored`** (per rank, during compile) — torch.compile noise, harmless.
 - **`Runner interrupted due to worker preemption`** (tokenize only, not training) — Modal preempted the spot instance. Modal restarts the same input automatically.
 - **mpg123 / id3 warnings** (tokenize only) — malformed MP3 tags in the source files. Decode proceeds; tokens are still produced.
 - **`PySoundFile failed. Trying audioread instead`** (tokenize only) — librosa fallback path. Slower but functionally identical.
