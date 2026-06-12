@@ -81,7 +81,7 @@ modal run --detach diskrot/modal_structure.py     # → structure/  (optional)
 
 ```bash
 modal run --detach diskrot/modal_key_detect.py    # → keys.json   (waits on Pack; optional)
-modal run diskrot/modal_filter_lyrics.py --apply  # nulls Whisper-hallucinated captions in lyrics/ (recommended; dry-run without --apply)
+modal run --detach diskrot/modal_filter_lyrics.py --apply  # nulls Whisper-hallucinated captions in lyrics/ (recommended; dry-run without --apply)
 modal run --detach diskrot/modal_phonemize.py     # → phonemes/   (waits on Filter-lyrics; recommended)
 ```
 

@@ -11,16 +11,19 @@ reports:
   - vocal-gender distribution among vocal-ready songs ('unset' = pre-gender
     v7 entries — re-run transcribe to add the field)
   - word-count distribution among vocal-ready songs
+  - language breakdown of vocal-ready transcripts (py3langid on the stored
+    text)
   - top detected keys (sanity check on key_detect output)
 
 Read-only, so it's safe to run while a transcribe/filter pass is in flight —
 the numbers are just a snapshot of what's on disk right now.
 
 Caveat: transcription forces ``language="en"`` (transcribe_lyrics.py), so
-non-English vocals are mis-transcribed into noise. There's no cheap reliable
-language detector here, but the word-count buckets surface the tell — a heavy
-tail of tiny "songs" is usually instrumental bleed or garbled output (the
-hallucination filter catches most of it via the <6-valid-words rule).
+non-English vocals decode into English-looking word salad rather than their
+source language. The language breakdown is therefore a LOWER BOUND on
+non-English contamination — it only flags transcripts where enough source
+language leaked through for a text detector to see; the fully-anglicized
+salad still counts as "en".
 
 Run:  modal run scripts/lyrics_audit.py
 """
@@ -30,7 +33,9 @@ import modal
 
 app = modal.App("nano-lyrics-audit")
 
-image = modal.Image.debian_slim(python_version="3.12").pip_install("numpy>=1.26")
+image = modal.Image.debian_slim(python_version="3.12").pip_install(
+    "numpy>=1.26", "py3langid>=0.3"
+)
 
 tokens_vol = modal.Volume.from_name("nano-tokens")
 corpus_vol = modal.Volume.from_name("nano-corpus")
@@ -173,6 +178,34 @@ def audit():
             print(f"  {label:>8} words: {n:>7}  ({n / len(counts):.1%})")
         print(f"  mean {counts.mean():.0f}  median {int(np.median(counts))}  "
               f"max {int(counts.max())}")
+
+    # --- language ID on vocal-ready transcripts (text-based, LOWER BOUND) ---
+    # Transcribe forces language="en", so a non-English song usually decodes
+    # into English-looking word salad the detector reads as "en". Anything
+    # flagged non-English here is the unambiguous tail (source language leaked
+    # through); the true non-English share is higher. Audio-based language ID
+    # would need another Whisper pass (language=None) — see transcribe_lyrics.
+    if vocal_ready:
+        import py3langid as langid
+
+        lang_counts = Counter()
+        for v in vocal_ready.values():
+            text = (v.get("text") or "").strip()[:1500]
+            if not text:
+                lang_counts["(empty)"] += 1
+                continue
+            lang, _ = langid.classify(text)
+            lang_counts[lang] += 1
+        n_en = lang_counts.get("en", 0)
+        print(f"\nlanguage of vocal-ready transcripts (text-based — a lower "
+              f"bound on non-English; forced-en salad still reads as 'en'):")
+        for label, n in lang_counts.most_common(10):
+            print(f"  {label:<8} {n:>7}  ({n / len(vocal_ready):.1%})")
+        rest = len(vocal_ready) - sum(n for _, n in lang_counts.most_common(10))
+        if rest:
+            print(f"  (other)  {rest:>7}  ({rest / len(vocal_ready):.1%})")
+        print(f"  non-en (detectable): {len(vocal_ready) - n_en} "
+              f"({(len(vocal_ready) - n_en) / len(vocal_ready):.1%})")
 
     # --- key distribution (sanity that key-detect output is plausible) ---
     if keys:

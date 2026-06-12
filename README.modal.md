@@ -130,8 +130,8 @@ Writes a sharded `lyrics/` dir (`lyrics_NNN.json`, 256 shards keyed by a stable 
 Whisper invents captions over instrumental audio — "Thank you.", "Thanks for watching!", "We'll be right back." — and any entry with usable words trains as `<vocals>` with those words attended, so each one mislabels an instrumental song *and* feeds it garbage lyrics (~24% of with-words entries in the 2026-06 full-corpus sweep). This pass nulls them back to the transcribed-but-wordless convention (trains as `<instrumental>`) ([modal_filter_lyrics.py](diskrot/modal_filter_lyrics.py)):
 
 ```bash
-modal run diskrot/modal_filter_lyrics.py            # dry-run report
-modal run diskrot/modal_filter_lyrics.py --apply    # rewrite shards
+modal run --detach diskrot/modal_filter_lyrics.py            # dry-run report
+modal run --detach diskrot/modal_filter_lyrics.py --apply    # rewrite shards
 ```
 
 Flags entries with fewer than 6 valid words, or a known caption-artifact phrase ("thank you for watching", "subscribe", …) in a transcript under 30 words — long real lyrics that merely mention such a phrase survive. Rewrites are atomic per shard and the pass is idempotent. **Run it only after the transcribe fleet has fully finished** (the transcribe orchestrator holds shard contents in memory and its next flush would clobber concurrent edits), and before phonemize so junk never enters the phoneme store.

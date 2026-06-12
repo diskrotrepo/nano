@@ -128,8 +128,8 @@ inference.**
 
 ### 7b. Filter hallucinated lyrics — *recommended* after step 7 completes
 ```bash
-modal run diskrot/modal_filter_lyrics.py          # dry-run report first
-modal run diskrot/modal_filter_lyrics.py --apply  # then rewrite shards
+modal run --detach diskrot/modal_filter_lyrics.py          # dry-run report first
+modal run --detach diskrot/modal_filter_lyrics.py --apply  # then rewrite shards
 # or locally: python -m diskrot.filter_lyrics --lyrics-dir ./lyrics [--apply]
 ```
 Nulls Whisper-invented captions over instrumentals ("Thank you." etc. — ~24% of

@@ -10,10 +10,10 @@ flush) and BEFORE phonemize (so junk never enters the phoneme store).
 
 Run::
 
-    modal run diskrot/modal_filter_lyrics.py            # dry-run report
-    modal run diskrot/modal_filter_lyrics.py --apply    # rewrite shards
+    modal run --detach diskrot/modal_filter_lyrics.py            # dry-run report
+    modal run --detach diskrot/modal_filter_lyrics.py --apply    # rewrite shards
 
-Monitor::
+Monitor (the report prints to the remote logs)::
 
     modal app logs nano-filter-lyrics
 """
@@ -67,7 +67,12 @@ def filter_remote(apply: bool = False) -> dict:
 
 @app.local_entrypoint()
 def main(apply: bool = False):
-    stats = filter_remote.remote(apply=apply)
-    print(stats)
+    # spawn (not remote) — submit the sweep and return immediately. Combined
+    # with `modal run --detach`, the app stays alive after the local client
+    # exits, so the report/rewrite survives a closed terminal.
+    fc = filter_remote.spawn(apply=apply)
+    mode = "APPLY" if apply else "dry run"
+    print(f"lyric filter launched (detached, {mode}) — function call id: {fc.object_id}")
+    print("monitor with: modal app logs nano-filter-lyrics")
     if not apply:
         print("dry run only — re-run with --apply to null the flagged entries")
