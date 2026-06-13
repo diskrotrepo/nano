@@ -216,6 +216,8 @@ modal volume get nano-ckpts /v7_1500m/best.pt ./checkpoints/latest.pt --force
 
 Then follow the [inference instructions](README.md#inference) in the main README. The server reads `GPTConfig` from the checkpoint's `cfg` dict, so any checkpoint works without client-side flag changes.
 
+Or skip the download and serve straight from the volume: `modal serve diskrot/modal_serve.py` (dev) / `modal deploy diskrot/modal_serve.py` (persistent) brings up **two** endpoints — the inference API (`...-serve[-dev].modal.run`, L4) and the Flutter web UI (`...-ui[-dev].modal.run`, CPU static files; run `cd webapp && flutter build web` first). The UI pre-fills its server-url field with the sibling API URL.
+
 ## Resetting (start fresh)
 
 Delete tags, lyrics, packed shards, and checkpoints to retrain from scratch:

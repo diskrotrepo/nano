@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:web/web.dart' as web;
 
 import 'api.dart';
 import 'audio_web.dart';
@@ -51,7 +52,8 @@ class _HomePageState extends State<HomePage> {
   /// both extend and cover.
   GenClip? _sourceClip;
 
-  final _serverCtl = TextEditingController(text: 'http://127.0.0.1:8000');
+  final _serverCtl =
+      TextEditingController(text: defaultServerUrl(web.window.location.hostname));
   final _promptCtl = TextEditingController();
   final _lyricsCtl = TextEditingController();
   final _negCtl = TextEditingController();

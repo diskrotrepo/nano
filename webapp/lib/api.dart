@@ -3,6 +3,19 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
+/// Default for the UI's server-url field. When the UI itself is served from a
+/// Modal endpoint (`<workspace>--<app>-ui[-dev].modal.run`, see
+/// diskrot/modal_serve.py), the API is the sibling `serve` function — the same
+/// hostname with the `-ui` label swapped for `-serve`. Anywhere else (local
+/// flutter dev server, etc.) fall back to the local inference server.
+String defaultServerUrl(String hostname) {
+  final m = RegExp(r'^(.+--.+)-ui(-dev)?\.modal\.run$').firstMatch(hostname);
+  if (m != null) {
+    return 'https://${m.group(1)}-serve${m.group(2) ?? ''}.modal.run';
+  }
+  return 'http://127.0.0.1:8000';
+}
+
 enum NanoMode { generate, extend, cover }
 
 extension NanoModeX on NanoMode {

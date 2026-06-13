@@ -131,6 +131,7 @@ Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `
 | nano-tokens | .pt token files, packed/ shards (incl. `.mel.bin`), tags.json, lyrics/, structure/, keys.json, phonemes/ |
 | nano-melody | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its ~500k-inode cap) |
 | nano-ckpts | Training checkpoints (step_*.pt, latest.pt, best.pt) |
+| nano-output | Generations from the Modal inference server (every /generate /extend /cover /infill result, written via `NANO_OUTPUT_DIR=/outputs`) |
 
 ## Checkpoints
 

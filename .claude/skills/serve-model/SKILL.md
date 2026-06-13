@@ -17,8 +17,8 @@ works. It **prefers the slim `best_inference.pt`** export. Produce and download 
 via the **train-model** skill (extract + download step):
 
 ```bash
-modal run diskrot/modal_export_ckpt.py --src v7_1500m/best.pt
-modal volume get nano-ckpts /v7_1500m/best_inference.pt ./checkpoints/latest.pt --force
+modal run diskrot/modal_export_ckpt.py --src v8_sing/best.pt
+modal volume get nano-ckpts /v8_sing/best_inference.pt ./checkpoints/latest.pt --force
 ```
 
 ## Local server
@@ -39,8 +39,25 @@ silicon the 1.5B model runs on `mps`; loading the checkpoint takes ~30s before t
 modal serve diskrot/modal_serve.py     # dev: hot-reload, ephemeral public URL (Ctrl-C tears down)
 modal deploy diskrot/modal_serve.py    # persistent public URL
 ```
-On the volume it prefers `/ckpts/v7_1500m/best_inference.pt`, falling back to
-`best.pt` then `latest.pt`. Override with `NANO_CKPT=/ckpts/custom.pt`.
+On the volume it prefers `/ckpts/v8_sing/best_inference.pt`, falling back to
+`best.pt` then `latest.pt`. Override with `NANO_CKPT=/ckpts/custom.pt` (baked
+into the image at serve/deploy time — local env doesn't reach the container
+otherwise).
+
+Every generation is also persisted to the **nano-output** volume
+(`<UTCstamp>_<mode>_<prompt-slug>_<id>.mp3`; `NANO_OUTPUT_DIR=/outputs`, set
+empty to disable). List/pull them:
+```bash
+modal volume ls nano-output
+modal volume get nano-output /<name>.mp3 .
+```
+
+Both commands also bring up the **Flutter web UI** as a second, CPU-only
+endpoint: `https://<workspace>--nano-serve-ui[-dev].modal.run` (the API is the
+sibling `...-serve[-dev].modal.run`, and the UI pre-fills its server-url field
+with it). The UI is mounted from the local `webapp/build/web` bundle — run
+`cd webapp && flutter build web` before serving/deploying, or the `ui` function
+errors at startup.
 
 ## Weight quantization (optional)
 

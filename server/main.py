@@ -22,7 +22,11 @@ See each endpoint's docstring (surfaced in /docs).
 """
 from __future__ import annotations
 
+import os
+import re
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +35,30 @@ from fastapi.responses import Response
 from server.inference import InferenceEngine
 
 engine: InferenceEngine | None = None
+
+# When set, every generation is also written here (e.g. the nano-output volume
+# on Modal, mounted at /outputs). Empty = response-only, nothing persisted.
+OUTPUT_DIR = os.environ.get("NANO_OUTPUT_DIR", "")
+
+
+def _save_output(body: bytes, mime: str, mode: str, prompt: str) -> None:
+    """Persist a generation to OUTPUT_DIR; never fatal to the response."""
+    if not OUTPUT_DIR:
+        return
+    try:
+        ext = "mp3" if "mpeg" in mime else "wav"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:48] or "untitled"
+        name = f"{stamp}_{mode}_{slug}_{uuid.uuid4().hex[:6]}.{ext}"
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Direct write, no temp+rename: filenames are unique per request, and on
+        # a Modal volume the background commit can capture the temp file while
+        # the rename's delete never propagates (orphaned .tmp entries).
+        with open(os.path.join(OUTPUT_DIR, name), "wb") as f:
+            f.write(body)
+        print(f"[output] saved {name} ({len(body)} bytes)")
+    except Exception as e:  # disk-full etc. must not break the response
+        print(f"[output] save failed: {e}")
 
 
 def _combine_text_lyrics(text: str, lyrics: str) -> str | None:
@@ -202,6 +230,7 @@ async def generate_endpoint(
             headers["X-Nano-Clap-Score"] = f"{clap:.6f}"
     else:
         body, mime = result
+    _save_output(body, mime, "generate", prompt)
     return Response(content=body, media_type=mime, headers=headers)
 
 
@@ -266,6 +295,7 @@ async def extend_endpoint(
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    _save_output(body, mime, "extend", prompt)
     return Response(content=body, media_type=mime, headers=sweet_headers)
 
 
@@ -321,6 +351,7 @@ async def cover_endpoint(
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
+    _save_output(body, mime, "cover", prompt)
     return Response(content=body, media_type=mime, headers=sweet_headers)
 
 
@@ -373,4 +404,5 @@ async def infill_endpoint(
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
+    _save_output(body, mime, "infill", prompt)
     return Response(content=body, media_type=mime, headers=sweet_headers)

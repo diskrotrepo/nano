@@ -42,6 +42,25 @@ flutter build web
 # output in build/web/
 ```
 
+## Serve on Modal
+
+The Modal entrypoint ([../diskrot/modal_serve.py](../diskrot/modal_serve.py))
+serves this UI as a second, CPU-only endpoint next to the GPU inference API:
+
+```bash
+cd webapp && flutter build web        # the bundle is mounted into the image
+modal serve diskrot/modal_serve.py    # dev URLs (from the repo root)
+modal deploy diskrot/modal_serve.py   # persistent URLs
+```
+
+UI:  `https://<workspace>--nano-serve-ui[-dev].modal.run`
+API: `https://<workspace>--nano-serve-serve[-dev].modal.run`
+
+When the UI is loaded from its Modal URL it pre-fills the **server url** field
+with the sibling API URL (`defaultServerUrl` in [lib/api.dart](lib/api.dart));
+anywhere else it defaults to `http://127.0.0.1:8000`. The field stays editable
+either way.
+
 ## Tests
 
 Widget tests touch web-only libraries (`package:web`, `dart:js_interop`), so run

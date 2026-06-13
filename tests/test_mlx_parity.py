@@ -39,11 +39,12 @@ def _build_pair(cfg, seed=0):
 
 
 @pytest.mark.parametrize("use_text", [False, True])
-def test_oneshot_logits_match_torch(use_text):
+@pytest.mark.parametrize("use_qk_norm", [False, True])
+def test_oneshot_logits_match_torch(use_text, use_qk_norm):
     """MLX full forward must match PyTorch logits in fp32 (within float noise)."""
     import mlx.core as mx
 
-    cfg = _tiny_cfg(use_text_conditioning=use_text)
+    cfg = _tiny_cfg(use_text_conditioning=use_text, use_qk_norm=use_qk_norm)
     m, mlx_m = _build_pair(cfg)
     K, T = cfg.n_codebooks, 12
     tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, T))
@@ -59,10 +60,12 @@ def test_oneshot_logits_match_torch(use_text):
     assert np.abs(got - ref).max() < 1e-3
 
 
-def test_cached_decode_matches_oneshot():
+@pytest.mark.parametrize("use_qk_norm", [False, True])
+def test_cached_decode_matches_oneshot(use_qk_norm):
     """The KV-cached generate path (greedy) must reproduce a one-shot forward's
-    argmax trajectory — and match PyTorch's generate exactly in fp32."""
-    cfg = _tiny_cfg(use_text_conditioning=True)
+    argmax trajectory — and match PyTorch's generate exactly in fp32. qk-norm is
+    covered in both states (it must be applied before the cache write)."""
+    cfg = _tiny_cfg(use_text_conditioning=True, use_qk_norm=use_qk_norm)
     m, mlx_m = _build_pair(cfg, seed=3)
     K, T = cfg.n_codebooks, 10
     tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, T))

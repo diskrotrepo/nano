@@ -64,6 +64,10 @@ class _SelfAttention(mnn.Module):
         self.scale = self.head_dim ** -0.5
         self.qkv = mnn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = mnn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # Per-head-dim gains shared across heads — mirrors torch (see
+        # GPTConfig.use_qk_norm).
+        self.q_norm = _RMSNorm(self.head_dim) if cfg.use_qk_norm else None
+        self.k_norm = _RMSNorm(self.head_dim) if cfg.use_qk_norm else None
 
 
 class _CrossAttention(mnn.Module):
@@ -75,6 +79,8 @@ class _CrossAttention(mnn.Module):
         self.q_proj = mnn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.kv_proj = mnn.Linear(cfg.d_model, 2 * cfg.d_model, bias=False)
         self.out_proj = mnn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.q_norm = _RMSNorm(self.head_dim) if cfg.use_qk_norm else None
+        self.k_norm = _RMSNorm(self.head_dim) if cfg.use_qk_norm else None
 
 
 class _MLP(mnn.Module):
@@ -308,6 +314,10 @@ class MLXNanoAudioGPT(mnn.Module):
         q = q.reshape(B, T, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, T, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
+        # QK-norm before RoPE (and before the cache write), matching torch.
+        if attn.q_norm is not None:
+            q = attn.q_norm(q)
+            k = attn.k_norm(k)
         q, k = _apply_rotary(q, k, cos, sin)
 
         if cache is not None:
@@ -336,6 +346,9 @@ class MLXNanoAudioGPT(mnn.Module):
         k, v = mx.split(kv, 2, axis=-1)
         k = k.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
+        if ca.q_norm is not None:
+            q = ca.q_norm(q)
+            k = ca.k_norm(k)
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=ca.scale, mask=mask)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return ca.out_proj(y)

@@ -773,10 +773,13 @@ class LyricEncoder(nn.Module):
         Returns (lyric_emb [B, L, d_model], mask [B, L]).
         """
         # Float additive key-padding mask for SDPA: [B, 1, 1, L], 0 keep / -inf drop.
+        # Built in the model's compute dtype — SDPA requires the bias to match the
+        # query's dtype, and the fp16-cast inference path has no autocast to fix it.
         attn_mask = None
         if mask is not None:
             attn_mask = torch.zeros(
-                mask.shape[0], 1, 1, mask.shape[1], dtype=torch.float32, device=mask.device,
+                mask.shape[0], 1, 1, mask.shape[1],
+                dtype=self.embed.weight.dtype, device=mask.device,
             ).masked_fill(~mask[:, None, None, :], float("-inf"))
         x = self.drop(self.pos(self.embed(ids)))
         for layer in self.layers:
