@@ -33,6 +33,19 @@ silicon the 1.5B model runs on `mps`; loading the checkpoint takes ~30s before t
 `lsof -iTCP:8000 -sTCP:LISTEN` and `curl :8000/health` (the response reports
 `model_params`, so you can tell the 1.5B from the retired 287M model).
 
+**Apple-Silicon backend + dtype.** The Mac default is the **PyTorch-MPS** backend
+in **bf16** (the training dtype). Do NOT run fp16 on MPS: MPS accumulates fp16
+matmuls in fp16 (CUDA uses fp32), so fp16's narrow exponent range overflows this
+bf16-trained model and the autoregressive rollout collapses to a single-pitch
+**drone** — verified, and it's the worst option in every controlled test. CUDA
+keeps fp16 (fine + faster there). Overrides:
+- `NANO_DTYPE=fp32|bf16|fp16` — force the torch compute dtype (default bf16 on
+  MPS, fp16 on CUDA). fp32 is ~2× memory/slower and not reliably better than
+  bf16 at this scale; bf16 is the recommended Mac dtype.
+- `NANO_MLX=1` — opt into the MLX backend (faster single-token decode, separate
+  runtime; also bf16 now). Default is off → torch-MPS, which shares the CUDA code
+  path and is fully parity-tested (`tests/test_mlx_parity.py`).
+
 ## Modal server
 
 ```bash

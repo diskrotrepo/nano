@@ -89,10 +89,13 @@ class InferenceEngine:
             if any(k.startswith("_orig_mod.") for k in state):
                 state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
-            # Backend: MLX on Apple Silicon (unless NANO_MLX=0), else PyTorch.
+            # Backend on Apple Silicon: PyTorch-MPS by default (bf16, shares the
+            # CUDA code path and is fully parity-tested), MLX only on explicit
+            # opt-in (NANO_MLX=1) — MLX is faster for single-token decode but a
+            # separate runtime. Elsewhere: PyTorch.
             self.backend = (
                 "mlx"
-                if os.environ.get("NANO_MLX", "auto") != "0"
+                if os.environ.get("NANO_MLX", "0") == "1"
                 and self.device == "mps"
                 and _mlx_available()
                 else "torch"
@@ -103,11 +106,13 @@ class InferenceEngine:
                 from model.nano_audio_gpt_mlx import MLXNanoAudioGPT
 
                 bits = int(os.environ.get("NANO_MLX_BITS", "8"))
+                # bf16 (not fp16): this is the training dtype, and fp16's narrow
+                # exponent range collapses the rollout (see the torch-path note).
                 self.model = MLXNanoAudioGPT(
-                    cfg, state, dtype=mx.float16, bits=bits if bits in (4, 8) else None
+                    cfg, state, dtype=mx.bfloat16, bits=bits if bits in (4, 8) else None
                 )
                 print(f"[inference] backend: mlx (Apple Silicon), weights="
-                      f"{'fp16' if self.model._bits == 16 else f'int{self.model._bits}'}")
+                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}")
             else:
                 self.model = NanoAudioGPT(cfg).to(self.device)
                 self.model.load_state_dict(state)
@@ -119,9 +124,25 @@ class InferenceEngine:
                 # bf16 activations, so the compute dtype follows the bit-width.
                 bits = int(os.environ.get("NANO_BITS", "16"))
                 quantized = self.device == "cuda" and bits in (4, 8)
-                self._torch_dtype = (
-                    torch.bfloat16 if (quantized and bits == 4) else torch.float16
-                )
+                # Compute dtype. The model TRAINS in bf16 (8-bit exponent). On
+                # Apple Silicon, MPS accumulates fp16 matmuls in fp16 (CUDA uses
+                # fp32), so fp16's narrow exponent range overflows this model's
+                # activations and the autoregressive rollout collapses to a
+                # single-pitch drone (verified: fp16 top-token-frac 0.90 vs bf16
+                # 0.78 vs fp32 0.57 at step 17k). Use bf16 on MPS — training
+                # dtype, same memory as fp16, full fp32 exponent range. CUDA fp16
+                # is fine and faster, so keep it. int4 needs bf16 activations.
+                dtype_override = {
+                    "fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16,
+                }.get(os.environ.get("NANO_DTYPE", "").lower())
+                if dtype_override is not None:
+                    self._torch_dtype = dtype_override
+                elif quantized and bits == 4:
+                    self._torch_dtype = torch.bfloat16
+                elif self.device == "cuda":
+                    self._torch_dtype = torch.float16
+                else:  # mps (and any non-cuda accelerator)
+                    self._torch_dtype = torch.bfloat16
                 if self.device != "cpu":
                     self.model = self.model.to(self._torch_dtype)
                 if quantized:
@@ -129,7 +150,9 @@ class InferenceEngine:
                 self.model._bits = bits if quantized else 16
                 if self.device == "cuda":
                     self.model = torch.compile(self.model)
-                wdesc = "fp16" if self._torch_dtype == torch.float16 else "bf16"
+                wdesc = {
+                    torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32",
+                }[self._torch_dtype]
                 if self.model._bits != 16:
                     wdesc = f"int{self.model._bits} weight-only ({wdesc} compute)"
                 print(f"[inference] backend: torch ({self.device}), weights={wdesc}")
