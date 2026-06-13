@@ -54,6 +54,25 @@ uv pip install -e .
 python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 ```
 
+### Web UI
+
+A Flutter web front-end in [webapp/](webapp/) exposes every generation mode and
+parameter the server accepts. With the inference server running (above), start it
+in a second terminal:
+
+```bash
+cd webapp
+flutter pub get      # first run only — fetch dependencies
+flutter run -d chrome
+```
+
+It defaults to `http://127.0.0.1:8000`; point the **server url** field at any
+reachable host (e.g. a deployed Modal endpoint). See
+[webapp/README.md](webapp/README.md) for the full parameter list, `flutter build
+web` deploy bundle, and Modal hosting.
+
+### API
+
 Generate audio from scratch:
 
 ```bash

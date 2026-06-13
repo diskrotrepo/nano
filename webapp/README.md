@@ -12,6 +12,7 @@ uvicorn server.main:app --host 127.0.0.1 --port 8000
 
 # 2. start the web UI (from this dir)
 cd webapp
+flutter pub get      # first run only — fetch dependencies
 flutter run -d chrome
 ```
 

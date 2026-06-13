@@ -161,6 +161,12 @@ DEFAULTS = {
     "lr": 1.5e-4,
     "warmup_steps": 10_000,
     "use_qk_norm": True,
+    # Extend QK-norm into the LyricEncoder. The first v8_sing run trained with
+    # use_qk_norm=True (decoder) but the encoder lacked it; grad forensics traced
+    # that run's gradient explosion (~step 65k) to lyric_encoder.layers.0. See
+    # GPTConfig.use_lyric_qk_norm. Checkpoint-incompatible for the encoder weights
+    # (adds q_norm/k_norm) — needs a fresh ckpt dir, decoder warm-started.
+    "use_lyric_qk_norm": True,
     "steps": 400_000,
     "patience": 20,
     "eval_batches": 50,
@@ -274,6 +280,7 @@ def _build_model_cfg(
     melody_enc_layers: int = DEFAULTS["melody_enc_layers"],
     use_fim: bool = DEFAULTS["use_fim"],
     use_qk_norm: bool = DEFAULTS["use_qk_norm"],
+    use_lyric_qk_norm: bool = DEFAULTS["use_lyric_qk_norm"],
 ):
     from model.nano_audio_gpt import GPTConfig
 
@@ -297,6 +304,7 @@ def _build_model_cfg(
         melody_n_bins=melody_n_bins,
         melody_enc_layers=melody_enc_layers,
         use_qk_norm=use_qk_norm,
+        use_lyric_qk_norm=use_lyric_qk_norm,
     )
 
 

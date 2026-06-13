@@ -150,17 +150,24 @@ def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
 
     vocals_16k = librosa.resample(vocals, orig_sr=44100, target_sr=16000)
 
+    # Language auto-detected (NOT forced to "en"): forcing English produced
+    # ~17% English-phoneme "salad" over non-English vocals in the first v8
+    # corpus AND discarded the language/confidence fields, so the bad pairs
+    # couldn't be filtered without a full re-transcribe. Storing info.language,
+    # language_probability, and the mean segment avg_logprob lets a later filter
+    # drop non-English / low-confidence transcripts cheaply.
     segments, info = whisper_model.transcribe(
         vocals_16k,
-        language="en",
         word_timestamps=True,
         vad_filter=True,
     )
 
     words = []
     full_text_parts = []
+    seg_logprobs = []
     for segment in segments:
         full_text_parts.append(segment.text.strip())
+        seg_logprobs.append(segment.avg_logprob)
         if segment.words:
             for w in segment.words:
                 words.append({"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)})
@@ -171,7 +178,15 @@ def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
 
     # Estimate on the 16 kHz vocals (Nyquist 8 kHz >> vocal F0; cheaper than 44.1).
     gender = estimate_vocal_gender(vocals_16k, sr=16000)
-    return {"text": full_text, "words": words, "gender": gender}
+    avg_logprob = round(sum(seg_logprobs) / len(seg_logprobs), 4) if seg_logprobs else None
+    return {
+        "text": full_text,
+        "words": words,
+        "gender": gender,
+        "language": info.language,
+        "language_probability": round(info.language_probability, 4),
+        "avg_logprob": avg_logprob,
+    }
 
 
 def _flush_shards(lyrics_dir: Path, lyrics: dict, dirty: set[int]) -> None:

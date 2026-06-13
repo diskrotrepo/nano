@@ -111,9 +111,12 @@ class TrainConfig:
     wandb_project: str | None = None
     wandb_run_name: str | None = None
 
-    # use_qk_norm=True is the bespoke model's shape (GPTConfig's own default
-    # stays False only so pre-qk-norm checkpoint cfg dicts keep loading).
-    model: GPTConfig = field(default_factory=lambda: GPTConfig(use_qk_norm=True))
+    # use_qk_norm / use_lyric_qk_norm = True is the bespoke model's shape (the
+    # GPTConfig defaults stay False only so pre-qk-norm checkpoint cfg dicts keep
+    # loading). use_lyric_qk_norm extends QK-norm into the LyricEncoder (the fix
+    # for the v8_sing gradient runaway traced to lyric_encoder.layers.0).
+    model: GPTConfig = field(
+        default_factory=lambda: GPTConfig(use_qk_norm=True, use_lyric_qk_norm=True))
 
 
 def _setup_dist(cfg: TrainConfig) -> bool:

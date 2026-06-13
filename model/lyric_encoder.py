@@ -695,7 +695,8 @@ class _SinusoidalPositionalEncoding(nn.Module):
 class _EncoderLayer(nn.Module):
     """Pre-norm bidirectional self-attention + GELU MLP (matches house style)."""
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float,
+                 use_qk_norm: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -703,6 +704,14 @@ class _EncoderLayer(nn.Module):
         self.ln1 = nn.RMSNorm(d_model)
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
+        # Per-head-dim QK-norm, mirroring the decoder's CausalSelfAttention. The
+        # decoder got this in the 2026-06-12 stability fix but the encoder didn't;
+        # grad forensics on the stopped v8_sing run (50k->65k optimizer state)
+        # traced the gradient runaway to this layer's qkv/ln1 — its unbounded
+        # attention logits. Gated by GPTConfig.use_lyric_qk_norm (default off so
+        # pre-fix checkpoints still load strictly).
+        self.q_norm = nn.RMSNorm(self.head_dim) if use_qk_norm else None
+        self.k_norm = nn.RMSNorm(self.head_dim) if use_qk_norm else None
         self.ln2 = nn.RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_ff, bias=False)
         self.fc2 = nn.Linear(d_ff, d_model, bias=False)
@@ -715,6 +724,9 @@ class _EncoderLayer(nn.Module):
         q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, is_causal=False,
             dropout_p=self.dropout if self.training else 0.0,
@@ -743,13 +755,15 @@ class LyricEncoder(nn.Module):
         max_len: int = 256,
         vocab_size: int = PHONEME_VOCAB_SIZE,
         dropout: float = 0.05,
+        use_qk_norm: bool = False,
     ):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=PAD_PHONEME_ID)
         self.pos = _SinusoidalPositionalEncoding(d_model, max_len)
         self.drop = nn.Dropout(dropout)
         self.layers = nn.ModuleList(
-            [_EncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+            [_EncoderLayer(d_model, n_heads, d_ff, dropout, use_qk_norm=use_qk_norm)
+             for _ in range(n_layers)]
         )
         self.ln_final = nn.RMSNorm(d_model)
         self.apply(self._init_weights)

@@ -123,6 +123,13 @@ class GPTConfig:
     # entrypoints (DEFAULTS / TrainConfig) enable it explicitly, and v8+
     # checkpoints carry the key in their saved cfg.
     use_qk_norm: bool = False
+    # Same QK-norm, applied inside the LyricEncoder's bidirectional self-attention
+    # (model/lyric_encoder.py). Separate flag because the encoder was added after
+    # use_qk_norm and the original v8_sing run trained without it: grad forensics
+    # traced that run's gradient explosion to lyric_encoder.layers.0 (unbounded
+    # encoder attention logits). Default False so every existing checkpoint's cfg
+    # dict still loads strictly; the train entrypoints enable it for v8+.
+    use_lyric_qk_norm: bool = False
 
     @property
     def n_control(self) -> int:
@@ -363,6 +370,7 @@ class NanoAudioGPT(nn.Module):
                 max_len=cfg.max_lyric_len,
                 vocab_size=cfg.phoneme_vocab_size,
                 dropout=cfg.dropout,
+                use_qk_norm=cfg.use_lyric_qk_norm,
             )
         # MelodyEncoder also lives INSIDE the model (same rationale as the lyric
         # encoder: DDP grad-sync + saves in the model state_dict). Its output is
