@@ -22,6 +22,7 @@ matches the question.
 | Am I overfitting / at capacity? | `modal run scripts/eval_train_vs_val.py` |
 | Is lyric conditioning earning its compute? (val-loss ablation) | `modal run scripts/eval_lyrics_ablation.py` |
 | Can a listener make out the words? (intelligibility / WER) | `modal run scripts/eval_lyric_wer.py` (tune `--cfg-scale`, `--lyric-cfg-scale`) |
+| Best lyric/cfg settings, with clips to listen to? (real path) | `modal run scripts/eval_lyric_sweep.py` (grid: cfg × lyric_cfg × ladder × {lyrics, instrumental}; sweetener ON; WER + one MP3 per cell) |
 | What sampling params are best? | `python -m eval.sweep.run_sweep --stage 1` then `--stage 2 --top-n 4` |
 | How well is each genre covered? | `python -m eval.genre_sweep` (gaps: `python eval/genre_gap_eval.py`) |
 | Is the DAC codec itself fine? | `python scripts/dac_roundtrip.py` |
@@ -66,6 +67,21 @@ conditioned on held-out lyric lines, transcribes the output with the same
 Demucs+Whisper pipeline used to build the training lyrics, and reports WER vs the
 input lyric. Gibberish ≈ 1.0; falling WER across checkpoints == emerging
 intelligibility. Raise `--lyric-cfg-scale` (e.g. 5–6) to push the lyric axis harder.
+
+### Realistic lyric sweep — `eval_lyric_sweep` (Modal, H100)
+```bash
+modal run scripts/eval_lyric_sweep.py --ckpt-path /ckpts/v8_sing2/best_inference.pt
+# flags: --n-clips 5  --seconds 12  --cfg-scales 3.0,5.0  --lyric-cfgs 0.0,3.0,6.0
+```
+Like `eval_lyric_wer` but through the **exact `/generate` path** — `InferenceEngine`
++ the prompt **sweetener ON** + per-cb ladder — so the clips match what users hear.
+Grid = `cfg × lyric_cfg × ladder(HOT_FLAT/COLD_LADDER) × {lyrics, instrumental}` =
+16 cells (12 lyric + 4 instrumental controls), `--n-clips` held-out lyrics each.
+Per cell: WER (lyric cells) or leaked-word count (instrumental cells should be ≈0 —
+confirms the `<instrumental>` marker) **plus one MP3 saved** to nano-output
+(`/lyric_sweep/<tag>/`) to listen. Pull: `modal volume get nano-output /lyric_sweep/<tag> ./sweep_clips --force`.
+Use `eval_lyric_wer` for the clean isolated WER number; use this for picking
+serving settings + hearing them.
 
 ### Sampling sweep — `eval.sweep.run_sweep`
 ```bash
