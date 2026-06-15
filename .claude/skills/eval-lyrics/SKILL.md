@@ -11,6 +11,10 @@ allowed-tools: Read, Bash
 
 # Evaluate lyrics — data health and model intelligibility
 
+> Want the **whole-corpus** readiness view (all streams + scale + melody +
+> duration), not just lyrics? Use **eval-training-data** — it wraps the same
+> audit and routes back here for the lyric detail below.
+
 Two distinct questions live here. Route first:
 
 | Question | Command |

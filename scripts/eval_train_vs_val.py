@@ -35,10 +35,11 @@ ckpts_vol = modal.Volume.from_name("nano-ckpts")
 @app.function(
     image=image,
     gpu="H100",
-    timeout=60 * 30,
+    timeout=60 * 60,
     volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol},
 )
-def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_ratio: float = 0.12):
+def eval_splits(n_batches: int = 50, batch_size: int = 64, seed: int = 42, val_ratio: float = 0.12,
+                ckpt_path: str = "/ckpts/v8_sing2/best.pt"):
     import torch
     from torch.utils.data import DataLoader
 
@@ -49,7 +50,7 @@ def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_
     from diskrot.train import TrainConfig, _evaluate
 
     device = "cuda"
-    ckpt = torch.load("/ckpts/best.pt", map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model_cfg = GPTConfig(**ckpt["cfg"])
     model = NanoAudioGPT(model_cfg).to(device)
     state_dict = {
@@ -57,7 +58,7 @@ def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_
         for k, v in ckpt["model"].items()
     }
     model.load_state_dict(state_dict)
-    print(f"loaded best.pt — step={ckpt['step']} best_val_loss={ckpt['best_val_loss']:.4f}")
+    print(f"loaded {ckpt_path} — step={ckpt['step']} best_val_loss={ckpt['best_val_loss']:.4f}")
 
     segment_frames = int(10.0 * DACodec.FRAME_RATE_HZ)
 
@@ -78,17 +79,22 @@ def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_
             "/tokens", segment_frames=segment_frames, split=split,
             val_ratio=val_ratio, seed=seed,
             tags_path="/tokens/tags.json", lyrics_path="/tokens/lyrics",
+            phonemes_path="/tokens/phonemes",
         )
         if text_encoder is not None:
             new_tags = sorted(set(ds._tags.values()) - set(tag_cache))
             if new_tags:
+                emb_bs = 256
                 with torch.no_grad():
-                    for tag in new_tags:
-                        emb = text_encoder._clap.get_text_embeddings([tag])
-                        tag_cache[tag] = emb.squeeze(0).to(device)
+                    for i in range(0, len(new_tags), emb_bs):
+                        chunk = new_tags[i:i + emb_bs]
+                        embs = text_encoder._clap.get_text_embeddings(chunk)
+                        for tag, emb in zip(chunk, embs):
+                            tag_cache[tag] = emb.to(device)
+                print(f"[tags] embedded {len(new_tags)} unique captions for {split}", flush=True)
         loader = DataLoader(
             ds, batch_size=batch_size, shuffle=True,
-            num_workers=2, pin_memory=True, drop_last=True, persistent_workers=True,
+            num_workers=8, pin_memory=True, drop_last=True, persistent_workers=True,
             collate_fn=collate_lyrics,
         )
         mean, per_cb = _evaluate(model, loader, tcfg, n_batches,
@@ -110,5 +116,5 @@ def eval_splits(n_batches: int = 100, batch_size: int = 64, seed: int = 42, val_
 
 
 @app.local_entrypoint()
-def main(n_batches: int = 100, batch_size: int = 64):
-    eval_splits.remote(n_batches=n_batches, batch_size=batch_size)
+def main(n_batches: int = 50, batch_size: int = 64, ckpt_path: str = "/ckpts/v8_sing2/best.pt"):
+    eval_splits.remote(n_batches=n_batches, batch_size=batch_size, ckpt_path=ckpt_path)

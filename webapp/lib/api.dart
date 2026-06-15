@@ -59,7 +59,7 @@ class GenParams {
   static const double defaultTemperature = 0.8;
   static const int defaultTopK = 120;
   static const double defaultTopP = 0.95;
-  static const double defaultCfgScale = 4.0;
+  static const double defaultCfgScale = 7.0;
   static const double defaultLyricCfgScale = 3.0;
   static const double defaultMelodyCfgScale = 0.0;
 
@@ -67,8 +67,9 @@ class GenParams {
   double temperature = defaultTemperature;
   int topK = defaultTopK;
   double topP = defaultTopP;
-  String perCbTemperature = '';
-  String perCbTopK = '';
+  // Sweep winner cfg7.0_WARM_LADDER (eval/sweep/config.py): WARM temp + top_k ladders.
+  String perCbTemperature = '1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42';
+  String perCbTopK = '120,90,70,50,36,26,18,12,8';
   String perCbTopP = '';
   double cfgScale = defaultCfgScale;
   double lyricCfgScale = defaultLyricCfgScale;

@@ -168,10 +168,12 @@ async def generate_endpoint(
     temperature: float = Form(0.9),
     top_k: int = Form(50),
     top_p: float = Form(0.95),
-    per_cb_temperature: str = Form(""),
-    per_cb_top_k: str = Form(""),
+    # Defaults = sweep winner cfg7.0_WARM_LADDER (eval/sweep/config.py). The WARM
+    # ladder rides per_cb_temperature/top_k; top_p (0.95) and cfg (7.0) below match.
+    per_cb_temperature: str = Form("1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"),
+    per_cb_top_k: str = Form("120,90,70,50,36,26,18,12,8"),
     per_cb_top_p: str = Form(""),
-    cfg_scale: float = Form(3.0),
+    cfg_scale: float = Form(7.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
     gender: str = Form(""),

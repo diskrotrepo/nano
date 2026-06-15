@@ -34,6 +34,24 @@ PROMPTS = {
 }
 
 
+# ── lyric-conditioned prompts: the same cfg×profile grid is swept over these too,
+# so we find non-collapse settings for SUNG generation, not just instrumental.
+# tags are caption-style (vocals-forward); lyrics are a clear English line. The
+# runner combines them as "tags. lyrics" (server convention) AFTER flattening any
+# internal ". " in the tags, so the caption can't spill into the lyric stream. ──
+LYRIC_CFG = 3.0   # moderate lyric guidance, held constant while cfg/profile sweep
+LYRIC_PROMPTS = {
+    "pop_vocal": {
+        "tags": "An upbeat pop song with a clear female lead vocal, bright synths, punchy drums and warm bass, catchy and energetic",
+        "lyrics": "Hold me close under the city lights tonight, we are electric and we will never fade away",
+    },
+    "ballad": {
+        "tags": "A slow emotional piano ballad with a soft male lead vocal, gentle strings, intimate and warm",
+        "lyrics": "I remember every word you said, the quiet way you held my hand in the dark",
+    },
+}
+
+
 def all_settings():
     """15 settings: cfg(5) x profile(3). Each is a dict ready for
     InferenceEngine.generate_audio + an id string."""

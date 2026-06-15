@@ -18,8 +18,10 @@ Grid (4 axes):
   cfg_scale          x {3.0, 5.0}
   lyric_cfg_scale    x {0.0, 3.0, 6.0}   (lyric cells only)
   ladder             x {HOT_FLAT, COLD_LADDER}
-  conditioning       x {lyrics, instrumental}
--> 12 lyric cells + 4 instrumental controls = 16 cells, n_clips each.
+  conditioning       x {lyrics, instrumental, none}
+-> 12 lyric cells + 4 instrumental + 4 none (tags-only, no lyric stream at all)
+   = 20 cells, n_clips each. "none" is the genuine lyric-free baseline:
+   instrumental still feeds the <instrumental> marker header, "none" feeds nothing.
 
 Run:  modal run scripts/eval_lyric_sweep.py --ckpt-path /ckpts/v8_sing2/best_inference.pt
       modal run scripts/eval_lyric_sweep.py --n-clips 3 --seconds 12
@@ -77,11 +79,13 @@ output_vol = modal.Volume.from_name("nano-output", create_if_missing=True)
 # Ladder profiles (temperature, top_k), reused from eval/sweep/config.py — scalar
 # = flat, length-9 = per-codebook (coarse hot / fine cold).
 LADDERS = {
-    "HOT_FLAT": (0.9, 50),
+    # COLD_LADDER first: it's the realistic serving config, so its clips land
+    # before the HOT_FLAT control (which sounds like noise on a 9-codebook model).
     "COLD_LADDER": (
         [0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25],
         [120, 90, 70, 50, 36, 26, 18, 12, 8],
     ),
+    "HOT_FLAT": (0.9, 50),
 }
 
 
@@ -164,6 +168,10 @@ def sweep(
             for lcfg in lcfgs:
                 cells.append({"cond": "lyrics", "cfg": cfg, "lyric_cfg": lcfg, "ladder": ladder_name})
             cells.append({"cond": "instrumental", "cfg": cfg, "lyric_cfg": 0.0, "ladder": ladder_name})
+            # "none" = tags only, NO lyric stream at all (not even the marker
+            # header) — the genuine lyric-free baseline. Metric is leaked_words,
+            # same as instrumental, but here nothing suppresses vocals.
+            cells.append({"cond": "none", "cfg": cfg, "lyric_cfg": 0.0, "ladder": ladder_name})
 
     tag = ckpt_path.rstrip("/").split("/")[-1].replace(".pt", "")
     out_dir = f"/outputs/lyric_sweep/{tag}"
@@ -181,9 +189,16 @@ def sweep(
                 if not r["ref"]:
                     continue
                 lyric_field = r["ref"]
-            else:
+            elif cell["cond"] == "instrumental":
                 lyric_field = "[instrumental]"
-            combined = f"{r['sweet']}. {lyric_field}" if r["sweet"] else lyric_field
+            else:  # "none" — tags only, no lyric field appended
+                lyric_field = None
+            if lyric_field is None:
+                # Tags-only: sanitize internal ". " so no tag prose spills past
+                # the engine's first-". " tags|lyrics split into the lyric slot.
+                combined = r["sweet"].replace(". ", ", ") if r["sweet"] else ""
+            else:
+                combined = f"{r['sweet']}. {lyric_field}" if r["sweet"] else lyric_field
 
             audio, mime = eng.generate_audio(
                 seconds=seconds, text=combined,

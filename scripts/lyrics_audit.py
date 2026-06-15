@@ -1,10 +1,16 @@
-"""Lyric-data health audit: coverage + quality of every conditioning stream.
+"""Training-data health audit: coverage + quality of every conditioning stream.
 
-One CPU container sweeps the nano-tokens volume (and the corpus listing) and
-reports:
+One CPU container sweeps the nano-tokens volume (+ nano-melody + the corpus
+listing) and reports:
 
+  - packed (trainable) corpus size with a scale check vs the ~10k/~50k/~500k
+    rails (see CLAUDE.md "Scale of training data")
   - per-stream coverage of the packed (trainable) corpus: tags, structure,
-    keys, lyrics, phonemes
+    keys, lyrics, phonemes, melody
+  - melody source (.mel.npy on nano-melody) vs packed (.mel.bin) coverage —
+    both must hold for a contour to actually train
+  - song-duration distribution from the packed offsets (and the share shorter
+    than the 60s training crop)
   - lyric breakdown: instrumental(null) / hallucinated (what the filter
     would null, same rules as diskrot/filter_lyrics.py) / vocal-ready /
     never-transcribed
@@ -39,11 +45,15 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
 
 tokens_vol = modal.Volume.from_name("nano-tokens")
 corpus_vol = modal.Volume.from_name("nano-corpus")
+# Source chromagrams live on their own volume (kept off nano-tokens for its
+# inode cap). Read-only here; create_if_missing so the audit still runs before
+# any melody pass has populated it.
+melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
 
 
 @app.function(
     image=image,
-    volumes={"/tokens": tokens_vol, "/corpus": corpus_vol},
+    volumes={"/tokens": tokens_vol, "/corpus": corpus_vol, "/melody": melody_vol},
     timeout=60 * 30,
     # Modal's spontaneous platform cancellations (the same waves that hit the
     # big .map fleets) can kill this single .remote() call mid-sweep — retry.
@@ -94,11 +104,21 @@ def audit():
             merged.update(json.loads(shard.read_text()))
         return merged
 
+    # DAC frame rate (model/codec.py FRAME_RATE_HZ); inlined to keep the slim
+    # image free of torch. seconds = frames / 86.
+    FRAME_RATE_HZ = 86
+    # Corpus health rails (see CLAUDE.md "Scale of training data"): below ~10k is
+    # noise (pipeline-validation only), ~50k is the recommended floor for
+    # coherent output, ~500k is the nano-corpus inode ceiling.
+    FLOOR_NOISE, FLOOR_COHERENT, CEILING = 10_000, 50_000, 500_000
+
     # --- corpus / packed (trainable) ---
     corpus = {p.stem for p in Path("/corpus").glob("*.mp3")}
     print(f"corpus mp3s:              {len(corpus)}")
 
     trainable: set[str] = set()
+    durations: list[float] = []          # per-song seconds (from packed offsets)
+    melody_packed: set[str] = set()      # songs in a shard packed WITH chroma
     packed = Path("/tokens/packed")
     if (packed / "packed_index.json").exists():
         index = json.loads((packed / "packed_index.json").read_text())
@@ -106,8 +126,34 @@ def audit():
             meta = json.loads(
                 (packed / f"packed_{shard_entry['shard_id']:03d}.json").read_text()
             )
-            trainable.update(meta["names"])
+            names = meta["names"]
+            trainable.update(names)
+            # offsets are cumulative frame counts (len == n_songs + 1), so a
+            # song's frame length is the gap between consecutive offsets.
+            offsets = meta.get("offsets")
+            if isinstance(offsets, list) and len(offsets) == len(names) + 1:
+                durations.extend(
+                    (offsets[i + 1] - offsets[i]) / FRAME_RATE_HZ
+                    for i in range(len(names))
+                )
+            # has_melody marks a shard packed with a chroma sidecar. Membership
+            # there is identical to the token .bin (missing chroma is zero-filled,
+            # never dropped), so every name in the shard is melody-PACKED — though
+            # a zero-filled row carries no real contour (see source coverage below).
+            if meta.get("has_melody"):
+                melody_packed.update(names)
     print(f"packed (trainable) songs: {len(trainable)}")
+    n_train = len(trainable)
+    if n_train:
+        if n_train < FLOOR_NOISE:
+            verdict = f"BELOW ~{FLOOR_NOISE//1000}k — expect noise (pipeline-validation only)"
+        elif n_train < FLOOR_COHERENT:
+            verdict = f"below ~{FLOOR_COHERENT//1000}k recommended floor — usable but thin"
+        elif n_train <= CEILING:
+            verdict = f"in the recommended ~{FLOOR_COHERENT//1000}k–{CEILING//1000}k band"
+        else:
+            verdict = f"above the ~{CEILING//1000}k inode ceiling (?)"
+        print(f"  scale check:            {verdict}")
 
     # --- per-stream coverage vs trainable ---
     tags_path = Path("/tokens/tags.json")
@@ -127,6 +173,12 @@ def audit():
 
     lyrics = load_lyrics_shards("/tokens/lyrics")
 
+    # Source chromagrams on nano-melody (the modal_melody.py output). A song with
+    # a .mel.npy here has a real contour; whether it reached the dataset also
+    # needs it folded into the pack (melody_packed below).
+    melody_src = {p.name[: -len(".mel.npy")]
+                  for p in Path("/melody").glob("*.mel.npy")}
+
     def cov(name: str, have: set[str]) -> None:
         n = len(have & trainable) if trainable else len(have)
         pct = n / max(len(trainable), 1)
@@ -138,6 +190,42 @@ def audit():
     cov("keys", set(keys))
     cov("lyrics", set(lyrics))
     cov("phonemes", phonemes)
+    cov("melody", melody_src)
+
+    # --- melody: source vs packed (the two must both hold for the model to use
+    # a contour). source = .mel.npy on nano-melody; packed = folded into a
+    # has_melody pack shard. Source-without-packed means the pack predates the
+    # chroma and needs a re-pack with --mel-cache-dir before melody trains. ---
+    print("\nmelody conditioning:")
+    src_in_train = len(melody_src & trainable)
+    pk_in_train = len(melody_packed & trainable)
+    print(f"  source (.mel.npy):      {src_in_train:>7} / {len(trainable)}  "
+          f"({src_in_train / max(len(trainable), 1):.1%})")
+    print(f"  packed (.mel.bin):      {pk_in_train:>7} / {len(trainable)}  "
+          f"({pk_in_train / max(len(trainable), 1):.1%})")
+    src_not_packed = len((melody_src & trainable) - melody_packed)
+    if src_not_packed:
+        print(f"  source not yet packed:  {src_not_packed}  "
+              f"(re-pack with --mel-cache-dir to make these trainable)")
+    if pk_in_train and src_in_train < pk_in_train:
+        print(f"  packed-but-zero-filled: ~{pk_in_train - src_in_train}  "
+              f"(in a melody shard but no source chroma → silent rows)")
+
+    # --- song-duration distribution (from packed offsets) ---
+    if durations:
+        d = np.array(sorted(durations))
+        print("\nsong-duration distribution (packed, seconds):")
+        for lo, hi in [(0, 20), (20, 30), (30, 60), (60, 120), (120, 10**9)]:
+            n = int(((d >= lo) & (d < hi)).sum())
+            label = f"{lo}-{hi}s" if hi < 10**9 else f"{lo}s+"
+            print(f"  {label:>9}: {n:>7}  ({n / len(d):.1%})")
+        print(f"  mean {d.mean():.0f}s  median {np.median(d):.0f}s  "
+              f"min {d.min():.0f}s  max {d.max():.0f}s")
+        # Songs shorter than the Modal 60s training segment can't fill a crop
+        # (the dataset pads/wraps them) — a large share dilutes the effective set.
+        n_short = int((d < 60).sum())
+        if n_short:
+            print(f"  shorter than 60s crop:  {n_short}  ({n_short / len(d):.1%})")
 
     # --- lyric breakdown (null=instrumental, ABSENT=never transcribed) ---
     instrumental = [k for k, v in lyrics.items() if v is None]

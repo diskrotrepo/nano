@@ -25,29 +25,43 @@ def ckpt_tag(eng) -> str:
     return f"{base}_step{eng.ckpt_step}"
 
 
-def gen_one(eng, setting, prompt_key, clip_idx, tag):
+def _flatten_tags(s: str) -> str:
+    """generate_audio splits text on the FIRST ". " into tags|lyrics, so flatten
+    any internal ". " in a caption to ", " — otherwise the caption tail spills
+    into the lyric stream (instrumental prompts would get sung)."""
+    return s.replace(". ", ", ").strip()
+
+
+def gen_one(eng, setting, tags, lyrics, prompt_key, clip_idx, tag):
+    """One clip. lyrics=None -> instrumental (tags only); else sung (tags+lyrics,
+    moderate lyric_cfg). Collapse features/score apply to both modes."""
     sdir = ROOT / "samples" / tag
     sdir.mkdir(parents=True, exist_ok=True)
+    mode = "lyric" if lyrics else "instr"
+    text = _flatten_tags(tags)
+    if lyrics:
+        text = f"{text}. {lyrics}"
     t0 = time.time()
     audio, mime = eng.generate_audio(
         seconds=C.SECONDS,
-        text=C.PROMPTS[prompt_key],
+        text=text,
         temperature=setting["temperature"],
         top_k=setting["top_k"],
         top_p=setting["top_p"],
         cfg_scale=setting["cfg_scale"],
+        lyric_cfg_scale=(C.LYRIC_CFG if lyrics else None),
     )
     ext = "mp3" if mime == "audio/mpeg" else "wav"
-    path = sdir / f"{setting['id']}__{prompt_key}__c{clip_idx}.{ext}"
+    path = sdir / f"{setting['id']}__{mode}_{prompt_key}__c{clip_idx}.{ext}"
     path.write_bytes(audio)
     feat = features(str(path))
     rec = {
         "setting": setting["id"], "cfg_scale": setting["cfg_scale"],
-        "profile": setting["profile"],
+        "profile": setting["profile"], "mode": mode,
         "prompt": prompt_key, "clip": clip_idx, "file": str(path),
         **feat, "score": score(feat), "gen_sec": round(time.time() - t0, 1),
     }
-    print(f"[{rec['gen_sec']:5.1f}s] {setting['id']:28s} {prompt_key:7s} "
+    print(f"[{rec['gen_sec']:5.1f}s] {setting['id']:24s} {mode:5s} {prompt_key:10s} "
           f"beat={feat['beat']:.2f} sil={feat['sil']*100:3.0f}% score={rec['score']:.3f}")
     return rec
 
@@ -101,16 +115,21 @@ def main():
     if args.stage == 1:
         settings = C.all_settings()
         for s in settings:
-            for pk in C.PROMPTS:
-                recs.append(gen_one(eng, s, pk, 0, tag))
+            for pk, tags in C.PROMPTS.items():               # instrumental
+                recs.append(gen_one(eng, s, tags, None, pk, 0, tag))
+            for pk, lp in C.LYRIC_PROMPTS.items():            # sung
+                recs.append(gen_one(eng, s, lp["tags"], lp["lyrics"], pk, 0, tag))
     elif args.stage == 2:
         keep = set(top_settings_from_manifest(tag, args.top_n))
         settings = [s for s in C.all_settings() if s["id"] in keep]
         print(f"[stage2] refining {len(settings)} settings x 2 clips: {sorted(keep)}")
         for s in settings:
-            for pk in C.PROMPTS:
+            for pk, tags in C.PROMPTS.items():
                 for clip in (1, 2):
-                    recs.append(gen_one(eng, s, pk, clip, tag))
+                    recs.append(gen_one(eng, s, tags, None, pk, clip, tag))
+            for pk, lp in C.LYRIC_PROMPTS.items():
+                for clip in (1, 2):
+                    recs.append(gen_one(eng, s, lp["tags"], lp["lyrics"], pk, clip, tag))
     append_manifest(tag, recs)
     print("\nNow rank:  python -m eval.sweep.rank")
 
