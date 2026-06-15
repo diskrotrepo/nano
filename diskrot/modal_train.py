@@ -311,17 +311,30 @@ def _build_model_cfg(
 def _ddp_worker(
     local_rank: int, world_size: int, cfg_kwargs: dict, model_kwargs: dict,
     shared_bundle: dict | None = None,
-    precomputed_tag_cache: dict | None = None,
+    tag_cache_stacked=None,
+    tag_cache_keys: list | None = None,
 ) -> None:
     """One DDP rank. Runs in a subprocess launched by mp.spawn.
 
     rank 0 re-acquires the checkpoints volume by name so it can commit
     incrementally; non-zero ranks don't touch the volume.
 
-    shared_bundle and precomputed_tag_cache (if provided) are produced once
-    by the parent process — workers reuse them instead of redundantly
-    re-loading 50 GB off the volume / re-encoding CLAP per rank."""
+    shared_bundle and the CLAP cache (if provided) are produced once by the
+    parent process — workers reuse them instead of redundantly re-loading
+    50 GB off the volume / re-encoding CLAP per rank. The CLAP cache crosses
+    the spawn as ONE stacked [n_tags, d] tensor + the key list (not a dict of
+    n_tags separate tensors): mp.spawn shares each tensor via an open FD, so a
+    300k+-tag corpus would open 300k×world_size FDs and abort the spawn with
+    "terminate called without an active exception". The dict is rebuilt here
+    from row views into the single shared tensor — no copy, one FD."""
     from diskrot.train import TrainConfig, train_run
+
+    _setup_mp_sharing()
+    precomputed_tag_cache: dict | None = None
+    if tag_cache_stacked is not None and tag_cache_keys:
+        precomputed_tag_cache = {
+            k: tag_cache_stacked[i] for i, k in enumerate(tag_cache_keys)
+        }
 
     text_conditioned = cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(text_conditioned=text_conditioned, **model_kwargs)
@@ -344,6 +357,26 @@ def _ddp_worker(
     )
 
 
+def _setup_mp_sharing() -> None:
+    """Use the file_system tensor-sharing strategy + faulthandler in every
+    remote/spawned process. The default 'file_descriptor' strategy opens one
+    FD per shared torch tensor; the CLAP cache (300k+ unique tags at the
+    current corpus) crossing a Manager().dict() / mp.spawn then opens
+    hundreds of thousands of FDs and aborts with the bare C++ message
+    "terminate called without an active exception" right after the precompute.
+    file_system uses a refcounting daemon (one FD, not one-per-tensor).
+    faulthandler turns any surviving native abort into a real Python stack."""
+    import faulthandler
+
+    import torch.multiprocessing as _mp
+
+    faulthandler.enable()
+    try:
+        _mp.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+
+
 def _encode_clap_shard(rank: int, shard: list[str], d_model: int, batch: int) -> dict:
     """Worker body shared by single- and multi-GPU paths. Sets the active
     device, loads CLAP onto it, encodes the shard, returns a CPU dict.
@@ -353,6 +386,7 @@ def _encode_clap_shard(rank: int, shard: list[str], d_model: int, batch: int) ->
 
     import torch
 
+    _setup_mp_sharing()
     torch.cuda.set_device(rank)
     from model.text_encoder import CLAPTextEncoder
 
@@ -383,9 +417,24 @@ def _encode_clap_shard(rank: int, shard: list[str], d_model: int, batch: int) ->
 
 
 def _clap_shard_worker(rank: int, shards: list[list[str]], d_model: int,
-                       batch: int, return_dict) -> None:
-    """mp.spawn entrypoint for multi-GPU sharded encoding."""
-    return_dict[rank] = _encode_clap_shard(rank, shards[rank], d_model, batch)
+                       batch: int, out_dir: str) -> None:
+    """mp.spawn entrypoint for multi-GPU sharded encoding. Writes this rank's
+    result as ONE file (stacked [n, d] tensor + key list) rather than pushing
+    tens of thousands of tensors through a Manager().dict(): at the 300k+-tag
+    corpus that per-tensor IPC either exhausts file descriptors (the default
+    sharing strategy → "terminate called" abort) or hangs the gather (the
+    file_system strategy). One contiguous blob per rank sidesteps both."""
+    import os
+
+    import torch
+
+    _setup_mp_sharing()
+    shard_cache = _encode_clap_shard(rank, shards[rank], d_model, batch)
+    keys = list(shard_cache.keys())
+    emb = (torch.stack([shard_cache[k] for k in keys])
+           if keys else torch.empty(0, d_model))
+    torch.save({"keys": keys, "emb": emb},
+               os.path.join(out_dir, f"clap_shard_{rank}.pt"))
 
 
 def _precompute_clap_cache(unique_tags: list[str], d_model: int,
@@ -401,6 +450,7 @@ def _precompute_clap_cache(unique_tags: list[str], d_model: int,
 
     import torch
 
+    _setup_mp_sharing()
     if not unique_tags:
         return {}
 
@@ -411,22 +461,29 @@ def _precompute_clap_cache(unique_tags: list[str], d_model: int,
         # each worker boots a fresh CUDA context — no conflict with whatever
         # the parent has touched. Round-robin sharding (i::n_gpus) interleaves
         # short/long tags so per-GPU padding waste is even.
+        import os
+        import tempfile
+
         import torch.multiprocessing as mp
 
         shards = [unique_tags[i::n_gpus] for i in range(n_gpus)]
         print(f"[clap-parent] sharding {len(unique_tags)} tags across "
               f"{n_gpus} GPUs (batch={BATCH}, bf16)...", flush=True)
         t0 = _t.time()
-        manager = mp.get_context("spawn").Manager()
-        return_dict = manager.dict()
+        # Gather via files, not a Manager().dict(): each rank writes one blob
+        # (see _clap_shard_worker) — pushing 300k+ tensors through a manager
+        # proxy hangs at this corpus size.
+        out_dir = tempfile.mkdtemp(prefix="clap_shards_")
         mp.spawn(
             _clap_shard_worker,
-            args=(shards, d_model, BATCH, return_dict),
+            args=(shards, d_model, BATCH, out_dir),
             nprocs=n_gpus, join=True,
         )
         cache: dict[str, torch.Tensor] = {}
         for rank in range(n_gpus):
-            cache.update(return_dict[rank])
+            blob = torch.load(os.path.join(out_dir, f"clap_shard_{rank}.pt"))
+            for k, row in zip(blob["keys"], blob["emb"]):
+                cache[k] = row
         print(f"[clap-parent] done: {len(cache)} embeddings in "
               f"{_t.time()-t0:.0f}s ({n_gpus}-GPU)", flush=True)
         return cache
@@ -522,13 +579,15 @@ def train_remote(
         _commit_quietly(compile_cache_vol)  # persist the seeded compile cache
 
 
-# Multi-GPU DDP — 8×H100 in a single container, ranks coordinated via mp.spawn.
-# batch_size on this path is *per-rank*; the global batch is n_gpus× that. lr
-# should be sqrt-scaled against the global batch the same way as the single-GPU
-# path (global 32 with per-rank 4 on 8 ranks; lr is sqrt-scaled to 2.1e-4 to match).
+# Multi-GPU DDP — 4×B200 in a single container, ranks coordinated via mp.spawn.
+# batch_size on this path is *per-rank*; the global batch is n_gpus× that. The
+# global batch is held at DEFAULTS["batch_size"] (32) regardless of rank count
+# (per-rank = 32 // n_gpus → 8 on 4 ranks), so the tuned lr (1.5e-4) is unchanged.
+# B200 (192 GB) gives ~2x H100 throughput and far more headroom; 4 ranks (vs 8)
+# also means fewer processes in the NCCL rendezvous.
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="B200:4",
     timeout=60 * 60 * 24,  # 24 hours
     volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol,
              "/compile-cache": compile_cache_vol},
@@ -551,7 +610,7 @@ def train_remote_multi(
     d_ff: int = DEFAULTS["d_ff"],
     dropout: float = DEFAULTS["dropout"],
     text_conditioned: bool = True,
-    n_gpus: int = 8,
+    n_gpus: int = 4,
     segment_seconds: float = DEFAULTS["segment_seconds"],
     max_seq_len: int = DEFAULTS["max_seq_len"],
     # On by default; see train_remote() for the OOM rationale.
@@ -579,6 +638,8 @@ def train_remote_multi(
     from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
     from diskrot.train import TrainConfig
     from model.codec import DACodec
+
+    _setup_mp_sharing()
 
     assert torch.cuda.device_count() >= n_gpus, (
         f"requested n_gpus={n_gpus} but only {torch.cuda.device_count()} CUDA devices visible"
@@ -627,6 +688,17 @@ def train_remote_multi(
         unique_tags = sorted(set(shared_bundle["tags"].values()))
         tag_cache = _precompute_clap_cache(unique_tags, d_model, n_gpus=n_gpus)
 
+    # Hand the CLAP cache to the ranks as ONE stacked tensor + key list rather
+    # than a dict of N separate tensors. mp.spawn shares each torch tensor via
+    # the file_descriptor strategy (one open FD per tensor); at a 300k+-tag
+    # corpus that opens 300k×n_gpus FDs and aborts the spawn with "terminate
+    # called without an active exception" right after the CLAP precompute. One
+    # contiguous tensor = one shared FD; each rank rebuilds {tag: row-view}.
+    tag_cache_keys = list(tag_cache.keys())
+    tag_cache_stacked = (
+        torch.stack([tag_cache[k] for k in tag_cache_keys]) if tag_cache_keys else None
+    )
+
     # Periodically persist the torch.compile cache while the ranks run, so the
     # ~35-min cold-compile artifacts survive even if this container dies mid-run
     # (a daemon thread; the join below ends it with the process).
@@ -640,7 +712,8 @@ def train_remote_multi(
     try:
         mp.spawn(
             _ddp_worker,
-            args=(n_gpus, cfg_kwargs, model_kwargs, shared_bundle, tag_cache),
+            args=(n_gpus, cfg_kwargs, model_kwargs, shared_bundle,
+                  tag_cache_stacked, tag_cache_keys),
             nprocs=n_gpus, join=True,
         )
     finally:
@@ -699,7 +772,9 @@ def main(
     if lora and not init_from:
         raise SystemExit("--lora requires --init-from (e.g. --init-from v8_sing/best.pt)")
     if batch_size <= 0:
-        batch_size = DDP_PER_RANK_BATCH if n_gpus > 1 else DEFAULTS["batch_size"]
+        # Hold the global batch at DEFAULTS["batch_size"] (32) for any rank count:
+        # per-rank = 32 // n_gpus (8 on 4 ranks, 4 on 8 ranks). Keeps lr valid.
+        batch_size = (DEFAULTS["batch_size"] // n_gpus) if n_gpus > 1 else DEFAULTS["batch_size"]
         print(f"[main] batch_size auto-selected = {batch_size} "
               f"(n_gpus={n_gpus}, global batch={batch_size * n_gpus})")
     common = dict(

@@ -162,7 +162,9 @@ curl -X POST http://localhost:8000/infill \
 ```
 
 See the **Inference** section of [README.md](../../../README.md) for the full curl
-set (style blending, extend).
+set (style blending, extend). For **prompt content** — how to write tags, the full
+lyric `[marker]` syntax, and a ready-to-paste example library — see
+[README.prompting.md](../../../README.prompting.md).
 
 ## Comes from
 

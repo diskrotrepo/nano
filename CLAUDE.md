@@ -93,6 +93,8 @@ Task runbooks that orchestrate the CLIs above (link the READMEs, don't duplicate
 - `run-tests` — pytest suite, benchmark marker, `synth_tokens_dir` fixture.
 - `serve-model` — local/Modal inference server and the generation endpoints.
 
+User-facing prompting guide: [README.prompting.md](README.prompting.md) — how to write tags (caption style + sweeten), the full lyric `[marker]` syntax (gender/tempo/key/vocals/section), sampling, and a ready-to-paste example library across `/generate` `/extend` `/cover` `/infill`.
+
 ## Training Defaults
 
 Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `DEFAULTS` in [diskrot/modal_train.py](diskrot/modal_train.py).
