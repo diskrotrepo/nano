@@ -11,6 +11,10 @@ listing) and reports:
     both must hold for a contour to actually train
   - song-duration distribution from the packed offsets (and the share shorter
     than the 60s training crop)
+  - model settings vs data scale: the default 400k-step run translated into
+    effective epochs of unique audio, with an under/over-training verdict
+    (nano is one fixed-shape ~2.0B net, so step count is the lever that has to
+    match the trainable-song scale)
   - lyric breakdown: instrumental(null) / hallucinated (what the filter
     would null, same rules as diskrot/filter_lyrics.py) / vocal-ready /
     never-transcribed
@@ -227,6 +231,38 @@ def audit():
         if n_short:
             print(f"  shorter than 60s crop:  {n_short}  ({n_short / len(d):.1%})")
 
+    # --- model settings vs data scale ---
+    # nano is ONE fixed-shape ~2.0B net (the DEFAULTS dict in
+    # diskrot/modal_train.py is the source of truth — there is no family of
+    # sizes to pick from), so the only training lever that has to match the data
+    # scale is the step count. Translate it into effective epochs of unique
+    # audio: how many times the configured run sweeps the trainable corpus.
+    # Constants mirror DEFAULTS (steps / global batch_size / segment_seconds) —
+    # keep in sync if those change.
+    TRAIN_STEPS, GLOBAL_BATCH, SEG_SECONDS, MODEL_PARAMS = 400_000, 32, 60, "~2.0B"
+    if durations:
+        total_audio_s = float(np.array(durations).sum())
+        crops_drawn = TRAIN_STEPS * GLOBAL_BATCH          # 60s crops the run draws
+        seconds_drawn = crops_drawn * SEG_SECONDS
+        epochs = seconds_drawn / max(total_audio_s, 1.0)
+        print(f"\nmodel settings vs data scale (DEFAULTS: {MODEL_PARAMS}, "
+              f"{TRAIN_STEPS:,} steps, global batch {GLOBAL_BATCH}, {SEG_SECONDS}s crops):")
+        print(f"  trainable audio:        {total_audio_s / 3600:,.0f} h  "
+              f"({total_audio_s / 1e6:.1f}M s over {len(durations)} songs)")
+        print(f"  60s crops over run:     {crops_drawn / 1e6:.1f}M  "
+              f"({seconds_drawn / 3600:,.0f} h drawn)")
+        print(f"  effective epochs:       {epochs:.1f}x over unique audio")
+        # Heuristic band for a fixed-shape run: too few passes leaves the net
+        # undertrained, too many invites repetition/memorization. Tune steps (or
+        # the corpus) to land in the middle.
+        if epochs < 2:
+            verdict = "UNDER ~2x — undertraining risk; raise steps or add data"
+        elif epochs <= 15:
+            verdict = "in the healthy ~2-15x band"
+        else:
+            verdict = "OVER ~15x — repetition/memorization risk; cut steps or add data"
+        print(f"  verdict:                {verdict}")
+
     # --- lyric breakdown (null=instrumental, ABSENT=never transcribed) ---
     instrumental = [k for k, v in lyrics.items() if v is None]
     has_words = {k: v for k, v in lyrics.items()
@@ -301,6 +337,12 @@ def audit():
         print(f"\nkeys.json: {len(keys)} songs, top 8 keys:")
         for label, n in kc.most_common(8):
             print(f"  {label:<12} {n:>7}  ({n / len(keys):.1%})")
+
+    # NOTE: genre mix is intentionally NOT computed here. A regex over captions
+    # in this slim/torch-free container would only reproduce the weak signal
+    # eval/genre_gap_eval.py already owns (regex + CLAP zero-shot, per-gap
+    # floor/verdict, run-over-run snapshot). The eval-training-data skill runs
+    # that tool as a second step for the authoritative genre picture.
 
 
 @app.local_entrypoint()
