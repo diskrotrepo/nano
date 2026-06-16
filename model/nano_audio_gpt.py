@@ -92,7 +92,11 @@ class GPTConfig:
     lyric_enc_layers: int = 3
     lyric_enc_heads: int = 8
     lyric_enc_d_ff: int = 4096
-    max_lyric_len: int = 256
+    # 512 (up from 256): a dense 60s crop can carry ~400-600 phoneme tokens, which
+    # the 256 cap silently truncated (lyric_encoder.append_unit_capped), dropping
+    # the tail words' alignment signal. Only sizes the encoder's non-persistent
+    # sinusoidal PE + the dataset truncation cap (no learned-weight reshape).
+    max_lyric_len: int = 512
     # Melody (chromagram-sequence) conditioning — a time-aligned, MusicGen-Melody
     # style stream, separate from both the pooled-CLAP tag path and the lyric
     # cross-attention. When enabled, a MelodyEncoder projects a [B,T,12] chroma

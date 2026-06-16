@@ -178,13 +178,21 @@ DEFAULTS = {
     # GPTConfig fields). Melody requires the pack to carry the parallel chroma
     # sidecar (modal_melody.py → --mel-cache-dir); without it the model trains the
     # null path only.
-    "ckpt_subdir": "v8_sing",
+    # v8_sing4: fresh start carrying the vocal-supervision fixes — train crops
+    # biased toward sung regions (dataset.bias_vocal_crops) + max_lyric_len 512.
+    # Bumped from v8_sing3 (abandoned at ~1% / step 4k) so a bare relaunch starts
+    # clean rather than resuming the old dir; override with --ckpt-subdir.
+    "ckpt_subdir": "v8_sing4",
     # Lyric (phoneme) conditioning — a ~100M bidirectional encoder feeding a
     # per-block lyric cross-attention. Enabled together with tag conditioning.
     "lyric_enc_layers": 3,
     "lyric_enc_heads": 8,
     "lyric_enc_d_ff": 4096,
-    "max_lyric_len": 256,
+    # 512 (up from 256): a dense 60s crop carries ~400-600 phoneme tokens; the
+    # old 256 cap silently truncated the tail (lyric_encoder.append_unit_capped),
+    # losing alignment signal on the back half of busy crops. Sizes only the
+    # encoder PE (non-persistent) + the dataset cap — no checkpoint reshape.
+    "max_lyric_len": 512,
     # Melody (chroma) conditioning — a small additive encoder over the 12-bin
     # chromagram (~13M params). Enabled together with tags + lyrics.
     "melody_n_bins": 12,

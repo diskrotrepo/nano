@@ -766,6 +766,12 @@ def train_run(
                               keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
                               max_lyric_len=cfg.model.max_lyric_len)
 
+    # Steer training crops toward sung regions so most <vocals> crops actually
+    # carry phonemes (uniform crops often land on a vocal song's instrumental
+    # intro/solo/outro). Train split only — val stays a clean whole-distribution
+    # metric; singing is measured separately via WER (scripts/eval_lyric_wer.py).
+    train_ds.bias_vocal_crops = True
+
     pin = cfg.device == "cuda"
     if use_ddp:
         train_sampler: DistributedSampler | None = DistributedSampler(

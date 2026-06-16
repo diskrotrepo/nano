@@ -163,6 +163,53 @@ def test_lyrics_window_filtering(synth_tokens_dir, tmp_path):
     assert out == ""
 
 
+def test_vocal_crop_bias_increases_word_hits(synth_tokens_dir, tmp_path):
+    """bias_vocal_crops should steer a vocal song's crop to overlap its words.
+
+    The single word sits late in the song, so a uniform crop usually misses it
+    (a <vocals> header with zero phonemes); the biased sampler should land on it
+    the large majority of the time. Drives _choose_crop_start directly so the
+    crop position is observable."""
+    import random
+
+    rate = DACodec.FRAME_RATE_HZ
+    seg = 500
+    T = 1000
+    word = {"word": "late", "start": 10.0, "end": 10.5}  # ~860-903 frames, late
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=T))
+    lyrics_path = tmp_path / "lyrics.json"
+    lyrics_path.write_text(json.dumps({"song_000": {"words": [word]}}))
+    # The deterministic shuffle can place song_000 in either split — use whichever
+    # one actually holds it so the test doesn't depend on the shuffle order.
+    ds = None
+    for split in ("train", "val"):
+        cand = TokenDataset(tokens_dir, segment_frames=seg,
+                            lyrics_path=lyrics_path, split=split, seed=42, val_ratio=0.25)
+        if "song_000" in cand.names:
+            ds = cand
+            break
+    assert ds is not None, "song_000 missing from both splits"
+    idx = ds.names.index("song_000")
+
+    def hit_rate(bias: bool, n: int = 500) -> float:
+        ds.bias_vocal_crops = bias
+        hits = 0
+        for _ in range(n):
+            start = ds._choose_crop_start(idx, T)
+            assert 0 <= start <= T - seg
+            s, e = start / rate, (start + seg) / rate
+            if word["end"] > s and word["start"] < e:
+                hits += 1
+        return hits / n
+
+    random.seed(0)
+    uniform = hit_rate(False)
+    biased = hit_rate(True)
+    assert uniform < 0.5, f"uniform hit rate unexpectedly high: {uniform}"
+    assert biased > 0.8, f"biased hit rate too low: {biased}"
+    assert biased - uniform > 0.3
+
+
 def test_malformed_word_entries_filtered_at_load(synth_tokens_dir, tmp_path):
     """Malformed word entries (missing/non-numeric start/end, missing word) are
     dropped at load so the crop builders never hit a KeyError/TypeError. A song

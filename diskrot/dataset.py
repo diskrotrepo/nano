@@ -316,6 +316,15 @@ def load_mmap_bundle(
     }
 
 
+# When TokenDataset.bias_vocal_crops is set (train split only), the probability
+# that a vocal-ready song's crop is steered to overlap a transcribed word rather
+# than chosen uniformly. Uniform crops frequently land on a vocal song's
+# instrumental intro/solo/outro — a <vocals> header with zero phonemes that
+# starves the lyric cross-attention. The remaining 1-p stays uniform so the model
+# still sees some <vocals>-over-instrumental crops (and never overfits the header).
+_VOCAL_CROP_BIAS_PROB = 0.9
+
+
 class TokenDataset(Dataset):
     def __init__(
         self,
@@ -418,6 +427,9 @@ class TokenDataset(Dataset):
         ds._word_phones = OrderedDict()
         ds._word_phones_cap = min(len(ds.names), 4096) or 1
         ds.has_tags = len(ds._tags) > 0 or len(ds._lyrics) > 0
+        # Steer train crops toward sung regions; set True on the train split in
+        # diskrot/train.py. See _choose_crop_start / _VOCAL_CROP_BIAS_PROB.
+        ds.bias_vocal_crops = False
         return ds
 
     def __getstate__(self) -> dict:
@@ -563,10 +575,40 @@ class TokenDataset(Dataset):
                     break  # whole-unit truncation — never slice a word/marker mid-unit
         return ids
 
+    def _choose_crop_start(self, idx: int, T: int) -> int:
+        """Pick the crop's start frame in ``[0, T - segment_frames]``.
+
+        Default is uniform-random (the historical behavior). When
+        ``bias_vocal_crops`` is set — train split only — a vocal-ready song's
+        window is biased to overlap a transcribed word so the crop actually
+        carries phonemes: uniform crops routinely land on a vocal song's
+        instrumental intro/solo/outro and return a ``<vocals>`` header with zero
+        words, starving the lyric cross-attention. Instrumental / never-
+        transcribed / wordless songs (and the ``1 - _VOCAL_CROP_BIAS_PROB`` share
+        of vocal ones) stay uniform.
+        """
+        max_start = T - self.segment_frames
+        if max_start <= 0:
+            return 0
+        if self.bias_vocal_crops and random.random() < _VOCAL_CROP_BIAS_PROB:
+            entry = self._lyrics.get(self.names[idx])
+            words = entry.get("words") if isinstance(entry, dict) else None
+            if words:
+                w = random.choice(words)
+                seg_sec = self.segment_frames / DACodec.FRAME_RATE_HZ
+                # start_sec range that keeps word w fully inside the crop window,
+                # clamped to the valid range; drawn uniformly within it.
+                lo = max(0.0, float(w["end"]) - seg_sec)
+                hi = min(max_start / DACodec.FRAME_RATE_HZ, float(w["start"]))
+                if lo <= hi:
+                    start = int(round(random.uniform(lo, hi) * DACodec.FRAME_RATE_HZ))
+                    return max(0, min(start, max_start))
+        return random.randint(0, max_start)
+
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, torch.Tensor, torch.Tensor | None]:
         t = self._get(idx)  # [K, T_full] int16 — torch.Tensor or np.memmap view
         T = t.shape[1]
-        start = random.randint(0, T - self.segment_frames)
+        start = self._choose_crop_start(idx, T)
         crop = t[:, start:start + self.segment_frames]
         if not isinstance(crop, torch.Tensor):
             # mmap path: materialize the ~46 KB int16 crop (30s case) so the
