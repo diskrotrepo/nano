@@ -8,6 +8,8 @@ Endpoints:
     POST /generate       from scratch — random seed → fresh clip
     POST /extend         continue forward from a point T → [original 0→T | new]
     POST /cover          re-render a hummed melody (chroma) in the prompt's timbre
+    POST /infill         fill the gap between two clips → [before | middle | after]
+    POST /stem           remove/isolate stems via Demucs (no model — any ckpt)
 
     /generate, /extend accept optional text (tags), lyrics, gender, bpm, key,
 vocal-presence, and style_audio conditioning (gender/bpm/key/vocals ride the
@@ -82,6 +84,32 @@ def _norm_gender(gender: str) -> str | None:
     elif g in ("f", "woman", "girl"):
         g = "female"
     return g if g in ("male", "female") else None
+
+
+# Demucs (htdemucs) source order — the four stems the /stem endpoint can keep/drop.
+STEM_NAMES = ("drums", "bass", "other", "vocals")
+_STEM_ALIASES = {
+    "vocal": "vocals", "vox": "vocals", "voice": "vocals", "voices": "vocals",
+    "drum": "drums", "perc": "drums", "percussion": "drums",
+    "instrument": "other", "instruments": "other",
+}
+
+
+def _parse_stem_list(raw: str) -> list[str]:
+    """Comma-separated stem names -> canonical Demucs stems, de-duplicated.
+
+    Folds a few aliases (``vox`` -> ``vocals`` etc.); raises 400 on an unknown
+    name so a typo fails loudly instead of silently keeping/dropping nothing."""
+    out: list[str] = []
+    for tok in raw.split(","):
+        s = _STEM_ALIASES.get(tok.strip().lower(), tok.strip().lower())
+        if not s:
+            continue
+        if s not in STEM_NAMES:
+            raise HTTPException(400, f"unknown stem '{tok.strip()}'; valid: {', '.join(STEM_NAMES)}")
+        if s not in out:
+            out.append(s)
+    return out
 
 
 def _maybe_sweeten(prompt: str, sweeten: bool) -> tuple[str, dict[str, str]]:
@@ -408,3 +436,47 @@ async def infill_endpoint(
         raise HTTPException(400, str(e))
     _save_output(body, mime, "infill", prompt)
     return Response(content=body, media_type=mime, headers=sweet_headers)
+
+
+@app.post("/stem")
+async def stem_endpoint(
+    audio: UploadFile = File(...),
+    remove: str = Form("vocals"),
+    keep: str = Form(""),
+) -> Response:
+    """Remove or isolate instrument stems from an upload via Demucs separation.
+
+    Pure source separation — the nano model is NOT used, so this works with any
+    checkpoint (and needs the `demucs` package installed). Demucs splits the audio
+    into drums / bass / other / vocals; the result is the kept stems summed back
+    into one mono mixdown.
+
+    - `remove` (default `vocals`): comma-separated stems to drop — e.g.
+      `remove=vocals` -> instrumental, `remove=drums,bass` -> drop the rhythm
+      section.
+    - `keep`: when set, OVERRIDES `remove` and keeps exactly these — e.g.
+      `keep=vocals` -> a-cappella, `keep=drums` -> drums only.
+
+    Stem names: drums, bass, other, vocals (aliases like `vox` fold in).
+    Generating a brand-new stem (the complementary "add" direction) needs a
+    stem-conditioned checkpoint and is not this endpoint.
+    """
+    assert engine is not None
+    data = await audio.read()
+    if not data:
+        raise HTTPException(400, "empty audio upload")
+    keep_list = _parse_stem_list(keep)
+    remove_list = _parse_stem_list(remove)
+    # `keep` wins when given; otherwise keep everything not in `remove`.
+    if keep_list:
+        keep_set = [s for s in STEM_NAMES if s in keep_list]
+    else:
+        keep_set = [s for s in STEM_NAMES if s not in remove_list]
+    if not keep_set:
+        raise HTTPException(400, "nothing left to keep — remove fewer stems")
+    try:
+        body, mime = engine.separate_stems(data, keep=keep_set)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    _save_output(body, mime, "stem", "+".join(keep_set))
+    return Response(content=body, media_type=mime)

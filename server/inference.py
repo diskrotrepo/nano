@@ -79,6 +79,7 @@ class InferenceEngine:
         self.codec = DACodec(device=self.device)
         self.text_encoder: CLAPTextEncoder | None = None
         self.sweetener: PromptSweetener | None = None  # lazy — only built on first use
+        self._demucs = None  # (model, apply_fn) — lazy, only built on first /stem call
 
         ckpt_path = ckpt_path or os.environ.get("NANO_CKPT", "./checkpoints/latest.pt")
         if Path(ckpt_path).exists():
@@ -704,6 +705,65 @@ class InferenceEngine:
             finally:
                 os.unlink(tmp)
         return body, mime, clap
+
+    def _ensure_demucs(self):
+        """Lazy-load Demucs (htdemucs) for stem separation; cached after first use.
+
+        Reuses the same loader the transcribe pipeline uses, so the server and
+        data-prep agree on the model. Demucs is a data-prep dependency and may be
+        absent in a slim serving image — surface that as a clear error rather than
+        a bare ImportError deep in the request."""
+        if self._demucs is None:
+            try:
+                from diskrot.transcribe_lyrics import _load_demucs
+                self._demucs = _load_demucs(self.device)
+            except ImportError as e:
+                raise RuntimeError(
+                    "stem separation needs the `demucs` package, which isn't "
+                    "installed in this environment (pip install demucs)."
+                ) from e
+        return self._demucs
+
+    @torch.no_grad()
+    def separate_stems(self, audio_bytes: bytes, keep: list[str]) -> tuple[bytes, str]:
+        """Separate the upload with Demucs and remix only the ``keep`` stems.
+
+        Pure source separation — the nano model is NOT involved, so this works
+        with any checkpoint. Demucs (``htdemucs``) splits the audio into
+        drums / bass / other / vocals; the stems named in ``keep`` are summed back
+        into a single mixdown and re-encoded. ``keep=[drums,bass,other]`` yields an
+        instrumental, ``keep=[vocals]`` an a-cappella. Output is mono (the rest of
+        the server is mono), 44.1 kHz, mp3.
+        """
+        model, apply_fn = self._ensure_demucs()
+        names = list(model.sources)  # ['drums', 'bass', 'other', 'vocals']
+        keep_idx = [i for i, n in enumerate(names) if n in keep]
+        if not keep_idx:
+            raise ValueError(f"none of {keep} are Demucs stems ({names})")
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_bytes)
+            in_path = f.name
+        try:
+            # Demucs is a stereo model — load stereo (mono->stereo if needed).
+            audio, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=False)
+        finally:
+            os.unlink(in_path)
+        wav = torch.from_numpy(audio)  # [2, T] or [T]
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0).repeat(2, 1)  # mono -> stereo
+        wav = wav.unsqueeze(0).to(self.device)  # [1, 2, T]
+
+        sources = apply_fn(model, wav, device=self.device)  # [1, S, 2, T]
+        mixed = sources[0, keep_idx].sum(dim=0)  # [2, T] — sum kept stems
+        mono = mixed.mean(dim=0).cpu().unsqueeze(0)  # [1, T]
+
+        meta = self._gen_metadata(
+            "stem",
+            kept=",".join(n for n in names if n in keep),
+            removed=",".join(n for n in names if n not in keep),
+        )
+        return _encode_audio(mono, self.codec.SAMPLE_RATE, meta)
 
 
 def _crossfade_concat(

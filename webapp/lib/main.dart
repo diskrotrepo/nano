@@ -129,11 +129,14 @@ class _HomePageState extends State<HomePage> {
       ..perCbTopK = _perTopKCtl.text
       ..perCbTopP = _perTopPCtl.text;
 
+    final isStem = _mode == NanoMode.stem;
     final clip = GenClip(
       id: _clipSeq++,
       mode: _mode,
-      prompt: _promptCtl.text.trim(),
-      lyrics: _lyricsCtl.text.trim(),
+      prompt: isStem
+          ? 'keep ${kStemNames.where(_params.stemKeep.contains).join(', ')}'
+          : _promptCtl.text.trim(),
+      lyrics: isStem ? '' : _lyricsCtl.text.trim(),
     );
     setState(() {
       _busy = true;
@@ -239,7 +242,7 @@ class _HomePageState extends State<HomePage> {
               const Positioned.fill(
                 child: Padding(
                   padding: EdgeInsets.all(12),
-                  child: DropOverlay(label: 'drop to extend or cover'),
+                  child: DropOverlay(label: 'drop to extend, cover or split stems'),
                 ),
               ),
           ],
@@ -295,11 +298,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   List<Widget> _controlsChildren() {
+    // Stem separation is pure DSP — no prompt/lyrics/sampling apply, so those
+    // cards are hidden and the panel collapses to just the stem picker.
+    final isStem = _mode == NanoMode.stem;
     return [
       _header(),
       const SizedBox(height: 18),
-      _conditioningCard(),
-      _samplingCard(),
+      if (!isStem) _conditioningCard(),
+      if (!isStem) _samplingCard(),
       _modeCard(),
       _runButton(),
       if (_error != null) _errorBox(),
@@ -713,7 +719,7 @@ class _HomePageState extends State<HomePage> {
           // panel, or upload a file (e.g. a hum to cover). Either flips to the
           // extend/cover controls.
           _filePickRow(
-            label: 'or drop / upload audio to extend or cover',
+            label: 'or drop / upload audio to extend, cover or split stems',
             file: null,
             onPick: _uploadSource,
             onClear: () {},
@@ -730,7 +736,11 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 12),
         _transformToggle(),
         const SizedBox(height: 14),
-        ...(_mode == NanoMode.cover ? _coverControls() : _extendControls()),
+        ...switch (_mode) {
+          NanoMode.cover => _coverControls(),
+          NanoMode.stem => _stemControls(),
+          _ => _extendControls(),
+        },
       ],
     );
   }
@@ -859,6 +869,8 @@ class _HomePageState extends State<HomePage> {
         seg(NanoMode.extend, Icons.east),
         const SizedBox(width: 8),
         seg(NanoMode.cover, Icons.brush),
+        const SizedBox(width: 8),
+        seg(NanoMode.stem, Icons.layers),
       ],
     );
   }
@@ -932,6 +944,96 @@ class _HomePageState extends State<HomePage> {
     ];
   }
 
+  List<Widget> _stemControls() {
+    Widget stemChip(String stem) {
+      final kept = _params.stemKeep.contains(stem);
+      return InkWell(
+        onTap: () => setState(() {
+          if (kept) {
+            _params.stemKeep.remove(stem);
+          } else {
+            _params.stemKeep.add(stem);
+          }
+        }),
+        borderRadius: BorderRadius.circular(4),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: kept ? NanoColors.pink : Colors.transparent,
+            border:
+                Border.all(color: kept ? NanoColors.pink : NanoColors.border),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(kept ? Icons.check : Icons.add,
+                  size: 13, color: kept ? Colors.black : NanoColors.textDim),
+              const SizedBox(width: 6),
+              Text(stem,
+                  style: TextStyle(
+                    color: kept ? Colors.black : NanoColors.textDim,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  )),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return [
+      const Padding(
+        padding: EdgeInsets.only(bottom: 14),
+        child: Text(
+          'Splits the dropped clip into stems with Demucs and keeps the ones you '
+          'pick — the rest are dropped. No model is involved (works with any '
+          'checkpoint), but the server needs the demucs package installed.',
+          style:
+              TextStyle(color: NanoColors.textDim, fontSize: 11, height: 1.4),
+        ),
+      ),
+      const Text('keep stems',
+          style: TextStyle(color: NanoColors.text, fontSize: 13)),
+      const SizedBox(height: 8),
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [for (final s in kStemNames) stemChip(s)],
+      ),
+      const SizedBox(height: 12),
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          _stemPreset('instrumental', const {'drums', 'bass', 'other'}),
+          _stemPreset('a-cappella', const {'vocals'}),
+          _stemPreset('all', const {'drums', 'bass', 'other', 'vocals'}),
+        ],
+      ),
+      if (_params.stemKeep.isEmpty) ...[
+        const SizedBox(height: 10),
+        const Text('select at least one stem to keep',
+            style: TextStyle(color: NanoColors.error, fontSize: 11)),
+      ],
+    ];
+  }
+
+  /// Quick-set button: replaces the kept-stem set with a preset (instrumental /
+  /// a-cappella / all). A fresh copy so the const preset set isn't mutated.
+  Widget _stemPreset(String label, Set<String> keep) {
+    return OutlinedButton(
+      onPressed: () => setState(() => _params.stemKeep = {...keep}),
+      style: OutlinedButton.styleFrom(
+        foregroundColor: NanoColors.pink,
+        side: const BorderSide(color: NanoColors.border),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+      ),
+      child: Text(label, style: const TextStyle(fontSize: 11)),
+    );
+  }
+
   Widget _sourceClipRow() {
     final name = _sourceClip?.prompt.isNotEmpty == true
         ? _sourceClip!.prompt
@@ -1001,7 +1103,9 @@ class _HomePageState extends State<HomePage> {
 
   Widget _runButton() {
     final needsAudio = _mode != NanoMode.generate;
-    final disabled = _busy || (needsAudio && _params.inputAudio == null);
+    final disabled = _busy ||
+        (needsAudio && _params.inputAudio == null) ||
+        (_mode == NanoMode.stem && _params.stemKeep.isEmpty);
     return Padding(
       padding: const EdgeInsets.only(top: 4, bottom: 8),
       child: SizedBox(
@@ -1327,7 +1431,7 @@ class ClipCard extends StatelessWidget {
       child: MouseRegion(
         cursor: SystemMouseCursors.grab,
         child: Tooltip(
-          message: 'drag onto the create panel to extend or cover',
+          message: 'drag onto the create panel to extend, cover or split stems',
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: const [

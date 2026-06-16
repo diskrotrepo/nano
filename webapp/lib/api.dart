@@ -16,20 +16,25 @@ String defaultServerUrl(String hostname) {
   return 'http://127.0.0.1:8000';
 }
 
-enum NanoMode { generate, extend, cover }
+enum NanoMode { generate, extend, cover, stem }
 
 extension NanoModeX on NanoMode {
   String get path => switch (this) {
         NanoMode.generate => '/generate',
         NanoMode.extend => '/extend',
         NanoMode.cover => '/cover',
+        NanoMode.stem => '/stem',
       };
   String get label => switch (this) {
         NanoMode.generate => 'generate',
         NanoMode.extend => 'extend',
         NanoMode.cover => 'cover',
+        NanoMode.stem => 'stem',
       };
 }
+
+/// The four Demucs stems, in canonical (source) order — the set /stem can keep.
+const List<String> kStemNames = ['drums', 'bass', 'other', 'vocals'];
 
 /// A picked audio file (bytes + filename), platform-agnostic.
 class AudioFile {
@@ -91,6 +96,11 @@ class GenParams {
   // cover-only — independent guidance on the melody axis (0 = guided jointly
   // with the prompt by cfg_scale).
   double melodyCfgScale = defaultMelodyCfgScale;
+
+  // stem-only — which Demucs stems to KEEP in the mixdown (the rest are
+  // dropped). Default keeps everything but vocals → an instrumental. Sent as the
+  // `keep` field; the server re-canonicalizes the order, so this set is fine.
+  Set<String> stemKeep = {'drums', 'bass', 'other'};
 }
 
 class NanoResult {
@@ -186,6 +196,16 @@ class NanoApi {
         // appears in the output — only its chromagram conditions generation.
         req.files.add(http.MultipartFile.fromBytes(
           'melody_audio', p.inputAudio!.bytes,
+          filename: p.inputAudio!.name,
+        ));
+      case NanoMode.stem:
+        _requireInput(p);
+        // `keep` overrides the server's `remove` default; the rest of the shared
+        // conditioning/sampling fields are ignored by the /stem endpoint (pure
+        // Demucs separation, no model). The server canonicalizes the order.
+        f['keep'] = p.stemKeep.join(',');
+        req.files.add(http.MultipartFile.fromBytes(
+          'audio', p.inputAudio!.bytes,
           filename: p.inputAudio!.name,
         ));
     }
