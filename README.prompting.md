@@ -278,6 +278,61 @@ lyrics:       [chorus]
 ```
 *Why:* a leading `[chorus]` tells the continuation to lift into the hook.
 
+**Worked sequence: build a full song from sections**
+
+Because nano generates ~60s at a time, you assemble a longer, structured song by chaining
+`/extend` and switching the **vocals** and **section** markers per call. Each call returns
+`[everything so far | new part]`, so the **last file is the whole song.** Restate
+`[tempo]`/`[key]` (and gender) on *every* call — the marker header is per-call, not
+inherited; the audio tail is what carries timbre across the seam.
+
+*Step 1 — instrumental intro (`/generate`)*
+```
+prompt:   dreamy indie pop, shimmering reverb-drenched guitars, warm bass, soft
+          brushed drums, wistful and hazy
+lyrics:   [instrumental] [108bpm] [c major] [intro]
+seconds:  12
+```
+→ save as `01.mp3`. `[instrumental]` forces no vocals; `[intro]` sets the section — a
+section marker rides the header slot, so it registers even with no words.
+
+*Step 2 — verse/chorus, bring the vocals in (`/extend` `01.mp3`)*
+```
+audio:        01.mp3
+add_seconds:  24
+prompt:       (same tags as step 1)
+lyrics:       [female] [108bpm] [c major] [vocals] [verse]
+              sunlight pooling on the kitchen floor
+              we don't talk about it anymore
+              [chorus]
+              oh, let it go, let it drift away
+```
+→ save as `02.mp3`. The `[female] [vocals]` header turns singing on for the appended part.
+
+*Step 3 — instrumental break / solo (`/extend` `02.mp3`)*
+```
+audio:        02.mp3
+add_seconds:  16
+prompt:       dreamy indie pop, soaring reverb-guitar solo, instrumental break
+lyrics:       [instrumental] [108bpm] [c major] [solo]
+```
+→ save as `03.mp3`. Back to `[instrumental]` to drop the vocals for the solo.
+
+*Step 4 — outro, wind down (`/extend` `03.mp3`)*
+```
+audio:        03.mp3
+add_seconds:  16
+prompt:       dreamy indie pop, sparse, winding down, soft fade
+lyrics:       [instrumental] [108bpm] [c major] [outro]
+```
+→ `04.mp3` is the finished **intro → verse/chorus → solo → outro** arrangement.
+
+*Why it works:* `[instrumental]` ↔ `[vocals]` toggles singing per section, the section
+marker sets each part's role, and a consistent `[tempo]`/`[key]` plus the seed-from-tail
+seam keep it coherent. *Caveats:* this is a **stitching workflow, not one-shot song-form** —
+keep the prompt consistent across calls, and expect some drift over long chains (re-anchor
+the prompt if the vibe wanders).
+
 ### `/cover` — re-render a melody *(needs a melody-trained checkpoint)*
 
 Upload your hum/tune as `melody_audio`; its audio never appears in the output — only its
@@ -353,6 +408,27 @@ curl -X POST http://localhost:8000/extend \
   -F add_seconds=20 \
   -F prompt="mellow lofi hip hop instrumental, jazzy electric piano, warm sub bass" \
   --output lofi_longer.mp3
+
+# Build a structured song by chaining /extend, toggling [instrumental] <-> [vocals]
+# and the section marker per call (each call returns "[so far | new part]").
+TAGS="dreamy indie pop, shimmering reverb-drenched guitars, warm bass, soft brushed drums"
+# 1) instrumental intro
+curl -sX POST http://localhost:8000/generate \
+  -F prompt="$TAGS" -F lyrics="[instrumental] [108bpm] [c major] [intro]" \
+  -F seconds=12 --output 01.mp3
+# 2) verse/chorus with vocals
+curl -sX POST http://localhost:8000/extend \
+  -F audio=@01.mp3 -F add_seconds=24 -F prompt="$TAGS" \
+  -F lyrics="[female] [108bpm] [c major] [vocals] [verse] sunlight pooling on the kitchen floor [chorus] oh, let it go, let it drift away" \
+  --output 02.mp3
+# 3) instrumental solo
+curl -sX POST http://localhost:8000/extend \
+  -F audio=@02.mp3 -F add_seconds=16 -F prompt="$TAGS, soaring guitar solo, instrumental break" \
+  -F lyrics="[instrumental] [108bpm] [c major] [solo]" --output 03.mp3
+# 4) instrumental outro -> 04.mp3 is the finished arrangement
+curl -sX POST http://localhost:8000/extend \
+  -F audio=@03.mp3 -F add_seconds=16 -F prompt="$TAGS, sparse, winding down, soft fade" \
+  -F lyrics="[instrumental] [108bpm] [c major] [outro]" --output 04.mp3
 
 # Cover a hum as solo violin (needs a melody-trained checkpoint)
 curl -X POST http://localhost:8000/cover \
