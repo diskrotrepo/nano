@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .delay_pattern import revert_delay
 from .lyric_encoder import PHONEME_VOCAB_SIZE, LyricEncoder
 from .melody_encoder import MelodyEncoder
 
@@ -181,6 +180,8 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: KVCache | StaticLayerKVCache | None = None,
+        input_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | StaticLayerKVCache]:
         B, T, D = x.shape
         q, k, v = self.qkv(x).split(D, dim=-1)
@@ -198,7 +199,19 @@ class CausalSelfAttention(nn.Module):
         # original positions; subsequent decode steps don't need to re-rotate.
         q, k = apply_rotary(q, k, cos, sin)
 
-        if isinstance(cache, StaticLayerKVCache):
+        if input_pos is not None:
+            # CUDA-graph-friendly decode step: write k/v at a TENSOR position and
+            # attend over the FULL pre-allocated cache buffer with a static-shape
+            # mask (no python-int position, no growing slice) so torch.compile can
+            # capture one reusable graph for every step. Correct in eager too.
+            assert isinstance(cache, StaticLayerKVCache)
+            cache.k[:, :, input_pos] = k
+            cache.v[:, :, input_pos] = v
+            y = F.scaled_dot_product_attention(
+                q, cache.k, cache.v, attn_mask=attn_mask,
+            )
+            new_cache = cache
+        elif isinstance(cache, StaticLayerKVCache):
             old_pos = cache.pos
             end = old_pos + T
             cache.k[:, :, old_pos:end] = k
@@ -208,20 +221,24 @@ class CausalSelfAttention(nn.Module):
             cache.pos = end
             new_cache = cache
             is_causal = old_pos == 0
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         elif cache is not None:
             k = torch.cat([cache[0], k], dim=2)
             v = torch.cat([cache[1], v], dim=2)
             new_cache = (k, v)
-            is_causal = False
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=False,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         else:
             new_cache = (k, v)
-            is_causal = True
-
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=is_causal,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         y = y.transpose(1, 2).contiguous().view(B, T, D)
         return self.proj(y), new_cache
 
@@ -334,6 +351,8 @@ class Block(nn.Module):
         text_emb: torch.Tensor | None = None,
         lyric_emb: torch.Tensor | None = None,
         lyric_kv_mask: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | None]:
         if cache is None and self.training and self.use_gradient_checkpointing:
             x = checkpoint(
@@ -341,7 +360,10 @@ class Block(nn.Module):
                 use_reentrant=False,
             )
             return x, None
-        attn_out, new_cache = self.attn(self.ln1(x), cos, sin, cache=cache)
+        attn_out, new_cache = self.attn(
+            self.ln1(x), cos, sin, cache=cache,
+            input_pos=input_pos, attn_mask=attn_mask,
+        )
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
             x = x + self.cross_attn(self.ln_cross(x), text_emb)
@@ -355,6 +377,11 @@ class NanoAudioGPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
+        # Optional torch.compile'd forward for the per-step decode loop. Set by the
+        # inference engine after load (a no-op for training). When present,
+        # _generate_stream routes each decode step through it so CUDA graphs apply;
+        # the eager self.forward is the fallback (identical results, just slower).
+        self._compiled_forward = None
         self.tok_embeds = nn.ModuleList(
             [nn.Embedding(cfg.vocab_with_pad, cfg.d_model) for _ in range(cfg.n_codebooks)]
         )
@@ -446,6 +473,7 @@ class NanoAudioGPT(nn.Module):
         T: int,
         start_pos: int,
         keep: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The per-frame melody term added to the decoder input, shape [B, T, D].
 
@@ -462,6 +490,10 @@ class NanoAudioGPT(nn.Module):
           melody" means the null, not the absence of any add.
         """
         if melody_emb is not None:
+            # Decode path indexes by the tensor input_pos (graph-friendly); the
+            # prefill / training path uses the contiguous start_pos slice.
+            if input_pos is not None:
+                return melody_emb[:, input_pos, :]
             return melody_emb[:, start_pos:start_pos + T, :]
         if melody is not None:
             enc = self.melody_encoder.encode_melody(melody)  # [B, Tc, D]
@@ -513,6 +545,8 @@ class NanoAudioGPT(nn.Module):
         melody: torch.Tensor | None = None,
         melody_emb: torch.Tensor | None = None,
         melody_keep: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
@@ -570,10 +604,17 @@ class NanoAudioGPT(nn.Module):
         # prefill / single-step decode paths aligned, exactly like the RoPE slice.
         if self.cfg.use_melody_conditioning:
             x = x + self._melody_add(melody, melody_emb, B, T, start_pos,
-                                     keep=melody_keep)
+                                     keep=melody_keep, input_pos=input_pos)
         x = self.drop(x)
 
-        cos, sin = self.rotary(start_pos, T)
+        # RoPE positions: the CUDA-graph decode path indexes by the TENSOR
+        # input_pos (no python-int start_pos guard → one reusable compiled
+        # graph); every other path uses the contiguous start_pos slice.
+        if input_pos is not None:
+            cos = self.rotary.cos_cached[input_pos]
+            sin = self.rotary.sin_cached[input_pos]
+        else:
+            cos, sin = self.rotary(start_pos, T)
 
         new_caches: list[KVCache] = []
         for i, block in enumerate(self.blocks):
@@ -581,6 +622,7 @@ class NanoAudioGPT(nn.Module):
             x, new_cache = block(
                 x, cos, sin, cache=cache, text_emb=text_emb,
                 lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask,
+                input_pos=input_pos, attn_mask=attn_mask,
             )
             new_caches.append(new_cache)
         x = self.ln_final(x)
@@ -668,6 +710,32 @@ class NanoAudioGPT(nn.Module):
         from-scratch path the InferenceEngine relies on (a fresh random seed per
         call). Uses KV cache for efficient autoregressive decoding.
         """
+        prompt, squeeze_batch = self._resolve_prompt(prompt)
+        chunks = list(self._generate_stream(
+            prompt, num_new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=text_emb, cfg_scale=cfg_scale, text_emb_neg=text_emb_neg,
+            lyric_ids=lyric_ids, lyric_mask=lyric_mask,
+            lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
+            lyric_cfg_scale=lyric_cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+        ))
+        new = (
+            torch.cat(chunks, dim=-1) if chunks
+            else prompt.new_zeros((prompt.shape[0], prompt.shape[1], 0))
+        )
+        out = torch.cat([prompt, new], dim=-1)
+        return out.squeeze(0) if squeeze_batch else out
+
+    def _resolve_prompt(
+        self, prompt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, bool]:
+        """Resolve generate()'s prompt arg to a batched [B, K, T_prompt] tensor.
+
+        prompt=None -> a single random DAC seed column (the from-scratch path); a
+        2D [K, T] prompt is unsqueezed to [1, K, T] and squeeze_batch=True is
+        returned so the caller can squeeze the result back to 2D.
+        """
         if prompt is None:
             device = next(self.parameters()).device
             prompt = torch.randint(
@@ -678,8 +746,49 @@ class NanoAudioGPT(nn.Module):
         squeeze_batch = prompt.dim() == 2
         if squeeze_batch:
             prompt = prompt.unsqueeze(0)
+        return prompt, squeeze_batch
+
+    @torch.no_grad()
+    def _generate_stream(
+        self,
+        prompt: torch.Tensor,
+        num_new_frames: int,
+        temperature: float | Sequence[float] = 1.0,
+        top_k: int | None | Sequence[int | None] = 250,
+        top_p: float | None | Sequence[float | None] = None,
+        text_emb: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
+        text_emb_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
+        melody: torch.Tensor | None = None,
+        melody_cfg_scale: float | None = None,
+        emit_every: int = 256,
+        first_emit: int | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """The shared autoregressive decode loop behind generate().
+
+        Yields the NEW frames (never the prompt) as un-delayed [B, K, n]
+        LongTensor chunks, in generation order, emitting once >= emit_every new
+        frames have become fully known across all K codebooks (the first chunk
+        after `first_emit` frames — smaller by default, for a faster
+        time-to-first-audio when streaming). generate() concatenates these onto the
+        prompt to reproduce its full result bit-identically — this IS the loop, so
+        the per-step RNG order is shared and there is no train/inference drift.
+        `prompt` must be a resolved, batched [B, K, T_prompt] tensor (see
+        _resolve_prompt). emit_every is irrelevant to generate() (it concatenates
+        every chunk regardless); it only sets the streaming cadence.
+
+        A new frame f is fully known once the delayed decode step p = f + (K-1)
+        completes — codebook k of frame f lands at delayed position f + k.
+        """
         B, K, T_prompt = prompt.shape
         assert K == self.cfg.n_codebooks
+        if first_emit is None:
+            first_emit = emit_every
 
         def _per_cb(val, kind: str) -> list:
             if val is None or isinstance(val, (int, float)):
@@ -704,6 +813,11 @@ class NanoAudioGPT(nn.Module):
         for k in range(K):
             tokens[:, k, k:k + T_prompt] = prompt[:, k]
 
+        def _emit(s: int, e: int) -> torch.Tensor:
+            # Un-delay new frames [s, e): codebook k's value for frame f sits at
+            # delayed position f + k (the inverse of apply_delay; cf. revert_delay).
+            return torch.stack([tokens[:, k, s + k:e + k] for k in range(K)], dim=1)
+
         was_training = self.training
         self.eval()
         try:
@@ -711,13 +825,19 @@ class NanoAudioGPT(nn.Module):
             dtype = next(self.parameters()).dtype
 
             def _make_caches() -> list[StaticLayerKVCache]:
-                return [
-                    StaticLayerKVCache(
-                        torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype),
-                        torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype),
-                    )
-                    for _ in range(self.cfg.n_layers)
-                ]
+                caches = []
+                for _ in range(self.cfg.n_layers):
+                    k = torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype)
+                    v = torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype)
+                    # These KV buffers persist across decode steps and are mutated
+                    # in place — mark them as static-address so torch.compile's
+                    # CUDA graphs can own them (without this, the in-place cache
+                    # mutation makes cudagraphs fall back to plain compiled kernels).
+                    if device.type == "cuda":
+                        torch._dynamo.mark_static_address(k)
+                        torch._dynamo.mark_static_address(v)
+                    caches.append(StaticLayerKVCache(k, v))
+                return caches
 
             # Encode lyric streams ONCE (the encoder is ~100M params — encoding
             # per decode step would dominate cost). Reused across all steps.
@@ -789,14 +909,45 @@ class NanoAudioGPT(nn.Module):
             for s in stages:
                 s["caches"] = _make_caches()
 
-            def _run(inp: torch.Tensor, start: int):
+            # Mutable holder so a runtime compile/cudagraph failure can disable the
+            # compiled path mid-generation and fall back to eager (identical
+            # results, just slower) instead of failing the whole request.
+            # Mutable holder so a runtime compile/cudagraph failure can disable the
+            # compiled path mid-generation and fall back to eager (identical
+            # results, just slower) instead of failing the whole request.
+            compiled_box = [self._compiled_forward]
+
+            def _run(inp, start, input_pos=None, attn_mask=None):
+                # Decode steps (input_pos given) go through the compiled forward
+                # when available — that's where CUDA graphs remove the per-step
+                # launch overhead. Prefill stays eager (it runs once).
+                use_compiled = input_pos is not None and compiled_box[0] is not None
+                fwd = compiled_box[0] if use_compiled else self.forward
                 for s in stages:
-                    out, s["caches"] = self.forward(
-                        inp, kv_caches=s["caches"], start_pos=start,
-                        text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
-                        melody_emb=s["mel"],
-                    )
-                    s["logits"] = out
+                    try:
+                        out, s["caches"] = fwd(
+                            inp, kv_caches=s["caches"], start_pos=start,
+                            text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                            melody_emb=s["mel"],
+                            input_pos=input_pos, attn_mask=attn_mask,
+                        )
+                    except Exception as e:  # noqa: BLE001 — compile/cudagraph fallback
+                        if not use_compiled:
+                            raise
+                        compiled_box[0] = None
+                        fwd = self.forward
+                        print(f"[generate] compiled decode failed ({e!r}); "
+                              f"falling back to eager for the rest of this run")
+                        out, s["caches"] = fwd(
+                            inp, kv_caches=s["caches"], start_pos=start,
+                            text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                            melody_emb=s["mel"],
+                            input_pos=input_pos, attn_mask=attn_mask,
+                        )
+                    # Clone: under CUDA graphs the compiled forward's output is a
+                    # reused static buffer, so two sequential CFG-stage calls would
+                    # otherwise alias — _combine must see each stage's own logits.
+                    s["logits"] = out.clone()
 
             def _combine():
                 out = stages[0]["logits"]
@@ -804,17 +955,47 @@ class NanoAudioGPT(nn.Module):
                     out = out + sc * (stages[i + 1]["logits"] - stages[i]["logits"])
                 return out
 
-            # prefill: run full prompt through transformer
+            # prefill: run full prompt through transformer (eager, legacy path)
             prefill_len = max(1, T_prompt)
             prefill_inp = tokens[:, :, :prefill_len]
             _run(prefill_inp, 0)
             logits = _combine()
+            # The decode loop may capture a CUDA graph that reads the KV cache the
+            # eager prefill just wrote. Sync so those writes are visible before the
+            # capture stream reads them (a missing barrier here surfaced as
+            # intermittent NaN logits / device-side asserts at capture).
+            if device.type == "cuda" and compiled_box[0] is not None:
+                torch.cuda.synchronize()
 
-            # decode: one position at a time using cached K/V
+            # decode: one position at a time using cached K/V, yielding new frames
+            # as soon as they are fully known across all K codebooks. Each step
+            # passes a TENSOR position + a static-shape additive mask over the full
+            # cache buffer (no python-int position, no growing slice) so the
+            # compiled decode graph is captured once and replayed every step.
+            # The mask is a FINITE float (not bool/-inf): a bool mask becomes -inf,
+            # and flash-attention tiles keys into blocks — an all-masked early
+            # block then has block-max -inf and the online-softmax rescale yields
+            # NaN (fp16, CUDA). A large finite negative avoids that and still zeros
+            # the masked weights (exp(-1e4) == 0). cf. the cached-decode test.
+            # The fixed-shape input_pos path exists to enable torch.compile/CUDA
+            # graphs; it's only worth its extra (full-buffer) attention when we're
+            # actually compiling. Eager (no compiled forward) uses the original
+            # growing-slice legacy path — faster, and the proven fallback.
+            use_input_pos = compiled_box[0] is not None
+            emitted = 0  # count of new frames already yielded
+            threshold = first_emit
             for p in range(prefill_len, T_delay):
                 if p > prefill_len:
-                    inp = tokens[:, :, p - 1:p]
-                    _run(inp, p - 1)
+                    if use_input_pos:
+                        pos = p - 1
+                        input_pos = torch.tensor([pos], device=device, dtype=torch.long)
+                        attn_mask = torch.zeros(T_delay, dtype=dtype, device=device)
+                        attn_mask[pos + 1:] = -1e4
+                        attn_mask = attn_mask.view(1, 1, 1, T_delay)
+                        _run(tokens[:, :, pos:pos + 1], 0,
+                             input_pos=input_pos, attn_mask=attn_mask)
+                    else:
+                        _run(tokens[:, :, p - 1:p], p - 1)
                     logits = _combine()
 
                 step_logits = logits[:, :, -1, :].clone()  # [B, K, V]
@@ -857,12 +1038,19 @@ class NanoAudioGPT(nn.Module):
                 for k in range(K):
                     if k + T_prompt <= p < k + T_total:
                         tokens[:, k, p] = sampled[:, k]
+
+                # Emit any new frames now fully known: frame f completes at p=f+K-1.
+                n_complete = min(p - (K - 1), T_total - 1) - T_prompt + 1
+                if n_complete - emitted >= threshold:
+                    yield _emit(T_prompt + emitted, T_prompt + n_complete)
+                    emitted = n_complete
+                    threshold = emit_every
+            # flush the remaining tail
+            if emitted < num_new_frames:
+                yield _emit(T_prompt + emitted, T_total)
         finally:
             if was_training:
                 self.train()
-
-        out = revert_delay(tokens, T_total)
-        return out.squeeze(0) if squeeze_batch else out
 
 
 if __name__ == "__main__":

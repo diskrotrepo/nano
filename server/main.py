@@ -30,9 +30,11 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import glob
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from server.inference import InferenceEngine
 
@@ -43,15 +45,21 @@ engine: InferenceEngine | None = None
 OUTPUT_DIR = os.environ.get("NANO_OUTPUT_DIR", "")
 
 
-def _save_output(body: bytes, mime: str, mode: str, prompt: str) -> None:
-    """Persist a generation to OUTPUT_DIR; never fatal to the response."""
+def _output_name(mode: str, prompt: str, ext: str = "mp3", uid: str | None = None) -> str:
+    """Build a unique, sortable output filename. `uid` (a client-supplied req_id)
+    is used as the trailing token when given, so the client can fetch the saved
+    clip by id afterwards (see GET /outputs/{name}); otherwise a random suffix."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:48] or "untitled"
+    tail = re.sub(r"[^a-z0-9]+", "", (uid or "").lower())[:24] or uuid.uuid4().hex[:6]
+    return f"{stamp}_{mode}_{slug}_{tail}.{ext}"
+
+
+def _save_named(body: bytes, name: str) -> None:
+    """Write bytes to OUTPUT_DIR/name; never fatal to the response."""
     if not OUTPUT_DIR:
         return
     try:
-        ext = "mp3" if "mpeg" in mime else "wav"
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:48] or "untitled"
-        name = f"{stamp}_{mode}_{slug}_{uuid.uuid4().hex[:6]}.{ext}"
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         # Direct write, no temp+rename: filenames are unique per request, and on
         # a Modal volume the background commit can capture the temp file while
@@ -61,6 +69,14 @@ def _save_output(body: bytes, mime: str, mode: str, prompt: str) -> None:
         print(f"[output] saved {name} ({len(body)} bytes)")
     except Exception as e:  # disk-full etc. must not break the response
         print(f"[output] save failed: {e}")
+
+
+def _save_output(body: bytes, mime: str, mode: str, prompt: str) -> None:
+    """Persist a generation to OUTPUT_DIR; never fatal to the response."""
+    if not OUTPUT_DIR:
+        return
+    ext = "mp3" if "mpeg" in mime else "wav"
+    _save_named(body, _output_name(mode, prompt, ext))
 
 
 def _combine_text_lyrics(text: str, lyrics: str) -> str | None:
@@ -158,6 +174,26 @@ def _parse_per_cb_topp(raw: str, scalar: float) -> float | None | list[float | N
 async def lifespan(app: FastAPI):
     global engine
     engine = InferenceEngine()
+    # Warm up at container init so the first real request doesn't pay
+    # torch.compile tracing + CUDA-graph capture + the sweetener load on the
+    # request path. The compiled decode graph is keyed on sequence length, so warm
+    # at the UI's default (NANO_WARMUP_SECONDS, 30s) — that length is then fast;
+    # other lengths recompile once on first use. Set NANO_WARMUP_SECONDS=0 to skip.
+    warm_s = float(os.environ.get("NANO_WARMUP_SECONDS", "30"))
+    if warm_s > 0:
+        try:
+            print(f"[warmup] sweetener + compiling decode graph at {warm_s:.0f}s...")
+            import time as _time
+            t0 = _time.time()
+            try:
+                engine.sweeten_prompt("warm up the cache")
+            except Exception as e:
+                print(f"[warmup] sweetener skipped: {e}")
+            warm_cfg = float(os.environ.get("NANO_WARMUP_CFG", "7.0"))
+            engine.generate_audio(seconds=warm_s, text="warm up", cfg_scale=warm_cfg)
+            print(f"[warmup] done in {_time.time() - t0:.1f}s")
+        except Exception as e:
+            print(f"[warmup] skipped: {e}")
     yield
 
 
@@ -262,6 +298,86 @@ async def generate_endpoint(
         body, mime = result
     _save_output(body, mime, "generate", prompt)
     return Response(content=body, media_type=mime, headers=headers)
+
+
+@app.get("/generate_stream")
+def generate_stream_endpoint(
+    seconds: float = 30.0,
+    temperature: float = 0.9,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    per_cb_temperature: str = "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42",
+    per_cb_top_k: str = "120,90,70,50,36,26,18,12,8",
+    per_cb_top_p: str = "",
+    cfg_scale: float = 7.0,
+    prompt: str = "",
+    lyrics: str = "",
+    gender: str = "",
+    bpm: float = 0.0,
+    negative_prompt: str = "",
+    sweeten: bool = True,
+    lyric_cfg_scale: float = 0.0,
+    req_id: str = "",
+) -> StreamingResponse:
+    """Streaming counterpart to POST /generate — emits MP3 bytes progressively.
+
+    A native <audio src> can point straight at this URL for progressive playback;
+    because bytes start flowing within ~one chunk, the response stays "active" and
+    slips under Modal's 150 s web-endpoint timeout (which kills the buffered POST
+    path on long clips). Query params mirror POST /generate minus style_audio (no
+    file upload on GET) and score_clap (needs the whole clip).
+
+    Pass a client-generated `req_id`; the canonical gapless clip is saved under a
+    filename ending in that id, so the client can fetch it from GET /outputs/{id}
+    after playback for download / accurate duration / a gapless re-listen.
+    """
+    assert engine is not None
+    if seconds <= 0:
+        raise HTTPException(400, "seconds must be > 0")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    combined = _combine_text_lyrics(prompt, lyrics)
+    name = _output_name("generate", prompt, "mp3", uid=req_id or None)
+
+    stream = engine.generate_audio_stream(
+        seconds=seconds,
+        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+        cfg_scale=cfg_scale,
+        text=combined,
+        negative_text=negative_prompt.strip() or None,
+        lyric_cfg_scale=lyric_cfg_scale or None,
+        gender=_norm_gender(gender),
+        bpm=bpm or None,
+        on_complete=lambda body, mime: _save_named(body, name),
+    )
+    headers = dict(sweet_headers)
+    headers["X-Nano-Output-File"] = name
+    headers["Access-Control-Expose-Headers"] = (
+        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+    )
+    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
+
+
+@app.get("/outputs/{name}")
+def get_output(name: str) -> FileResponse:
+    """Serve a saved generation from OUTPUT_DIR. Accepts either the exact filename
+    or a req_id (the streaming path saves <stamp>_generate_<slug>_<req_id>.mp3, so
+    the client fetches the canonical clip knowing only the id it generated)."""
+    if not OUTPUT_DIR:
+        raise HTTPException(404, "outputs not persisted on this server")
+    safe = os.path.basename(name)
+    if not safe or safe != name:
+        raise HTTPException(400, "bad name")
+    path = os.path.join(OUTPUT_DIR, safe)
+    if not os.path.isfile(path):
+        token = re.sub(r"[^a-z0-9]+", "", safe.lower())[:24]
+        matches = sorted(glob.glob(os.path.join(OUTPUT_DIR, f"*_{token}.mp3"))) if token else []
+        if not matches:
+            raise HTTPException(404, "not found")
+        path = matches[-1]
+    mime = "audio/mpeg" if path.endswith(".mp3") else "audio/wav"
+    return FileResponse(path, media_type=mime)
 
 
 @app.post("/extend")
@@ -383,6 +499,113 @@ async def cover_endpoint(
         raise HTTPException(400, str(e))
     _save_output(body, mime, "cover", prompt)
     return Response(content=body, media_type=mime, headers=sweet_headers)
+
+
+@app.post("/extend_stream")
+async def extend_stream_endpoint(
+    audio: UploadFile = File(...),
+    add_seconds: float = Form(20.0),
+    overlap_seconds: float = Form(8.0),
+    from_seconds: float = Form(-1.0),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form(""),
+    per_cb_top_k: str = Form(""),
+    per_cb_top_p: str = Form(""),
+    cfg_scale: float = Form(3.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    gender: str = Form(""),
+    bpm: float = Form(0.0),
+    negative_prompt: str = Form(""),
+    sweeten: bool = Form(True),
+    lyric_cfg_scale: float = Form(0.0),
+    req_id: str = Form(""),
+) -> StreamingResponse:
+    """Streaming /extend: yields the kept original instantly, then the generated
+    continuation as it's produced (progressive MSE playback; bypasses the 150s
+    wall). The finished clip is saved to OUTPUT_DIR (fetch via /outputs/{req_id})."""
+    assert engine is not None
+    data = await audio.read()
+    if not data:
+        raise HTTPException(400, "empty audio upload")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    combined = _combine_text_lyrics(prompt, lyrics)
+    name = _output_name("extend", prompt, "mp3", uid=req_id or None)
+    stream = engine.extend_audio_stream(
+        data,
+        add_seconds=add_seconds,
+        overlap_seconds=overlap_seconds,
+        from_seconds=from_seconds if from_seconds >= 0 else None,
+        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+        cfg_scale=cfg_scale,
+        text=combined,
+        negative_text=negative_prompt.strip() or None,
+        lyric_cfg_scale=lyric_cfg_scale or None,
+        gender=_norm_gender(gender),
+        bpm=bpm or None,
+        on_complete=lambda body, mime: _save_named(body, name),
+    )
+    headers = dict(sweet_headers)
+    headers["X-Nano-Output-File"] = name
+    headers["Access-Control-Expose-Headers"] = (
+        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+    )
+    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
+
+
+@app.post("/cover_stream")
+async def cover_stream_endpoint(
+    melody_audio: UploadFile = File(...),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form(""),
+    per_cb_top_k: str = Form(""),
+    per_cb_top_p: str = Form(""),
+    cfg_scale: float = Form(3.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    gender: str = Form(""),
+    bpm: float = Form(0.0),
+    negative_prompt: str = Form(""),
+    sweeten: bool = Form(True),
+    melody_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(0.0),
+    req_id: str = Form(""),
+) -> StreamingResponse:
+    """Streaming /cover: re-render the hum's melody in the prompt's timbre,
+    streaming the result as it generates. Needs a melody-trained checkpoint."""
+    assert engine is not None
+    data = await melody_audio.read()
+    if not data:
+        raise HTTPException(400, "empty melody_audio upload")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    combined = _combine_text_lyrics(prompt, lyrics)
+    name = _output_name("cover", prompt, "mp3", uid=req_id or None)
+    stream = engine.cover_audio_stream(
+        data,
+        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+        cfg_scale=cfg_scale,
+        text=combined,
+        negative_text=negative_prompt.strip() or None,
+        melody_cfg_scale=melody_cfg_scale or None,
+        lyric_cfg_scale=lyric_cfg_scale or None,
+        gender=_norm_gender(gender),
+        bpm=bpm or None,
+        on_complete=lambda body, mime: _save_named(body, name),
+    )
+    headers = dict(sweet_headers)
+    headers["X-Nano-Output-File"] = name
+    headers["Access-Control-Expose-Headers"] = (
+        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+    )
+    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
 
 
 @app.post("/infill")

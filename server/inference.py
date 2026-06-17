@@ -7,10 +7,12 @@ import platform
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 
 import librosa
+import numpy as np
 import soundfile as sf
 import torch
 
@@ -50,11 +52,7 @@ def _quantize_torch_linears(model: torch.nn.Module, bits: int, group_size: int =
     divisible by group_size are left unquantized (the int4 tinygemm kernel
     requires it); none of nano's Linears hit that today (d_model=2048, d_ff=8192,
     heads in=2048 are all divisible by 64), but the guard mirrors MLX."""
-    from torchao.quantization import (
-        int4_weight_only,
-        int8_weight_only,
-        quantize_,
-    )
+    from torchao.quantization import quantize_
 
     def filter_fn(module: torch.nn.Module, fqn: str) -> bool:
         if not isinstance(module, torch.nn.Linear):
@@ -65,7 +63,18 @@ def _quantize_torch_linears(model: torch.nn.Module, bits: int, group_size: int =
             return False
         return True
 
-    config = int4_weight_only(group_size=group_size) if bits == 4 else int8_weight_only()
+    # torchao moved the weight-only quant API from functions
+    # (int4_weight_only/int8_weight_only) to config objects
+    # (Int4WeightOnlyConfig/Int8WeightOnlyConfig). Prefer the new API; fall back
+    # to the old one for older torchao.
+    try:
+        from torchao.quantization import Int4WeightOnlyConfig, Int8WeightOnlyConfig
+        config = (Int4WeightOnlyConfig(group_size=group_size) if bits == 4
+                  else Int8WeightOnlyConfig())
+    except ImportError:
+        from torchao.quantization import int4_weight_only, int8_weight_only
+        config = (int4_weight_only(group_size=group_size) if bits == 4
+                  else int8_weight_only())
     quantize_(model, config, filter_fn=filter_fn)
 
 
@@ -147,10 +156,47 @@ class InferenceEngine:
                 if self.device != "cpu":
                     self.model = self.model.to(self._torch_dtype)
                 if quantized:
-                    _quantize_torch_linears(self.model, bits)
+                    try:
+                        _quantize_torch_linears(self.model, bits)
+                    except Exception as e:  # never crash startup over quant
+                        print(f"[inference] int{bits} quantization failed "
+                              f"({e!r}); falling back to fp16 weights")
+                        quantized = False
                 self.model._bits = bits if quantized else 16
-                if self.device == "cuda":
-                    self.model = torch.compile(self.model)
+                # NANO_COMPILE: "off"/"0" (default) = eager decode — the reliable
+                # path; "default" = plain torch.compile (fusion, no graphs);
+                # "graphs" = reduce-overhead/CUDA graphs. Graphs give a ~3x decode
+                # speedup (30s clip ~16s vs ~50s) BUT capture intermittently NaNs
+                # on this model (cudagraph + in-place KV cache) and a device-side
+                # assert poisons the container — so it's opt-in/experimental until
+                # debugged with local CUDA. Default stays eager for reliability.
+                compile_mode = os.environ.get("NANO_COMPILE", "off").lower()
+                if self.device == "cuda" and compile_mode not in ("0", "off", "none"):
+                    # Route the per-step DECODE forward through torch.compile with
+                    # CUDA graphs. The old `self.model = torch.compile(self.model)`
+                    # was a NO-OP for generation: model.generate() runs the eager
+                    # self.forward, never the compiled wrapper, so every token was
+                    # uncompiled (~13ms/forward, overhead-bound). Compiling forward
+                    # and attaching it where _generate_stream's decode loop looks
+                    # for it (model._compiled_forward) is what actually removes the
+                    # per-step launch overhead; the decode path uses a tensor
+                    # position + fixed-shape masked attention so one graph is
+                    # captured and replayed for every step.
+                    tc_mode = "reduce-overhead" if compile_mode == "graphs" else "default"
+                    if tc_mode == "reduce-overhead":
+                        # The KV cache is a persistent, in-place-mutated input to
+                        # the compiled decode step; cudagraphs must be told to
+                        # support that (with mark_static_address on the buffers) or
+                        # it mishandles the mutation and yields NaN logits.
+                        try:
+                            import torch._inductor.config as _ind
+                            _ind.triton.cudagraph_support_input_mutation = True
+                        except Exception as e:
+                            print(f"[inference] cudagraph mutation flag skipped: {e}")
+                    self.model._compiled_forward = torch.compile(
+                        self.model.forward, mode=tc_mode,
+                    )
+                    print(f"[inference] decode compile: {tc_mode}")
                 wdesc = {
                     torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32",
                 }[self._torch_dtype]
@@ -705,6 +751,320 @@ class InferenceEngine:
             finally:
                 os.unlink(tmp)
         return body, mime, clap
+
+    def _decode_chunk(
+        self, all_new: torch.Tensor, f0: int, f1: int, ctx: int, hop: int
+    ) -> np.ndarray:
+        """Decode new frames [f0, f1) to mono f32 PCM, gapless against neighbours.
+
+        DAC's decoder is convolutional, so decoding a chunk in isolation clicks at
+        the seams. We decode the chunk WITH `ctx` frames of real left context
+        (`all_new` is the cumulative un-delayed token buffer) and drop the
+        `ctx*hop` warmup samples — the kept span was decoded with proper left
+        context. The right edge needs no trim: the next chunk re-decodes the
+        boundary region with full left context and only keeps its own span.
+        """
+        start = max(0, f0 - ctx)
+        window = all_new[:, start:f1]              # [K, w] long, cpu
+        wav = self.codec.decode(window)            # [samples] float, cpu
+        drop = (f0 - start) * hop
+        return wav[drop:].contiguous().numpy().astype("float32")
+
+    def _stream_mp3(self, producer_fn, *, meta, on_complete, cancel=None):
+        """Run ONE persistent ffmpeg (raw f32 mono PCM -> mp3), yielding mp3 bytes
+        as they're produced. ``producer_fn(append_pcm, cancel)`` runs on a worker
+        thread and calls ``append_pcm(np.float32 mono)`` for each PCM chunk (the GPU
+        loop + decode live there; CUDA releases the GIL so this generator can read
+        ffmpeg stdout concurrently — no pipe deadlock). On normal completion the
+        full PCM is re-encoded with ``meta`` and handed to ``on_complete(body,
+        mime)`` (the canonical save); on client disconnect (GeneratorExit) the
+        producer is cancelled, ffmpeg killed, and nothing is saved. Shared by the
+        generate / extend / cover stream paths."""
+        sr = self.codec.SAMPLE_RATE
+        if cancel is None:
+            cancel = threading.Event()
+        try:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0",
+                 "-codec:a", "libmp3lame", "-b:a", "192k",
+                 "-f", "mp3", "-id3v2_version", "0", "pipe:1"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError("ffmpeg is required for streaming generation") from e
+
+        pcm_parts: list[np.ndarray] = []
+        err_box: dict[str, BaseException] = {}
+
+        def _append(pcm: np.ndarray) -> None:
+            pcm_parts.append(pcm)
+            proc.stdin.write(pcm.astype("<f4").tobytes())
+            proc.stdin.flush()
+
+        def _produce():
+            try:
+                producer_fn(_append, cancel)
+            except BaseException as e:  # BrokenPipe on disconnect, OOM, etc.
+                err_box["err"] = e
+                cancel.set()
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        producer = threading.Thread(target=_produce, daemon=True)
+        producer.start()
+
+        completed = False
+        try:
+            while True:
+                block = proc.stdout.read1(65536)
+                if not block:
+                    break
+                yield block
+            producer.join()
+            if "err" in err_box:
+                raise err_box["err"]
+            completed = not cancel.is_set()
+        finally:
+            if not completed:
+                cancel.set()
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            producer.join(timeout=5)
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+        if completed and pcm_parts and on_complete is not None:
+            full = torch.from_numpy(np.concatenate(pcm_parts))[None]  # [1, samples]
+            body, mime = _encode_audio(full, sr, meta)
+            on_complete(body, mime)
+
+    def _decoded_chunks(
+        self, append_pcm, cancel, *, prompt, num_new_frames,
+        temperature, top_k, top_p, cfg_scale,
+        cond_emb=None, neg_emb=None, cond_lids=None, cond_lmask=None,
+        neg_lids=None, neg_lmask=None, lyric_cfg_scale=None,
+        melody=None, melody_cfg_scale=None,
+        decode_ctx=16, emit_every=256, first_emit=128,
+    ):
+        """Stream the model's NEW frames, calling ``append_pcm`` with each
+        left-context-decoded chunk. Shared decode core for all stream paths;
+        ``prompt`` is an already-resolved batched [B, K, T] tensor. ``cfg_scale`` is
+        passed through unguarded — ``_generate_stream`` decides whether to run CFG
+        based on which conditioning (text / lyrics / melody) is actually present."""
+        hop = self.codec.SAMPLE_RATE // self.codec.FRAME_RATE_HZ  # 512
+        gen = self.model._generate_stream(
+            prompt, num_new_frames=num_new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale, lyric_cfg_scale=lyric_cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+            emit_every=emit_every, first_emit=first_emit,
+        )
+        all_new = None  # cumulative un-delayed tokens [K, frames], cpu long
+        produced = 0
+        try:
+            for chunk in gen:
+                if cancel.is_set():
+                    break
+                c = chunk.squeeze(0).cpu()  # [K, n]
+                f0, f1 = produced, produced + c.shape[-1]
+                all_new = c if all_new is None else torch.cat([all_new, c], dim=-1)
+                append_pcm(self._decode_chunk(all_new, f0, f1, decode_ctx, hop))
+                produced = f1
+        finally:
+            gen.close()
+
+    def generate_audio_stream(
+        self,
+        seconds: float = 30.0,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        lyric_cfg_scale: float | None = None,
+        gender: str | None = None,
+        bpm: float | None = None,
+        emit_every: int = 256,
+        first_emit: int = 128,
+        decode_ctx: int = 16,
+        cancel: threading.Event | None = None,
+        on_complete=None,
+    ):
+        """Streaming counterpart to ``generate_audio`` (from scratch). Token order
+        is bit-identical to ``generate``; see ``_stream_mp3`` for the topology."""
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
+        if 1 + new_frames > max_total:  # +1 seed frame
+            new_frames = max(0, max_total - 1)
+        if new_frames == 0:
+            raise ValueError("Requested duration exceeds model context limit.")
+
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
+        prompt, _ = self.model._resolve_prompt(None)  # random seed frame [1, K, 1]
+        meta = self._gen_metadata(
+            "generate", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            cfg_scale=cfg_scale, seconds=seconds,
+        )
+
+        def producer(append_pcm, cancel):
+            self._decoded_chunks(
+                append_pcm, cancel, prompt=prompt, num_new_frames=new_frames,
+                temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+                cond_emb=cond_emb, neg_emb=neg_emb, cond_lids=cond_lids, cond_lmask=cond_lmask,
+                neg_lids=neg_lids, neg_lmask=neg_lmask, lyric_cfg_scale=lyric_cfg_scale,
+                decode_ctx=decode_ctx, emit_every=emit_every, first_emit=first_emit,
+            )
+
+        yield from self._stream_mp3(producer, meta=meta, on_complete=on_complete, cancel=cancel)
+
+    def extend_audio_stream(
+        self,
+        full_audio_bytes: bytes,
+        add_seconds: float = 20.0,
+        overlap_seconds: float = 8.0,
+        from_seconds: float | None = None,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        lyric_cfg_scale: float | None = None,
+        gender: str | None = None,
+        bpm: float | None = None,
+        emit_every: int = 256,
+        first_emit: int = 128,
+        decode_ctx: int = 16,
+        cancel: threading.Event | None = None,
+        on_complete=None,
+    ):
+        """Streaming counterpart to ``extend_audio``: yields the kept original
+        verbatim FIRST (instant audio), then streams the generated continuation."""
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(full_audio_bytes)
+            in_path = f.name
+        try:
+            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
+            full_wav = torch.from_numpy(y).unsqueeze(0)
+            full_tokens = self.codec.encode(full_wav)
+        finally:
+            os.unlink(in_path)
+
+        if from_seconds is None:
+            cut_frame = full_tokens.shape[1]
+        else:
+            cut_frame = max(1, min(
+                int(from_seconds * self.codec.FRAME_RATE_HZ), full_tokens.shape[1]))
+        overlap_frames = max(1, int(overlap_seconds * self.codec.FRAME_RATE_HZ))
+        seed_start = max(0, cut_frame - overlap_frames)
+        prompt_tokens = full_tokens[:, seed_start:cut_frame]
+        if prompt_tokens.shape[1] == 0:
+            raise ValueError("Selected seed window is empty; move the point later or widen overlap_seconds.")
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        new_frames = int(add_seconds * self.codec.FRAME_RATE_HZ)
+        if prompt_tokens.shape[1] + new_frames > max_total:
+            new_frames = max(0, max_total - prompt_tokens.shape[1])
+        if new_frames == 0:
+            raise ValueError("Overlap window is already at model context limit; reduce overlap_seconds.")
+        if from_seconds is None:
+            keep_samples = full_wav.shape[1]
+        else:
+            keep_samples = min(
+                int(round(cut_frame / self.codec.FRAME_RATE_HZ * self.codec.SAMPLE_RATE)),
+                full_wav.shape[1])
+        prefix_pcm = full_wav[:, :keep_samples].squeeze(0).contiguous().numpy().astype("float32")
+
+        prompt, _ = self.model._resolve_prompt(prompt_tokens.to(self.device))
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
+        meta = self._gen_metadata(
+            "extend", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            add_seconds=add_seconds, overlap_seconds=overlap_seconds, from_seconds=from_seconds,
+        )
+
+        def producer(append_pcm, cancel):
+            append_pcm(prefix_pcm)  # the kept original, immediately
+            self._decoded_chunks(
+                append_pcm, cancel, prompt=prompt, num_new_frames=new_frames,
+                temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+                cond_emb=cond_emb, neg_emb=neg_emb, cond_lids=cond_lids, cond_lmask=cond_lmask,
+                neg_lids=neg_lids, neg_lmask=neg_lmask, lyric_cfg_scale=lyric_cfg_scale,
+                decode_ctx=decode_ctx, emit_every=emit_every, first_emit=first_emit,
+            )
+
+        yield from self._stream_mp3(producer, meta=meta, on_complete=on_complete, cancel=cancel)
+
+    def cover_audio_stream(
+        self,
+        melody_audio_bytes: bytes,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        melody_cfg_scale: float | None = None,
+        lyric_cfg_scale: float | None = None,
+        gender: str | None = None,
+        bpm: float | None = None,
+        emit_every: int = 256,
+        first_emit: int = 128,
+        decode_ctx: int = 16,
+        cancel: threading.Event | None = None,
+        on_complete=None,
+    ):
+        """Streaming counterpart to ``cover_audio``: re-render the hum's melody in
+        the prompt's timbre, streaming the result as it generates."""
+        if not getattr(self.model.cfg, "use_melody_conditioning", False):
+            raise RuntimeError(
+                "This checkpoint was trained without melody conditioning — /cover "
+                "needs a model with use_melody_conditioning=True.")
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        melody = self._build_melody(melody_audio_bytes)  # [1, T, 12]
+        new_frames = min(melody.shape[1], max_total - 1)
+        if new_frames <= 0:
+            raise ValueError("Melody audio is too short or context limit too small.")
+        melody = melody[:, :new_frames, :]
+
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
+        prompt, _ = self.model._resolve_prompt(None)  # seed frame; chroma drives contour
+        meta = self._gen_metadata(
+            "cover", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            melody_cfg_scale=melody_cfg_scale, seconds=new_frames / self.codec.FRAME_RATE_HZ,
+        )
+
+        def producer(append_pcm, cancel):
+            self._decoded_chunks(
+                append_pcm, cancel, prompt=prompt, num_new_frames=new_frames,
+                temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+                cond_emb=cond_emb, neg_emb=neg_emb, cond_lids=cond_lids, cond_lmask=cond_lmask,
+                neg_lids=neg_lids, neg_lmask=neg_lmask, lyric_cfg_scale=lyric_cfg_scale,
+                melody=melody, melody_cfg_scale=melody_cfg_scale,
+                decode_ctx=decode_ctx, emit_every=emit_every, first_emit=first_emit,
+            )
+
+        yield from self._stream_mp3(producer, meta=meta, on_complete=on_complete, cancel=cancel)
 
     def _ensure_demucs(self):
         """Lazy-load Demucs (htdemucs) for stem separation; cached after first use.

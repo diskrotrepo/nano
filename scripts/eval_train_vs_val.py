@@ -36,6 +36,7 @@ ckpts_vol = modal.Volume.from_name("nano-ckpts")
     image=image,
     gpu="H100",
     timeout=60 * 60,
+    memory=131072,  # 128 GB — corpus-scale tag cache (~283k embeds) + DataLoader worker forks OOM the default
     volumes={"/tokens": tokens_vol, "/ckpts": ckpts_vol},
 )
 def eval_splits(n_batches: int = 50, batch_size: int = 64, seed: int = 42, val_ratio: float = 0.12,
@@ -94,7 +95,7 @@ def eval_splits(n_batches: int = 50, batch_size: int = 64, seed: int = 42, val_r
                 print(f"[tags] embedded {len(new_tags)} unique captions for {split}", flush=True)
         loader = DataLoader(
             ds, batch_size=batch_size, shuffle=True,
-            num_workers=8, pin_memory=True, drop_last=True, persistent_workers=True,
+            num_workers=2, pin_memory=True, drop_last=True, persistent_workers=True,
             collate_fn=collate_lyrics,
         )
         mean, per_cb = _evaluate(model, loader, tcfg, n_batches,

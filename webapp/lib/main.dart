@@ -138,6 +138,69 @@ class _HomePageState extends State<HomePage> {
           : _promptCtl.text.trim(),
       lyrics: isStem ? '' : _lyricsCtl.text.trim(),
     );
+
+    // Progressive playback via MSE for generate/extend/cover: play unlocks once
+    // >= kStreamGateSeconds is buffered, then continues as the rest streams in
+    // (bypassing Modal's 150s wall; the server saves the finished clip on
+    // completion). generate streams over GET; extend/cover POST their upload.
+    // Needs MSE-mp3 support and (for extend/cover) an input clip; otherwise it
+    // falls through to the reliable buffered POST path below. Very long lyrics
+    // would overflow the generate GET query, so fall back there too.
+    const streamModes = {NanoMode.generate, NanoMode.extend, NanoMode.cover};
+    final canStream = mseMp3Supported() &&
+        streamModes.contains(_mode) &&
+        _lyricsCtl.text.trim().length <= 1500 &&
+        (_mode == NanoMode.generate || _params.inputAudio != null);
+    if (canStream) {
+      final reqId = 'g${clip.id}t${DateTime.now().microsecondsSinceEpoch}';
+      late final MseStream mse;
+      void onPlay() => _onStreamPlay(mse);
+      if (_mode == NanoMode.generate) {
+        mse = MseStream(_api.streamUrl(_params, reqId), onPlay: onPlay);
+      } else {
+        final file = _params.inputAudio!;
+        mse = MseStream(
+          _api.streamEndpoint(_mode),
+          requestInit: streamPostInit(
+            fields: _api.streamFields(_mode, _params, reqId),
+            fileField: _mode == NanoMode.cover ? 'melody_audio' : 'audio',
+            fileBytes: file.bytes,
+            fileName: file.name,
+          ),
+          onPlay: onPlay,
+        );
+      }
+      mse.addListener(() {
+        if (!mounted || !_clips.contains(clip)) return;
+        setState(() {
+          clip.bufferedSeconds = mse.bufferedSeconds;
+          if (clip.status == ClipStatus.generating &&
+              (mse.bufferedSeconds >= kStreamGateSeconds || mse.complete)) {
+            clip.status = ClipStatus.ready; // enough buffered → playable
+          }
+          if (mse.complete && clip.bytes == null) {
+            final bytes = mse.allBytes();
+            clip
+              ..bytes = bytes
+              ..mime = 'audio/mpeg'
+              ..blob = AudioBlob.fromBytes(bytes, 'audio/mpeg')
+              ..durationSeconds = mse.bufferedSeconds;
+          }
+          if (mse.error != null && clip.status != ClipStatus.ready) {
+            clip
+              ..status = ClipStatus.error
+              ..error = mse.error;
+          }
+        });
+      });
+      clip.mse = mse;
+      setState(() {
+        _error = null;
+        _clips.insert(0, clip);
+      });
+      return;
+    }
+
     setState(() {
       _busy = true;
       _error = null;
@@ -353,7 +416,17 @@ class _HomePageState extends State<HomePage> {
       key: ValueKey(clip.id),
       clip: clip,
       player: _player,
-      onToggle: () => _player.toggle(clip.id.toString(), clip.blob!.url),
+      onToggle: () {
+        if (clip.mse != null) {
+          clip.mse!.togglePlay(); // streaming clip: its own MSE element
+          return;
+        }
+        final url = clip.playUrl;
+        if (url != null) {
+          _pauseAllStreams();
+          _player.toggle(clip.id.toString(), url);
+        }
+      },
       onDownload: () {
         final ext = (clip.mime ?? '').contains('wav') ? 'wav' : 'mp3';
         clip.blob?.download('nano-${clip.mode.label}-${clip.id}.$ext');
@@ -365,7 +438,25 @@ class _HomePageState extends State<HomePage> {
   void _deleteClip(GenClip clip) {
     _player.stopIfCurrent(clip.id.toString());
     clip.blob?.revoke();
+    clip.mse?.dispose();
     setState(() => _clips.remove(clip));
+  }
+
+  /// One-at-a-time playback: when a streaming clip starts, pause the shared blob
+  /// player and any other streaming clip.
+  void _onStreamPlay(MseStream playing) {
+    _player.pause();
+    for (final c in _clips) {
+      final m = c.mse;
+      if (m != null && m != playing && m.playing) m.pause();
+    }
+  }
+
+  /// Pause every streaming clip (used before starting a blob-backed clip).
+  void _pauseAllStreams() {
+    for (final c in _clips) {
+      if (c.mse?.playing ?? false) c.mse!.pause();
+    }
   }
 
   Widget _header() {
@@ -1169,6 +1260,10 @@ class _HomePageState extends State<HomePage> {
 /// CLAP score / sweetened prompt the server returned.
 enum ClipStatus { generating, ready, error }
 
+/// Seconds of audio that must be buffered before a streaming clip becomes
+/// playable (progressive MSE playback). Below this, play stays disabled.
+const double kStreamGateSeconds = 10.0;
+
 class GenClip {
   GenClip({
     required this.id,
@@ -1186,10 +1281,23 @@ class GenClip {
   Uint8List? bytes;
   String? mime;
   AudioBlob? blob;
+  // Progressive MSE stream (generate mode): plays via mse.url as it streams,
+  // gated until bufferedSeconds reaches the play gate; bytes/blob fill in on
+  // completion (for download / waveform). Native <audio> can't play our live
+  // stream directly (no Content-Length / Range), so MSE is the progressive path.
+  MseStream? mse;
+  double bufferedSeconds = 0;
   double? durationSeconds;
   double? clapScore;
   String? sweetened;
   String? error;
+
+  /// Blob playback source for non-streaming clips (extend/cover/stem + the
+  /// finished download). Streaming clips play through their own [mse] element.
+  String? get playUrl => blob?.url;
+
+  /// Canonical bytes present → waveform / download / accurate length available.
+  bool get hasBytes => bytes != null;
 }
 
 String _fmtLen(double? s) {
@@ -1228,8 +1336,18 @@ class ClipCard extends StatelessWidget {
       animation: player,
       builder: (context, _) {
         final ready = clip.status == ClipStatus.ready;
-        final isCurrent = player.isCurrent(clip.id.toString());
-        final isPlaying = isCurrent && player.isPlaying;
+        // A streamed clip is playable (ready) before its canonical bytes arrive;
+        // the waveform / download / drag-as-source need the actual bytes.
+        final hasBytes = clip.hasBytes;
+        // Streaming clips play through their own MSE element; others through the
+        // shared blob ClipPlayer.
+        final mse = clip.mse;
+        final isPlaying = mse != null
+            ? mse.playing
+            : (player.isCurrent(clip.id.toString()) && player.isPlaying);
+        final isCurrent = mse != null
+            ? mse.playing
+            : player.isCurrent(clip.id.toString());
 
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
@@ -1253,11 +1371,14 @@ class ClipCard extends StatelessWidget {
                   _lengthChip(),
                 ],
               ),
-              if (ready) ...[
+              if (mse != null && ready) ...[
+                const SizedBox(height: 10),
+                _streamBar(mse),
+              ] else if (hasBytes) ...[
                 const SizedBox(height: 10),
                 ClipWaveform(
                   id: clip.id.toString(),
-                  url: clip.blob!.url,
+                  url: clip.playUrl!,
                   bytes: clip.bytes!,
                   player: player,
                 ),
@@ -1276,11 +1397,36 @@ class ClipCard extends StatelessWidget {
                 ),
               ],
               const SizedBox(height: 4),
-              _footer(ready),
+              _footer(hasBytes),
             ],
           ),
         );
       },
+    );
+  }
+
+  /// Progressive-stream transport: playback position + how much is buffered.
+  Widget _streamBar(MseStream mse) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(2),
+          child: LinearProgressIndicator(
+            value: mse.positionFraction,
+            minHeight: 4,
+            backgroundColor: NanoColors.surfaceAlt,
+            color: NanoColors.pink,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          mse.complete
+              ? 'streamed in full'
+              : 'streaming · ${mse.bufferedSeconds.toStringAsFixed(0)}s buffered',
+          style: const TextStyle(color: NanoColors.textDim, fontSize: 10),
+        ),
+      ],
     );
   }
 
@@ -1326,7 +1472,10 @@ class ClipCard extends StatelessWidget {
 
   Widget _body(bool ready) {
     final primary = switch (clip.status) {
-      ClipStatus.generating => 'generating…',
+      ClipStatus.generating => clip.mse != null
+          ? 'buffering ${clip.bufferedSeconds.toStringAsFixed(1)}s / '
+              '${kStreamGateSeconds.toStringAsFixed(0)}s'
+          : 'generating…',
       ClipStatus.error => clip.error ?? 'failed',
       ClipStatus.ready => clip.prompt.isEmpty ? '(no prompt)' : clip.prompt,
     };
@@ -1382,10 +1531,10 @@ class ClipCard extends StatelessWidget {
     );
   }
 
-  Widget _footer(bool ready) {
+  Widget _footer(bool canExport) {
     return Row(
       children: [
-        if (ready) ...[
+        if (canExport) ...[
           _dragHandle(),
           const SizedBox(width: 10),
         ],
@@ -1401,7 +1550,7 @@ class ClipCard extends StatelessWidget {
                   fontWeight: FontWeight.bold)),
         ],
         const Spacer(),
-        if (ready) _miniIcon(Icons.download, 'download', onDownload),
+        if (canExport) _miniIcon(Icons.download, 'download', onDownload),
         _miniIcon(Icons.close, 'remove', onDelete),
       ],
     );

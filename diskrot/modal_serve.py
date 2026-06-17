@@ -65,7 +65,9 @@ DEFAULT_CKPT_CANDIDATES = [
 # is also imported inside the container, where these are absent; the dict is
 # empty there and the .env() layer is a no-op.)
 _FORWARDED_ENV = {
-    k: v for k in ("NANO_CKPT", "NANO_BITS") if (v := os.environ.get(k))
+    k: v for k in ("NANO_CKPT", "NANO_BITS", "NANO_WARMUP_SECONDS", "TORCH_LOGS",
+                   "NANO_COMPILE", "NANO_WARMUP_CFG")
+    if (v := os.environ.get(k))
 }
 
 
@@ -143,8 +145,10 @@ output_vol = modal.Volume.from_name("nano-output", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="L4",  # the ~1.5B model in fp16 fits comfortably; bump to "A10G"/"H100"
-    # for lower latency on long (90s) generations.
+    gpu="H100",  # autoregressive decode is memory-bandwidth-bound: each token
+    # streams all ~2B weights from HBM, so the H100's ~3.35 TB/s (~11x the L4's
+    # ~300 GB/s) is both far faster AND cheaper per generation. (L4/A10G fit the
+    # model fine but are bandwidth-starved on long 90s gens.)
     volumes={"/ckpts": ckpts_vol, "/outputs": output_vol},
     # Keep a warm container for 5 min after the last request so back-to-back
     # generations don't each pay the model-load cold start. Set min_containers=1

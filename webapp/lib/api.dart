@@ -147,6 +147,86 @@ class NanoApi {
     return HealthInfo(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  /// GET URL for the progressive /generate_stream endpoint. A native <audio src>
+  /// pointed here plays the clip as it generates (and slips under Modal's 150s
+  /// wall, which kills the buffered POST on long clips). Only /generate fields are
+  /// carried — no file upload rides a GET, so extend/cover/stem keep [run].
+  /// `reqId` lets the client fetch the saved canonical clip afterwards (see
+  /// [fetchOutput] / GET /outputs/{id}).
+  Uri streamUri(GenParams p, String reqId) {
+    return _uri('/generate_stream').replace(queryParameters: {
+      'seconds': p.seconds.toString(),
+      'temperature': p.temperature.toString(),
+      'top_k': p.topK.toString(),
+      'top_p': p.topP.toString(),
+      'per_cb_temperature': p.perCbTemperature,
+      'per_cb_top_k': p.perCbTopK,
+      'per_cb_top_p': p.perCbTopP,
+      'cfg_scale': p.cfgScale.toString(),
+      'prompt': p.prompt,
+      'lyrics': p.lyrics,
+      'gender': p.gender,
+      'negative_prompt': p.negativePrompt,
+      'sweeten': p.sweeten.toString(),
+      'lyric_cfg_scale': p.lyricCfgScale.toString(),
+      'req_id': reqId,
+    });
+  }
+
+  String streamUrl(GenParams p, String reqId) => streamUri(p, reqId).toString();
+
+  /// Streaming endpoint path for a mode (generate is GET; extend/cover are POST
+  /// with a file upload).
+  String streamPath(NanoMode mode) => switch (mode) {
+        NanoMode.extend => '/extend_stream',
+        NanoMode.cover => '/cover_stream',
+        _ => '/generate_stream',
+      };
+
+  /// Absolute URL (no query) for a mode's streaming endpoint.
+  String streamEndpoint(NanoMode mode) => _uri(streamPath(mode)).toString();
+
+  /// Form fields for a POST streaming request (extend/cover). The file itself is
+  /// attached separately (audio / melody_audio).
+  Map<String, String> streamFields(NanoMode mode, GenParams p, String reqId) {
+    final f = <String, String>{
+      'prompt': p.prompt,
+      'lyrics': p.lyrics,
+      'gender': p.gender,
+      'negative_prompt': p.negativePrompt,
+      'sweeten': p.sweeten.toString(),
+      'temperature': p.temperature.toString(),
+      'top_k': p.topK.toString(),
+      'top_p': p.topP.toString(),
+      'per_cb_temperature': p.perCbTemperature,
+      'per_cb_top_k': p.perCbTopK,
+      'per_cb_top_p': p.perCbTopP,
+      'cfg_scale': p.cfgScale.toString(),
+      'lyric_cfg_scale': p.lyricCfgScale.toString(),
+      'req_id': reqId,
+    };
+    if (mode == NanoMode.extend) {
+      f['add_seconds'] = p.addSeconds.toString();
+      f['overlap_seconds'] = p.overlapSeconds.toString();
+      f['from_seconds'] = p.fromSeconds.toString();
+    } else if (mode == NanoMode.cover) {
+      f['melody_cfg_scale'] = p.melodyCfgScale.toString();
+    }
+    return f;
+  }
+
+  /// Fetch the canonical (gapless, full-metadata) clip saved by a streamed
+  /// generation, by the `reqId` the client passed to [streamUri]. Returns null
+  /// until the server has finished writing it (the stream must run to completion).
+  Future<NanoResult?> fetchOutput(String reqId) async {
+    final resp = await http.get(_uri('/outputs/$reqId'));
+    if (resp.statusCode != 200) return null;
+    return NanoResult(
+      bytes: resp.bodyBytes,
+      mime: resp.headers['content-type'] ?? 'audio/mpeg',
+    );
+  }
+
   Future<NanoResult> run(NanoMode mode, GenParams p) async {
     final req = http.MultipartRequest('POST', _uri(mode.path));
     final f = req.fields;

@@ -115,6 +115,12 @@ def _compute_clap(wav: np.ndarray, sr: int, text_emb: torch.Tensor | None, clap)
         sf.write(tmp, wav, sr)
     try:
         audio_emb = clap.get_audio_embeddings([tmp]).cpu()  # [1, 1024]
+    except Exception as e:
+        # ffmpeg 8 is too new for torchcodec 4-7 → CLAP audio loading crashes
+        # locally. Generation/decode are unaffected; degrade to librosa-only
+        # ranking (composite_score treats clap=None as 0.0).
+        print(f"  [warn] CLAP audio scoring unavailable ({type(e).__name__}); ranking by librosa metrics only")
+        return None
     finally:
         os.unlink(tmp)
     a = audio_emb / (audio_emb.norm(dim=-1, keepdim=True) + 1e-9)

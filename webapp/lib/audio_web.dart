@@ -41,6 +41,258 @@ class AudioBlob {
   }
 }
 
+/// Download a streaming HTTP response (e.g. `/generate_stream`) to completion via
+/// the Fetch API + ReadableStream, reporting bytes as they arrive. Unlike a
+/// native `<audio src>`, this plays nicely with our live chunked stream (no
+/// Content-Length / no Range support) AND keeps the connection actively reading,
+/// so it slips under Modal's 150s web-endpoint wall — then the caller plays the
+/// finished blob (which browsers play reliably; a live stream they will not).
+Future<Uint8List> fetchAudioStream(
+  String url, {
+  void Function(int receivedBytes)? onProgress,
+}) async {
+  final resp = await web.window.fetch(url.toJS).toDart;
+  if (resp.status != 200) {
+    throw Exception('stream HTTP ${resp.status}');
+  }
+  final body = resp.body;
+  if (body == null) {
+    final buf = await resp.arrayBuffer().toDart;
+    return buf.toDart.asUint8List();
+  }
+  final reader = body.getReader() as web.ReadableStreamDefaultReader;
+  final chunks = <Uint8List>[];
+  var received = 0;
+  while (true) {
+    final result = await reader.read().toDart;
+    if (result.done) break;
+    final value = result.value;
+    if (value.isUndefinedOrNull) continue;
+    final chunk = (value as JSUint8Array).toDart;
+    chunks.add(chunk);
+    received += chunk.length;
+    onProgress?.call(received);
+  }
+  final out = Uint8List(received);
+  var off = 0;
+  for (final c in chunks) {
+    out.setRange(off, off + c.length, c);
+    off += c.length;
+  }
+  return out;
+}
+
+/// True if the browser can play MP3 through MediaSource Extensions (Chrome can;
+/// Safari/Firefox vary). When false, callers fall back to [fetchAudioStream].
+bool mseMp3Supported() {
+  try {
+    return web.MediaSource.isTypeSupported('audio/mpeg');
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Build a POST `RequestInit` carrying a multipart form (text [fields] plus one
+/// uploaded file) — used to stream /extend and /cover, which need a file upload a
+/// GET URL can't carry. Pass the result to [MseStream]'s `requestInit`.
+web.RequestInit streamPostInit({
+  required Map<String, String> fields,
+  required String fileField,
+  required Uint8List fileBytes,
+  required String fileName,
+}) {
+  final fd = web.FormData();
+  fields.forEach((k, v) => fd.append(k, v.toJS));
+  final blob = web.Blob(
+    [fileBytes.toJS].toJS,
+    web.BlobPropertyBag(type: 'application/octet-stream'),
+  );
+  fd.append(fileField, blob, fileName);
+  return web.RequestInit(method: 'POST', body: fd);
+}
+
+/// Progressive MP3 playback over MediaSource Extensions, as a self-contained
+/// mini-player (a [ChangeNotifier]). Feeds a live `/generate_stream` response
+/// into a SourceBuffer chunk-by-chunk, so playback can start before the clip is
+/// finished — a native `<audio src>` can't play our live stream (no
+/// Content-Length / Range). It owns its own detached `<audio>` element and starts
+/// buffering on construction (attaching the MediaSource is what fires
+/// `sourceopen`). [bufferedSeconds] reports how much is decodable so the UI can
+/// gate play until enough is buffered; bytes are accumulated so the finished clip
+/// can be downloaded / waveformed. Reading the stream to completion is also what
+/// makes the server persist the finished clip to disk.
+class MseStream extends ChangeNotifier {
+  MseStream(String fetchUrl, {this.onPlay, web.RequestInit? requestInit}) {
+    _fetchUrl = fetchUrl;
+    _init = requestInit;
+    _audio = web.document.createElement('audio') as web.HTMLAudioElement
+      ..preload = 'auto';
+    _objectUrl = web.URL.createObjectURL(_ms);
+    _ms.addEventListener('sourceopen', _onSourceOpen.toJS);
+    // Attaching the MediaSource to an element is what fires `sourceopen` and lets
+    // buffering begin (before the user ever presses play).
+    _audio.src = _objectUrl;
+    _audio.addEventListener('timeupdate', ((web.Event _) => notifyListeners()).toJS);
+    _audio.addEventListener('playing', _onPlaying.toJS);
+    _audio.addEventListener('pause', _onPause.toJS);
+    _audio.addEventListener('ended', _onPause.toJS);
+  }
+
+  final web.MediaSource _ms = web.MediaSource();
+  late final web.HTMLAudioElement _audio;
+  late final String _objectUrl;
+  late final String _fetchUrl;
+  web.RequestInit? _init; // POST request init (extend/cover upload), null = GET
+
+  /// Invoked when this stream starts playing — lets the host stop other players
+  /// so only one clip plays at a time.
+  final void Function()? onPlay;
+
+  web.SourceBuffer? _sb;
+  final List<JSUint8Array> _queue = [];
+  final List<Uint8List> _bytes = [];
+  bool _streamDone = false;
+  bool complete = false;
+  String? error;
+  int receivedBytes = 0;
+  bool _playing = false;
+
+  bool get playing => _playing;
+
+  void _onPlaying(web.Event _) {
+    _playing = true;
+    notifyListeners();
+  }
+
+  void _onPause(web.Event _) {
+    _playing = false;
+    notifyListeners();
+  }
+
+  void togglePlay() {
+    if (_playing) {
+      _audio.pause();
+    } else {
+      onPlay?.call();
+      _audio.play();
+    }
+  }
+
+  void pause() => _audio.pause();
+
+  /// Playback position as a fraction 0..1 (0 until duration is known — duration
+  /// is Infinity until the stream ends / enough is buffered).
+  double get positionFraction {
+    final d = _audio.duration;
+    if (!d.isFinite || d <= 0) return 0;
+    return (_audio.currentTime / d).clamp(0.0, 1.0);
+  }
+
+  void seekFraction(double f) {
+    final d = _audio.duration;
+    if (d.isFinite && d > 0) {
+      _audio.currentTime = f.clamp(0.0, 1.0) * d;
+      notifyListeners();
+    }
+  }
+
+  void _onSourceOpen(web.Event _) {
+    if (_sb != null) return;
+    try {
+      final sb = _ms.addSourceBuffer('audio/mpeg');
+      _sb = sb;
+      sb.addEventListener('updateend', ((web.Event _) => _pump()).toJS);
+      _startFetch();
+    } catch (e) {
+      error = '$e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> _startFetch() async {
+    try {
+      final init = _init;
+      final resp = await (init == null
+              ? web.window.fetch(_fetchUrl.toJS)
+              : web.window.fetch(_fetchUrl.toJS, init))
+          .toDart;
+      if (resp.status != 200) throw Exception('stream HTTP ${resp.status}');
+      final reader = resp.body!.getReader() as web.ReadableStreamDefaultReader;
+      while (true) {
+        final r = await reader.read().toDart;
+        if (r.done) break;
+        final value = r.value;
+        if (value.isUndefinedOrNull) continue;
+        final arr = value as JSUint8Array;
+        _bytes.add(arr.toDart);
+        receivedBytes += arr.toDart.length;
+        _queue.add(arr);
+        _pump();
+        notifyListeners();
+      }
+      _streamDone = true;
+      _pump();
+    } catch (e) {
+      error = '$e';
+      notifyListeners();
+    }
+  }
+
+  void _pump() {
+    final sb = _sb;
+    if (sb == null || sb.updating) return;
+    if (_queue.isNotEmpty) {
+      final chunk = _queue.removeAt(0);
+      try {
+        sb.appendBuffer(chunk as JSObject);
+      } catch (e) {
+        error = '$e';
+        notifyListeners();
+      }
+    } else if (_streamDone && _ms.readyState == 'open') {
+      try {
+        _ms.endOfStream();
+      } catch (_) {}
+      complete = true;
+      notifyListeners();
+    }
+  }
+
+  /// Decodable buffered duration (seconds) — the gate for enabling play.
+  double get bufferedSeconds {
+    final b = _sb?.buffered;
+    if (b == null || b.length == 0) return 0;
+    try {
+      return b.end(b.length - 1).toDouble();
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// All bytes received so far, concatenated (for download / waveform on done).
+  Uint8List allBytes() {
+    final total = Uint8List(receivedBytes);
+    var off = 0;
+    for (final c in _bytes) {
+      total.setRange(off, off + c.length, c);
+      off += c.length;
+    }
+    return total;
+  }
+
+  @override
+  void dispose() {
+    try {
+      _audio.pause();
+      _audio.removeAttribute('src');
+    } catch (_) {}
+    try {
+      web.URL.revokeObjectURL(_objectUrl);
+    } catch (_) {}
+    super.dispose();
+  }
+}
+
 /// A native HTML `<audio controls>` element bound to a blob URL. Registered
 /// lazily per-URL so Flutter web can embed it via [HtmlElementView].
 class BlobAudioPlayer extends StatefulWidget {
@@ -436,6 +688,7 @@ class ClipPlayer extends ChangeNotifier {
 
   late final web.HTMLAudioElement _audio;
   String? _currentId;
+  String? _currentUrl;
   bool _playing = false;
   double _progress = 0;
   double? _pendingSeek;
@@ -445,10 +698,12 @@ class ClipPlayer extends ChangeNotifier {
   double get progress => _progress;
   bool isCurrent(String id) => _currentId == id;
 
-  /// Play/pause [id] (backed by blob [url]). Starting a different clip swaps the
-  /// source and stops the previous one.
+  /// Play/pause [id] (backed by [url]). Starting a different clip — OR the same
+  /// clip with a new source (e.g. a streamed clip upgrading from its live stream
+  /// URL to the gapless canonical blob once it arrives) — swaps the source and
+  /// stops the previous one.
   void toggle(String id, String url) {
-    if (_currentId == id) {
+    if (_currentId == id && _currentUrl == url) {
       if (_playing) {
         _audio.pause();
         _playing = false;
@@ -467,6 +722,7 @@ class ClipPlayer extends ChangeNotifier {
     _audio.src = url;
     _audio.currentTime = 0;
     _currentId = id;
+    _currentUrl = url;
     _progress = 0;
     _playing = true;
     _audio.play();
@@ -478,10 +734,11 @@ class ClipPlayer extends ChangeNotifier {
   /// metadata arrives. Drives the clip-card waveform scrubber.
   void seek(String id, String url, double fraction) {
     final f = fraction.clamp(0.0, 1.0);
-    if (_currentId != id) {
+    if (_currentId != id || _currentUrl != url) {
       _audio.pause();
       _audio.src = url;
       _currentId = id;
+      _currentUrl = url;
       _playing = false;
       _progress = f;
       _pendingSeek = f; // applied on loadedmetadata
@@ -498,6 +755,16 @@ class ClipPlayer extends ChangeNotifier {
     }
   }
 
+  /// Pause playback (without forgetting the loaded clip) — used to enforce
+  /// one-at-a-time when a streaming clip starts.
+  void pause() {
+    if (_playing) {
+      _audio.pause();
+      _playing = false;
+      notifyListeners();
+    }
+  }
+
   /// Stop and forget [id] if it's the one currently loaded (used when a clip is
   /// removed from the library).
   void stopIfCurrent(String id) {
@@ -505,6 +772,7 @@ class ClipPlayer extends ChangeNotifier {
     _audio.pause();
     _audio.removeAttribute('src');
     _currentId = null;
+    _currentUrl = null;
     _playing = false;
     _progress = 0;
     notifyListeners();
