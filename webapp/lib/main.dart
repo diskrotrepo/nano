@@ -1405,19 +1405,48 @@ class ClipCard extends StatelessWidget {
     );
   }
 
-  /// Progressive-stream transport: playback position + how much is buffered.
+  /// Progressive-stream transport: a seekable playback bar (scrub anywhere that's
+  /// buffered, mid-stream or complete) + how much is buffered.
   Widget _streamBar(MseStream mse) {
+    final pos = mse.positionFraction.clamp(0.0, 1.0);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        ClipRRect(
-          borderRadius: BorderRadius.circular(2),
-          child: LinearProgressIndicator(
-            value: mse.positionFraction,
-            minHeight: 4,
-            backgroundColor: NanoColors.surfaceAlt,
-            color: NanoColors.pink,
-          ),
+        LayoutBuilder(
+          builder: (context, c) {
+            final w = c.maxWidth;
+            void seekAt(double dx) =>
+                mse.seekFraction(w > 0 ? (dx / w).clamp(0.0, 1.0) : 0);
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapDown: (d) => seekAt(d.localPosition.dx),
+              onHorizontalDragUpdate: (d) => seekAt(d.localPosition.dx),
+              child: SizedBox(
+                height: 16,
+                child: Stack(
+                  alignment: Alignment.centerLeft,
+                  children: [
+                    Container(height: 4, color: NanoColors.surfaceAlt),
+                    FractionallySizedBox(
+                      alignment: Alignment.centerLeft,
+                      widthFactor: pos,
+                      child: Container(height: 4, color: NanoColors.pink),
+                    ),
+                    // Playhead handle.
+                    Align(
+                      alignment: Alignment(pos * 2 - 1, 0),
+                      child: Container(
+                        width: 10,
+                        height: 10,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle, color: NanoColors.pink),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
         ),
         const SizedBox(height: 4),
         Text(

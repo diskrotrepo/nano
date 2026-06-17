@@ -180,20 +180,32 @@ class MseStream extends ChangeNotifier {
 
   void pause() => _audio.pause();
 
-  /// Playback position as a fraction 0..1 (0 until duration is known — duration
-  /// is Infinity until the stream ends / enough is buffered).
-  double get positionFraction {
+  /// Reference duration for the transport: the finished length once the stream
+  /// ends (duration is Infinity until then), else how much is buffered — so you
+  /// can scrub within what's streamed so far, mid-generation.
+  double get _refDuration {
     final d = _audio.duration;
-    if (!d.isFinite || d <= 0) return 0;
-    return (_audio.currentTime / d).clamp(0.0, 1.0);
+    if (d.isFinite && d > 0) return d;
+    return bufferedSeconds;
   }
 
+  /// Playback position as a fraction 0..1 of [_refDuration].
+  double get positionFraction {
+    final ref = _refDuration;
+    if (ref <= 0) return 0;
+    return (_audio.currentTime / ref).clamp(0.0, 1.0);
+  }
+
+  /// Scrub to [f] (0..1). Mid-stream this is a fraction of what's buffered; we
+  /// never seek past the buffered frontier (seeking into a gap would stall).
   void seekFraction(double f) {
-    final d = _audio.duration;
-    if (d.isFinite && d > 0) {
-      _audio.currentTime = f.clamp(0.0, 1.0) * d;
-      notifyListeners();
-    }
+    final ref = _refDuration;
+    if (ref <= 0) return;
+    var t = f.clamp(0.0, 1.0) * ref;
+    final maxT = bufferedSeconds > 0 ? bufferedSeconds : ref;
+    if (t > maxT) t = maxT;
+    _audio.currentTime = t;
+    notifyListeners();
   }
 
   void _onSourceOpen(web.Event _) {
