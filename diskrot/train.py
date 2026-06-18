@@ -97,6 +97,20 @@ class TrainConfig:
     # preferred over the base's copy by the merge tool.
     lora_train_text_proj: bool = False
 
+    # Knowledge distillation: train this (typically smaller) student to imitate a
+    # frozen TEACHER checkpoint. distill_from is the teacher checkpoint path (a
+    # normal ckpt with "model"/"cfg"/"text_proj"). When set, a frozen teacher is
+    # rebuilt from its own cfg dict and run under no_grad each step; the loss
+    # becomes alpha*CE + (1-alpha)*KD where KD = tau^2 * KL(teacher || student)
+    # over the soft logits. The teacher is NEVER saved or updated — the student
+    # checkpoint is a normal checkpoint that existing inference/export load
+    # unchanged. Independent of init_from/LoRA: the student trains from scratch
+    # (or its own resume) and the teacher is a read-only side input. Incompatible
+    # with --lora (LoRA freezes a base; distillation trains a fresh student).
+    distill_from: str | None = None
+    distill_alpha: float = 0.5  # weight on the hard-label CE term; KD gets (1-alpha)
+    distill_tau: float = 2.0    # softmax temperature for the KD term (1.5-2.0 typical)
+
     # Distributed (multi-GPU) — DDP is active when world_size > 1.
     # batch_size is interpreted as the *per-rank* batch; global batch is
     # batch_size * world_size. lr at TrainConfig creation should already be the
@@ -604,6 +618,79 @@ def _loss_fn(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> tuple[
     return total, per_cb
 
 
+def _distill_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    targets: torch.Tensor,
+    pad_id: int,
+    tau: float,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Knowledge-distillation loss -> (total, ce, kd, per_cb).
+
+    student_logits / teacher_logits: [B, K, T, V] (teacher is detached/no-grad).
+    CE   = the existing hard-label cross-entropy (pad-masked, == _loss_fn total).
+    KD   = tau^2 * mean over NON-PAD (B,K,T) positions of
+           KL( softmax(teacher/tau) || softmax(student/tau) ).
+    total = alpha*CE + (1-alpha)*KD.
+
+    The KD term is computed in fp32 (the bf16 softmax tail is exactly the
+    low-probability mass KD cares about) and masked with the SAME
+    ``targets != pad_id`` mask CE uses, so the delay-pattern pad tail never
+    contributes. per_cb is the per-codebook CE (for logging continuity).
+    """
+    ce, per_cb = _loss_fn(student_logits, targets, pad_id)
+
+    # F.kl_div(input=student_logp, target=teacher_logp, log_target=True) computes
+    # sum_v exp(target) * (target - input) = KL(teacher || student) per position.
+    s_logp = F.log_softmax(student_logits.float() / tau, dim=-1)
+    t_logp = F.log_softmax(teacher_logits.float() / tau, dim=-1)
+    kl_pos = F.kl_div(s_logp, t_logp, reduction="none", log_target=True).sum(dim=-1)  # [B,K,T]
+
+    mask = (targets != pad_id).to(kl_pos.dtype)  # identical mask to _loss_fn
+    kd = (kl_pos * mask).sum() / mask.sum().clamp(min=1.0)
+    kd = kd * (tau * tau)
+
+    total = alpha * ce + (1.0 - alpha) * kd
+    return total, ce, kd, per_cb
+
+
+def _build_teacher(
+    distill_from: str, device: str, alpha: float, tau: float, main: bool,
+) -> tuple[NanoAudioGPT, CLAPTextEncoder | None, GPTConfig]:
+    """Load the frozen distillation teacher (model + its CLAP text_proj).
+
+    Returns (teacher_model, teacher_text_encoder_or_None, teacher_cfg). The
+    teacher is eval()+requires_grad_(False)+bf16 and is NOT DDP-wrapped or
+    compiled (it has no gradients — each rank just holds its own frozen replica).
+    Only the teacher text_encoder's ``.proj`` is ever used; the CLAP backbone is
+    shared with the student via the precomputed raw tag_cache.
+    """
+    ckpt = torch.load(distill_from, map_location="cpu", weights_only=False)
+    teacher_cfg = GPTConfig(**ckpt["cfg"])
+    teacher = NanoAudioGPT(teacher_cfg)
+    state = ckpt["model"]
+    if any(k.startswith("_orig_mod.") for k in state):  # strip compile prefix if present
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    teacher.load_state_dict(state)
+    teacher.to(device=device, dtype=torch.bfloat16)
+    teacher.eval()
+    teacher.requires_grad_(False)
+
+    teacher_text_enc: CLAPTextEncoder | None = None
+    if teacher_cfg.use_text_conditioning and "text_proj" in ckpt:
+        teacher_text_enc = CLAPTextEncoder(d_out=teacher_cfg.d_model, device=device)
+        teacher_text_enc.proj.load_state_dict(ckpt["text_proj"])
+        teacher_text_enc.to(device)
+        teacher_text_enc.eval()
+        teacher_text_enc.requires_grad_(False)
+    if main:
+        print(f"distillation: teacher loaded from {distill_from} "
+              f"({teacher.num_params()/1e9:.2f}B params, d_model={teacher_cfg.d_model}, "
+              f"frozen bf16); KD alpha={alpha} tau={tau}", flush=True)
+    return teacher, teacher_text_enc, teacher_cfg
+
+
 def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     """Strip torch.compile (``_orig_mod``) and DDP (``module``) wrappers."""
     inner = getattr(model, "_orig_mod", model)
@@ -738,6 +825,12 @@ def train_run(
                 print("WARNING: checkpoint enables lyric conditioning but "
                       "--lyrics-path is not set — lyrics train without signal")
     lora_active = plan.lora_cfg is not None
+    if cfg.distill_from and lora_active:
+        raise ValueError(
+            "distill_from is incompatible with --lora: LoRA freezes a pretrained "
+            "base and trains adapters, while distillation trains a fresh student "
+            "against a frozen teacher. Pick one."
+        )
 
     segment_frames = int(cfg.segment_seconds * DACodec.FRAME_RATE_HZ)
     if main:
@@ -902,6 +995,24 @@ def train_run(
             print(f"melody (chroma) conditioning enabled (n_bins={cfg.model.melody_n_bins}, "
                   f"cfg_dropout={cfg.cfg_dropout})")
 
+    # Distillation teacher: a frozen, read-only side model (built from its OWN
+    # cfg dict, so it can be any shape). Loaded per rank; NOT DDP-wrapped or
+    # compiled (no grads). Geometry must match the student exactly so the two
+    # logit tensors align position-by-position for the KL term.
+    teacher: NanoAudioGPT | None = None
+    teacher_text_enc: CLAPTextEncoder | None = None
+    teacher_cfg: GPTConfig | None = None
+    if cfg.distill_from:
+        teacher, teacher_text_enc, teacher_cfg = _build_teacher(
+            cfg.distill_from, cfg.device, cfg.distill_alpha, cfg.distill_tau, main)
+        assert teacher_cfg.n_codebooks == cfg.model.n_codebooks, "teacher/student n_codebooks mismatch"
+        assert teacher_cfg.vocab_with_pad == cfg.model.vocab_with_pad, "teacher/student vocab mismatch"
+        assert teacher_cfg.pad_id == cfg.model.pad_id, "teacher/student pad_id mismatch"
+        assert teacher_cfg.max_seq_len >= cfg.model.max_seq_len, "teacher max_seq_len too small"
+        if teacher_text_enc is None and text_encoder is not None and main:
+            print("WARNING: distillation teacher has no text_proj — its tag path "
+                  "will see no conditioning while the student's does", flush=True)
+
     # REGIONAL compilation, before the DDP wrap: compile each decoder Block
     # in place (nn.Module.compile keeps state-dict keys clean — no _orig_mod
     # interior prefixes) instead of one monolithic 22-layer graph. The blocks
@@ -1060,11 +1171,23 @@ def train_run(
         B_in = inputs.shape[0]
         d_model = cfg.model.d_model
         text_emb = None
+        text_emb_teacher = None  # teacher's tag projection (distillation only)
         if text_encoder is not None:
-            if _rng.random() >= cfg.cfg_dropout:
+            # ONE rng draw (unchanged order/probability vs the non-distill path).
+            # The teacher reuses this same keep decision and the same raw CLAP
+            # vector (only its projection differs) so both models see identical
+            # conditioning.
+            text_kept = _rng.random() >= cfg.cfg_dropout
+            if text_kept:
                 text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
+                if teacher_text_enc is not None:
+                    text_emb_teacher = _build_cond(
+                        teacher_text_enc, list(tags), cfg.device, tag_cache)
             else:
                 text_emb = torch.zeros((B_in, 1, d_model), device=cfg.device)
+                if teacher_text_enc is not None:
+                    text_emb_teacher = torch.zeros(
+                        (B_in, 1, teacher_cfg.d_model), device=cfg.device)
         # Lyrics and melody: the encoders ALWAYS run; a 0/1 keep tensor zeroes
         # the contribution on dropped steps (keep=0 is exactly the uncond
         # state: zero lyric cond / the melody null). One compiled graph per
@@ -1092,7 +1215,19 @@ def train_run(
             logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
                            lyric_mask=l_mask, lyric_keep=lyric_keep,
                            melody=mel, melody_keep=melody_keep)
-            loss, per_cb = _loss_fn(logits, targets, pad_id)
+            if teacher is not None:
+                # Teacher forward: identical inputs + conditioning (lyric/melody
+                # ids and keep gates are model-agnostic; only the tag projection
+                # differs). No grad, no autograd graph stored.
+                with torch.no_grad():
+                    t_logits = teacher(inputs, text_emb=text_emb_teacher, lyric_ids=l_ids,
+                                       lyric_mask=l_mask, lyric_keep=lyric_keep,
+                                       melody=mel, melody_keep=melody_keep)
+                loss, ce_term, kd_term, per_cb = _distill_loss(
+                    logits, t_logits, targets, pad_id, cfg.distill_tau, cfg.distill_alpha)
+            else:
+                loss, per_cb = _loss_fn(logits, targets, pad_id)
+                ce_term = kd_term = None
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(optim)
@@ -1130,7 +1265,13 @@ def train_run(
             avg_io_ms = (dataloader_wait_s / cfg.log_every) * 1000
             cur_lr = optim.param_groups[0]["lr"]
             gnorm_val = max_gnorm.item() if max_gnorm is not None else float("nan")
-            print(f"step {step:>6}/{cfg.steps}  loss {avg_loss:.4f}  "
+            # Distillation: surface the raw CE (comparable to non-distill runs)
+            # and KD alongside the combined loss. ce_term/kd_term hold the latest
+            # step's values (like grad/cb); None when not distilling.
+            distill_str = ""
+            if ce_term is not None:
+                distill_str = f"  ce {ce_term.item():.4f}  kd {kd_term.item():.4f}"
+            print(f"step {step:>6}/{cfg.steps}  loss {avg_loss:.4f}{distill_str}  "
                   f"lr {cur_lr:.2e}  grad {gnorm_val:.2f}  tok/s {tps/1e3:.1f}k  "
                   f"cb[{cb_str}]",
                   flush=True)
@@ -1143,6 +1284,9 @@ def train_run(
                     "train/dataloader_wait_ms": avg_io_ms,
                     "train/epoch": epoch,
                 }
+                if ce_term is not None:
+                    log_payload["train/ce_loss"] = ce_term.item()
+                    log_payload["train/kd_loss"] = kd_term.item()
                 for cb_i, cb_loss in enumerate(per_cb.tolist()):
                     log_payload[f"train/cb_{cb_i}"] = cb_loss
                 if cfg.device == "cuda":

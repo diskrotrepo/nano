@@ -228,6 +228,9 @@ def _build_cfg_kwargs(
     lora_targets: str = "",
     lora_train_text_proj: bool = False,
     data_subdir: str = "",
+    distill_from: str = "",
+    distill_alpha: float = 0.5,
+    distill_tau: float = 2.0,
 ) -> dict:
     """Shared TrainConfig builder for both single- and multi-GPU paths.
     Returns a plain dict so it survives mp.spawn pickling.
@@ -272,6 +275,11 @@ def _build_cfg_kwargs(
         lora_alpha=lora_alpha,
         lora_targets=lora_targets or DEFAULT_TARGETS,
         lora_train_text_proj=lora_train_text_proj,
+        # Distillation: the teacher checkpoint is relative to the nano-ckpts
+        # volume (mounted at /ckpts), same convention as init_from.
+        distill_from=f"/ckpts/{distill_from}" if distill_from else None,
+        distill_alpha=distill_alpha,
+        distill_tau=distill_tau,
     )
 
 
@@ -560,6 +568,13 @@ def train_remote(
     lora_targets: str = "",
     lora_train_text_proj: bool = False,
     data_subdir: str = "",
+    # Distillation: train this (smaller) student to imitate a frozen teacher
+    # checkpoint on nano-ckpts (e.g. "v8_sing4/best.pt"). The student trains
+    # from scratch; the teacher is read-only. Use the --d-model etc. flags to
+    # set the (smaller) student shape, and a fresh --ckpt-subdir.
+    distill_from: str = "",
+    distill_alpha: float = 0.5,
+    distill_tau: float = 2.0,
 ):
     from diskrot.train import TrainConfig, train_run
 
@@ -572,6 +587,7 @@ def train_remote(
         init_from=init_from, lora=lora, lora_r=lora_r, lora_alpha=lora_alpha,
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
+        distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
     )
     cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(
@@ -637,6 +653,11 @@ def train_remote_multi(
     lora_targets: str = "",
     lora_train_text_proj: bool = False,
     data_subdir: str = "",
+    # Distillation — see train_remote(). The teacher (e.g. "v8_sing4/best.pt")
+    # is loaded frozen per rank; each rank holds its own ~2.0B bf16 replica.
+    distill_from: str = "",
+    distill_alpha: float = 0.5,
+    distill_tau: float = 2.0,
 ):
     import torch
     import torch.multiprocessing as mp
@@ -661,6 +682,7 @@ def train_remote_multi(
         init_from=init_from, lora=lora, lora_r=lora_r, lora_alpha=lora_alpha,
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
+        distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
     )
     model_kwargs = dict(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff, dropout=dropout,
@@ -776,9 +798,21 @@ def main(
     # Train on a fine-tune corpus packed under /tokens/{data_subdir} instead
     # of the main pack (same layout: token_cache shards, tags.json, lyrics/ …).
     data_subdir: str = "",
+    # Distillation: train a (smaller) student to imitate a frozen teacher
+    # checkpoint on nano-ckpts. Set the student shape with --d-model/--n-layers/
+    # --n-heads/--d-ff and a FRESH --ckpt-subdir. The student trains from scratch;
+    # the teacher is read-only. Incompatible with --lora. Example:
+    #   modal run diskrot/modal_train.py --n-gpus 4 --ckpt-subdir v8_distill \
+    #     --distill-from v8_sing4/best.pt --d-model 1280 --n-layers 16 \
+    #     --n-heads 10 --d-ff 5120 --steps 150000 --lr 3.0e-4
+    distill_from: str = "",
+    distill_alpha: float = 0.5,
+    distill_tau: float = 2.0,
 ):
     if lora and not init_from:
         raise SystemExit("--lora requires --init-from (e.g. --init-from v8_sing/best.pt)")
+    if distill_from and lora:
+        raise SystemExit("--distill-from is incompatible with --lora (pick one)")
     if batch_size <= 0:
         # Hold the global batch at DEFAULTS["batch_size"] (32) for any rank count:
         # per-rank = 32 // n_gpus (8 on 4 ranks, 4 on 8 ranks). Keeps lr valid.
@@ -798,6 +832,7 @@ def main(
         init_from=init_from, lora=lora, lora_r=lora_r, lora_alpha=lora_alpha,
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
+        distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
     )
     if n_gpus > 1:
         fc = train_remote_multi.spawn(**common, n_gpus=n_gpus)

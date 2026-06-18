@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from diskrot.train import TrainConfig, _cosine_lr, _loss_fn
+from diskrot.train import TrainConfig, _cosine_lr, _distill_loss, _loss_fn
 
 
 def _loss_fn_loopy(logits: torch.Tensor, targets: torch.Tensor, pad_id: int):
@@ -116,6 +116,77 @@ def test_loss_fn_shapes():
     total, per_cb = _loss_fn(logits, targets, pad)
     assert total.shape == ()
     assert per_cb.shape == (K,)
+
+
+# ----- _distill_loss (knowledge distillation) -----
+
+def test_distill_loss_zero_kd_when_teacher_equals_student():
+    """Identical teacher/student logits → KL is exactly 0, so KD=0 and the total
+    collapses to alpha*CE. ce returned must equal the plain _loss_fn total."""
+    torch.manual_seed(0)
+    B, K, T, V = 2, 9, 13, 1025
+    pad = V - 1
+    logits = torch.randn(B, K, T, V)
+    targets = torch.randint(0, pad, (B, K, T))
+    alpha, tau = 0.5, 2.0
+    total, ce, kd, per_cb = _distill_loss(logits, logits.clone(), targets, pad, tau, alpha)
+
+    ref_total, ref_per_cb = _loss_fn(logits, targets, pad)
+    assert kd.item() == pytest.approx(0.0, abs=1e-6)
+    assert torch.allclose(ce, ref_total, atol=1e-6)
+    assert torch.allclose(per_cb, ref_per_cb, atol=1e-6)
+    assert total.item() == pytest.approx(alpha * ce.item(), abs=1e-6)
+
+
+def test_distill_loss_decomposition():
+    """total == alpha*CE + (1-alpha)*KD for distinct teacher/student, and KD>0."""
+    torch.manual_seed(1)
+    B, K, T, V = 3, 9, 17, 1025
+    pad = V - 1
+    student = torch.randn(B, K, T, V)
+    teacher = torch.randn(B, K, T, V)
+    targets = torch.randint(0, pad, (B, K, T))
+    alpha, tau = 0.3, 1.5
+    total, ce, kd, _ = _distill_loss(student, teacher, targets, pad, tau, alpha)
+    assert kd.item() > 0.0
+    assert total.item() == pytest.approx(alpha * ce.item() + (1 - alpha) * kd.item(), abs=1e-5)
+
+
+def test_distill_loss_pad_positions_ignored():
+    """KD (like CE) is masked at pad targets: perturbing BOTH teacher and student
+    logits only at pad positions leaves total/ce/kd unchanged."""
+    torch.manual_seed(2)
+    B, K, T, V = 2, 9, 15, 1025
+    pad = V - 1
+    student = torch.randn(B, K, T, V)
+    teacher = torch.randn(B, K, T, V)
+    targets = torch.randint(0, pad, (B, K, T))
+    targets[:, :, :3] = pad  # mask the first 3 positions
+    alpha, tau = 0.5, 2.0
+
+    total_a, ce_a, kd_a, _ = _distill_loss(student, teacher, targets, pad, tau, alpha)
+    s2, t2 = student.clone(), teacher.clone()
+    s2[:, :, :3] = torch.randn_like(s2[:, :, :3]) * 100
+    t2[:, :, :3] = torch.randn_like(t2[:, :, :3]) * 100
+    total_b, ce_b, kd_b, _ = _distill_loss(s2, t2, targets, pad, tau, alpha)
+
+    assert torch.allclose(total_a, total_b, atol=1e-5)
+    assert torch.allclose(ce_a, ce_b, atol=1e-6)
+    assert torch.allclose(kd_a, kd_b, atol=1e-5)
+
+
+def test_distill_loss_all_pad_is_finite():
+    """Entire batch pad → CE=0 and KD=0 (mask.sum() clamped), total finite zero."""
+    B, K, T, V = 1, 9, 5, 1025
+    pad = V - 1
+    student = torch.randn(B, K, T, V)
+    teacher = torch.randn(B, K, T, V)
+    targets = torch.full((B, K, T), pad, dtype=torch.long)
+    total, ce, kd, per_cb = _distill_loss(student, teacher, targets, pad, 2.0, 0.5)
+    for t in (total, ce, kd, per_cb):
+        assert torch.isfinite(t).all()
+    assert total.item() == pytest.approx(0.0, abs=1e-6)
+    assert kd.item() == pytest.approx(0.0, abs=1e-6)
 
 
 # ----- _cosine_lr -----

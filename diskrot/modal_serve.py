@@ -29,6 +29,12 @@ The UI is mounted from the local `webapp/build/web` bundle, so build it first:
 Point at a different checkpoint on the volume:
     NANO_CKPT=/ckpts/v8_sing/latest.pt modal serve diskrot/modal_serve.py
 
+Register MULTIPLE switchable checkpoints (the request's `model` field picks one;
+the others lazy-load on first use; GET /models lists them). Keeps the big model
+available alongside the fast distilled student:
+    NANO_MODELS="fast=/ckpts/v8_distill/best_inference.pt,full=/ckpts/v8_sing4/best_inference.pt" \\
+      NANO_DEFAULT_MODEL=fast modal deploy diskrot/modal_serve.py
+
 Quantize the weights to shrink the model + speed up the memory-bound decode
 (CUDA only; mirrors NANO_MLX_BITS on the Apple-Silicon path). Default is fp16:
     NANO_BITS=8 modal serve diskrot/modal_serve.py   # int8 weight-only (~1.5GB)
@@ -65,8 +71,8 @@ DEFAULT_CKPT_CANDIDATES = [
 # is also imported inside the container, where these are absent; the dict is
 # empty there and the .env() layer is a no-op.)
 _FORWARDED_ENV = {
-    k: v for k in ("NANO_CKPT", "NANO_BITS", "NANO_WARMUP_SECONDS", "TORCH_LOGS",
-                   "NANO_COMPILE", "NANO_WARMUP_CFG")
+    k: v for k in ("NANO_CKPT", "NANO_MODELS", "NANO_DEFAULT_MODEL", "NANO_BITS",
+                   "NANO_WARMUP_SECONDS", "TORCH_LOGS", "NANO_COMPILE", "NANO_WARMUP_CFG")
     if (v := os.environ.get(k))
 }
 
@@ -166,7 +172,12 @@ def serve():
     # (its default detection only knows MPS/CPU locally).
     os.environ.setdefault("NANO_DEVICE", "cuda")
     os.environ.setdefault("NANO_OUTPUT_DIR", "/outputs")
-    if "NANO_CKPT" not in os.environ:
+    # NANO_MODELS ("fast=/ckpts/v8_distill/best_inference.pt,full=/ckpts/v8_sing4/
+    # best_inference.pt") registers several switchable checkpoints; the request's
+    # `model` field picks one, the rest lazy-load. When it's set the server reads
+    # it directly — skip the single-checkpoint resolution below. Otherwise fall
+    # back to NANO_CKPT (explicit) or the default-candidate search.
+    if "NANO_MODELS" not in os.environ and "NANO_CKPT" not in os.environ:
         for cand in DEFAULT_CKPT_CANDIDATES:
             if os.path.exists(cand):
                 os.environ["NANO_CKPT"] = cand
@@ -176,9 +187,10 @@ def serve():
                 "No checkpoint found on the nano-ckpts volume at any of "
                 f"{DEFAULT_CKPT_CANDIDATES}. Export one with "
                 "`modal run diskrot/modal_export_ckpt.py --src v8_sing/best.pt`, "
-                "or set NANO_CKPT to its path."
+                "or set NANO_CKPT / NANO_MODELS to its path(s)."
             )
-    print(f"[serve] device={os.environ['NANO_DEVICE']} ckpt={os.environ['NANO_CKPT']}")
+    _sel = os.environ.get("NANO_MODELS") or os.environ.get("NANO_CKPT")
+    print(f"[serve] device={os.environ['NANO_DEVICE']} models={_sel}")
 
     from server.main import app as fastapi_app
 

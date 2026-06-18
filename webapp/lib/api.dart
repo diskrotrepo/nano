@@ -47,6 +47,11 @@ class AudioFile {
 /// Fields not relevant to the active mode are simply omitted when building
 /// the request.
 class GenParams {
+  // Which served checkpoint to use ('' = the server's default model). Populated
+  // from GET /models; lets the UI switch between e.g. the fast distilled student
+  // and the full 2.0B model. Sent as the `model` field on every request.
+  String model = '';
+
   // conditioning (all modes)
   String prompt = '';
   String lyrics = '';
@@ -116,6 +121,13 @@ class NanoResult {
   final double? clapScore;
 }
 
+/// The server's switchable-checkpoint registry (GET /models).
+class ModelsInfo {
+  ModelsInfo(this.ids, this.defaultId);
+  final List<String> ids;
+  final String defaultId;
+}
+
 class HealthInfo {
   HealthInfo(this.raw);
   final Map<String, dynamic> raw;
@@ -147,6 +159,22 @@ class NanoApi {
     return HealthInfo(jsonDecode(resp.body) as Map<String, dynamic>);
   }
 
+  /// Available switchable checkpoints (GET /models). Returns the ordered list of
+  /// model ids and the default id. Returns a single-entry list on older servers
+  /// that don't expose /models, so the picker always has at least one option.
+  Future<ModelsInfo> models() async {
+    final resp = await http.get(_uri('/models'));
+    if (resp.statusCode != 200) {
+      return ModelsInfo(const ['default'], 'default');
+    }
+    final j = jsonDecode(resp.body) as Map<String, dynamic>;
+    final ids = ((j['models'] as List?) ?? const [])
+        .map((m) => '${(m as Map)['id']}')
+        .toList();
+    final def = '${j['default_model'] ?? (ids.isNotEmpty ? ids.first : 'default')}';
+    return ModelsInfo(ids.isEmpty ? const ['default'] : ids, def);
+  }
+
   /// GET URL for the progressive /generate_stream endpoint. A native <audio src>
   /// pointed here plays the clip as it generates (and slips under Modal's 150s
   /// wall, which kills the buffered POST on long clips). Only /generate fields are
@@ -170,6 +198,7 @@ class NanoApi {
       'sweeten': p.sweeten.toString(),
       'lyric_cfg_scale': p.lyricCfgScale.toString(),
       'req_id': reqId,
+      'model': p.model,
     });
   }
 
@@ -204,6 +233,7 @@ class NanoApi {
       'cfg_scale': p.cfgScale.toString(),
       'lyric_cfg_scale': p.lyricCfgScale.toString(),
       'req_id': reqId,
+      'model': p.model,
     };
     if (mode == NanoMode.extend) {
       f['add_seconds'] = p.addSeconds.toString();
@@ -232,6 +262,7 @@ class NanoApi {
     final f = req.fields;
 
     // shared conditioning
+    f['model'] = p.model;
     f['prompt'] = p.prompt;
     f['lyrics'] = p.lyrics;
     f['gender'] = p.gender;

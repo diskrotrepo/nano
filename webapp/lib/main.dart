@@ -66,6 +66,9 @@ class _HomePageState extends State<HomePage> {
   String? _error;
   HealthInfo? _health;
   bool _healthLoading = false;
+  // Available switchable checkpoints (from GET /models). The picker shows only
+  // when there's more than one; `_params.model` holds the selection.
+  List<String> _models = const [];
 
   final List<GenClip> _clips = [];
   final ClipPlayer _player = ClipPlayer();
@@ -101,7 +104,23 @@ class _HomePageState extends State<HomePage> {
     });
     try {
       final h = await _api.health();
-      if (mounted) setState(() => _health = h);
+      // Also fetch the switchable-model registry; tolerate older servers.
+      ModelsInfo? mi;
+      try {
+        mi = await _api.models();
+      } catch (_) {
+        mi = null;
+      }
+      if (mounted) {
+        setState(() {
+          _health = h;
+          _models = mi?.ids ?? const [];
+          // Default the selection to the server's default when unset or stale.
+          if (mi != null && (_params.model.isEmpty || !mi.ids.contains(_params.model))) {
+            _params.model = mi.defaultId;
+          }
+        });
+      }
     } catch (_) {
       if (mounted) setState(() => _health = null);
     } finally {
@@ -485,10 +504,45 @@ class _HomePageState extends State<HomePage> {
             ),
           ],
         ),
+        if (_models.length > 1) ...[
+          const SizedBox(height: 6),
+          _modelPicker(),
+        ],
         if (_health != null) ...[
           const SizedBox(height: 6),
           _healthDetail(_health!),
         ],
+      ],
+    );
+  }
+
+  /// Dropdown to switch which served checkpoint generates (the fast distilled
+  /// student vs the full model). Only rendered when the server advertises more
+  /// than one model; the choice rides every request as the `model` field.
+  Widget _modelPicker() {
+    final value = _models.contains(_params.model)
+        ? _params.model
+        : (_models.isNotEmpty ? _models.first : null);
+    return Row(
+      children: [
+        const Icon(Icons.tune, size: 14, color: NanoColors.textDim),
+        const SizedBox(width: 6),
+        const Text('model', style: TextStyle(color: NanoColors.textDim, fontSize: 11)),
+        const SizedBox(width: 10),
+        DropdownButton<String>(
+          value: value,
+          isDense: true,
+          dropdownColor: NanoColors.surfaceAlt,
+          underline: const SizedBox.shrink(),
+          style: const TextStyle(fontSize: 12, color: NanoColors.text),
+          items: [
+            for (final m in _models)
+              DropdownMenuItem(value: m, child: Text(m)),
+          ],
+          onChanged: (v) {
+            if (v != null) setState(() => _params.model = v);
+          },
+        ),
       ],
     );
   }

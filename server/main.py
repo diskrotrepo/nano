@@ -38,11 +38,73 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from server.inference import InferenceEngine
 
+# --- Model registry (switch between checkpoints at serve time) ---------------
+# The server can hold several named checkpoints (e.g. "full"=v8_sing4 and
+# "fast"=the distilled student) and pick one per request via the `model` form
+# field. Engines are LAZY-loaded on first use, so a cold container only pays for
+# the default model — the others load on their first request. The single active
+# engine lives in the module global `engine` (every endpoint selects it via
+# `_get_engine` first); this is safe because the server serializes requests
+# (Modal `max_inputs=1`, and the static KV cache already forbids concurrent
+# generations). MODELS maps id -> checkpoint path (None = let InferenceEngine
+# resolve NANO_CKPT / its default).
+MODELS: dict[str, str | None] = {}
+DEFAULT_MODEL: str = "default"
+ACTIVE_MODEL: str | None = None
+ENGINES: dict[str, InferenceEngine] = {}
 engine: InferenceEngine | None = None
 
 # When set, every generation is also written here (e.g. the nano-output volume
 # on Modal, mounted at /outputs). Empty = response-only, nothing persisted.
 OUTPUT_DIR = os.environ.get("NANO_OUTPUT_DIR", "")
+
+
+def _parse_models_env() -> tuple[dict[str, str | None], str]:
+    """Parse NANO_MODELS ("id=path,id2=path2") -> ({id: path}, default_id).
+
+    The default is NANO_DEFAULT_MODEL if set, else the first listed id. When
+    NANO_MODELS is unset, fall back to a single "default" model that
+    InferenceEngine resolves from NANO_CKPT / its own default — so existing
+    single-checkpoint deployments keep working unchanged."""
+    raw = os.environ.get("NANO_MODELS", "").strip()
+    if not raw:
+        return {"default": os.environ.get("NANO_CKPT") or None}, "default"
+    models: dict[str, str | None] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"NANO_MODELS entry '{part}' must be 'id=path'")
+        mid, path = part.split("=", 1)
+        models[mid.strip()] = path.strip()
+    if not models:
+        return {"default": os.environ.get("NANO_CKPT") or None}, "default"
+    default = os.environ.get("NANO_DEFAULT_MODEL", "").strip() or next(iter(models))
+    if default not in models:
+        raise ValueError(
+            f"NANO_DEFAULT_MODEL '{default}' is not one of NANO_MODELS ({', '.join(models)})"
+        )
+    return models, default
+
+
+def _get_engine(model_id: str | None) -> InferenceEngine:
+    """Select (lazy-loading if needed) the engine for `model_id` and make it the
+    active one. Empty/None -> the default model. Raises 400 on an unknown id."""
+    global engine, ACTIVE_MODEL
+    mid = (model_id or "").strip() or DEFAULT_MODEL
+    if mid not in MODELS:
+        raise HTTPException(
+            400, f"unknown model '{mid}'; available: {', '.join(MODELS) or '(none)'}"
+        )
+    eng = ENGINES.get(mid)
+    if eng is None:
+        print(f"[models] lazy-loading '{mid}' from {MODELS[mid] or '(default ckpt)'}", flush=True)
+        eng = InferenceEngine(ckpt_path=MODELS[mid])
+        ENGINES[mid] = eng
+    engine = eng
+    ACTIVE_MODEL = mid
+    return eng
 
 
 def _output_name(mode: str, prompt: str, ext: str = "mp3", uid: str | None = None) -> str:
@@ -172,8 +234,12 @@ def _parse_per_cb_topp(raw: str, scalar: float) -> float | None | list[float | N
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine
-    engine = InferenceEngine()
+    global MODELS, DEFAULT_MODEL
+    MODELS, DEFAULT_MODEL = _parse_models_env()
+    print(f"[models] registry: {', '.join(f'{k}={v or 'default'}' for k, v in MODELS.items())} "
+          f"(default={DEFAULT_MODEL})", flush=True)
+    # Eager-load only the default model; others lazy-load on first request.
+    _get_engine(DEFAULT_MODEL)
     # Warm up at container init so the first real request doesn't pay
     # torch.compile tracing + CUDA-graph capture + the sweetener load on the
     # request path. The compiled decode graph is keyed on sequence length, so warm
@@ -223,7 +289,32 @@ def health() -> dict:
         },
         "model_params": engine.model.num_params(),
         "text_conditioning": engine.text_encoder is not None,
+        # Active/available models (the `model` request field selects among these).
+        "model": ACTIVE_MODEL,
+        "default_model": DEFAULT_MODEL,
+        "available_models": list(MODELS),
     }
+
+
+@app.get("/models")
+def list_models() -> dict:
+    """List the available checkpoints the `model` request field can select.
+
+    Reports each id, whether it's currently loaded, and (when loaded) its
+    checkpoint path / step / param count. The UI populates its model picker from
+    this; unloaded models load lazily on their first generation request."""
+    out = []
+    for mid in MODELS:
+        eng = ENGINES.get(mid)
+        entry: dict = {"id": mid, "loaded": eng is not None, "default": mid == DEFAULT_MODEL}
+        if eng is not None:
+            entry.update(
+                ckpt_path=eng.ckpt_path,
+                ckpt_step=eng.ckpt_step,
+                model_params=eng.model.num_params(),
+            )
+        out.append(entry)
+    return {"models": out, "default_model": DEFAULT_MODEL, "active_model": ACTIVE_MODEL}
 
 
 @app.post("/generate")
@@ -248,6 +339,7 @@ async def generate_endpoint(
     style_weight: float = Form(0.5),
     lyric_cfg_scale: float = Form(0.0),
     score_clap: bool = Form(False),
+    model: str = Form(""),
 ) -> Response:
     """Generate audio from scratch — no audio input. Returns a fresh clip.
 
@@ -267,6 +359,7 @@ async def generate_endpoint(
         per_cb_temperature="0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3") usually sounds
         better than a single temperature applied across all 9.
     """
+    _get_engine(model)
     assert engine is not None
     style_bytes = (await style_audio.read()) if style_audio else None
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
@@ -318,6 +411,7 @@ def generate_stream_endpoint(
     sweeten: bool = True,
     lyric_cfg_scale: float = 0.0,
     req_id: str = "",
+    model: str = "",
 ) -> StreamingResponse:
     """Streaming counterpart to POST /generate — emits MP3 bytes progressively.
 
@@ -331,6 +425,7 @@ def generate_stream_endpoint(
     filename ending in that id, so the client can fetch it from GET /outputs/{id}
     after playback for download / accurate duration / a gapless re-listen.
     """
+    _get_engine(model)
     assert engine is not None
     if seconds <= 0:
         raise HTTPException(400, "seconds must be > 0")
@@ -402,6 +497,7 @@ async def extend_endpoint(
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
     lyric_cfg_scale: float = Form(0.0),
+    model: str = Form(""),
 ) -> Response:
     """Continue a clip forward from a point in time. Returns [original 0→T | new].
 
@@ -414,6 +510,7 @@ async def extend_endpoint(
     Only the small seed window counts against the context budget, so call this
     repeatedly to chain a clip past the model's single-shot length cap.
     """
+    _get_engine(model)
     assert engine is not None
     data = await audio.read()
     if not data:
@@ -463,6 +560,7 @@ async def cover_endpoint(
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
     lyric_cfg_scale: float = Form(0.0),
+    model: str = Form(""),
 ) -> Response:
     """Cover a hummed/uploaded melody in the prompt's timbre.
 
@@ -475,6 +573,7 @@ async def cover_endpoint(
 
     Requires a checkpoint trained with melody conditioning (use_melody_conditioning).
     """
+    _get_engine(model)
     assert engine is not None
     data = await melody_audio.read()
     if not data:
@@ -522,10 +621,12 @@ async def extend_stream_endpoint(
     sweeten: bool = Form(True),
     lyric_cfg_scale: float = Form(0.0),
     req_id: str = Form(""),
+    model: str = Form(""),
 ) -> StreamingResponse:
     """Streaming /extend: yields the kept original instantly, then the generated
     continuation as it's produced (progressive MSE playback; bypasses the 150s
     wall). The finished clip is saved to OUTPUT_DIR (fetch via /outputs/{req_id})."""
+    _get_engine(model)
     assert engine is not None
     data = await audio.read()
     if not data:
@@ -576,9 +677,11 @@ async def cover_stream_endpoint(
     melody_cfg_scale: float = Form(0.0),
     lyric_cfg_scale: float = Form(0.0),
     req_id: str = Form(""),
+    model: str = Form(""),
 ) -> StreamingResponse:
     """Streaming /cover: re-render the hum's melody in the prompt's timbre,
     streaming the result as it generates. Needs a melody-trained checkpoint."""
+    _get_engine(model)
     assert engine is not None
     data = await melody_audio.read()
     if not data:
@@ -625,6 +728,7 @@ async def infill_endpoint(
     sweeten: bool = Form(True),
     melody_audio: UploadFile | None = File(None),
     melody_cfg_scale: float = Form(0.0),
+    model: str = Form(""),
 ) -> Response:
     """Fill the gap between two clips — returns ``[before | middle | after]``.
 
@@ -635,6 +739,7 @@ async def infill_endpoint(
 
     Requires a checkpoint trained with FIM (use_fim — a v8+ model).
     """
+    _get_engine(model)
     assert engine is not None
     before = await before_audio.read()
     after = await after_audio.read()
@@ -666,6 +771,7 @@ async def stem_endpoint(
     audio: UploadFile = File(...),
     remove: str = Form("vocals"),
     keep: str = Form(""),
+    model: str = Form(""),
 ) -> Response:
     """Remove or isolate instrument stems from an upload via Demucs separation.
 
@@ -684,6 +790,7 @@ async def stem_endpoint(
     Generating a brand-new stem (the complementary "add" direction) needs a
     stem-conditioned checkpoint and is not this endpoint.
     """
+    _get_engine(model)
     assert engine is not None
     data = await audio.read()
     if not data:
