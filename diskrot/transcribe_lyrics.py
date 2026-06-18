@@ -46,6 +46,20 @@ def _atomic_write_json(path: str | Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def is_valid_word(w) -> bool:
+    """A word entry usable by the train-time crop builders: dict with a string
+    ``word`` and numeric ``start``/``end`` (bools rejected). Lives here (the
+    schema producer) so every consumer — the dataset loader AND the phonemize
+    pass — filters with the IDENTICAL predicate; a mismatch would break the
+    group-count==word-count contract the pre-phonemized store relies on."""
+    return (
+        isinstance(w, dict)
+        and isinstance(w.get("word"), str)
+        and isinstance(w.get("start"), (int, float)) and not isinstance(w["start"], bool)
+        and isinstance(w.get("end"), (int, float)) and not isinstance(w["end"], bool)
+    )
+
+
 def load_lyrics_shards(lyrics_dir: str | Path) -> dict[str, dict | None]:
     """Read all ``lyrics_*.json`` shards in ``lyrics_dir`` into one merged dict."""
     lyrics_dir = Path(lyrics_dir)
@@ -86,24 +100,74 @@ def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str
     return vocals_mono
 
 
+# Vocal-gender labeling (F0 heuristic) ----------------------------------------
+# Median voiced pitch of the isolated vocal stem splits male vs female robustly
+# enough for a conditioning marker: male singing F0 clusters well below female.
+# We estimate on the Demucs vocal stem (already a clean signal), take the median
+# of the voiced frames, and threshold. Ambiguous / too-little-voiced -> None, so
+# the dataset falls back to <unknown_gender> rather than committing a bad guess.
+# This is a coarse label by design — it feeds the gender markers in
+# model/lyric_encoder.py, which are robust to some label noise.
+_GENDER_F0_THRESHOLD_HZ = 165.0   # ~E3; >= -> female, < -> male
+_GENDER_MIN_VOICED_FRAMES = 50    # need enough voiced pitch to trust the median
+_GENDER_MAX_ANALYSIS_SEC = 90     # cap pYIN cost; plenty for a stable median
+
+
+def estimate_vocal_gender(vocals: np.ndarray, sr: int) -> str | None:
+    """Estimate "male"/"female" from an isolated vocal stem via median voiced F0.
+
+    Returns None when the stem has too little voiced content to trust (e.g. a
+    near-instrumental Demucs mis-route) — the caller leaves gender unset and the
+    model sees <unknown_gender>."""
+    import librosa
+
+    if vocals.size == 0:
+        return None
+    clip = vocals[: int(_GENDER_MAX_ANALYSIS_SEC * sr)]
+    try:
+        f0, _, _ = librosa.pyin(
+            clip, sr=sr,
+            fmin=float(librosa.note_to_hz("C2")),  # ~65 Hz
+            fmax=float(librosa.note_to_hz("C6")),  # ~1047 Hz
+        )
+    except Exception:
+        return None
+    voiced = f0[np.isfinite(f0)]
+    if voiced.size < _GENDER_MIN_VOICED_FRAMES:
+        return None
+    median_f0 = float(np.median(voiced))
+    return "female" if median_f0 >= _GENDER_F0_THRESHOLD_HZ else "male"
+
+
 def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
-    """Transcribe vocals array at 44100Hz. Returns {text, words} or None if empty."""
+    """Transcribe vocals array at 44100Hz. Returns {text, words, gender} or None.
+
+    ``gender`` is the F0-estimated vocal gender ("male"/"female"/None); it rides
+    in the same per-song entry the dataset reads, so the gender marker is wired
+    with no extra store. None entries (instrumental) carry no gender at all."""
     # faster-whisper expects 16kHz
     import librosa
 
     vocals_16k = librosa.resample(vocals, orig_sr=44100, target_sr=16000)
 
+    # Language auto-detected (NOT forced to "en"): forcing English produced
+    # ~17% English-phoneme "salad" over non-English vocals in the first v8
+    # corpus AND discarded the language/confidence fields, so the bad pairs
+    # couldn't be filtered without a full re-transcribe. Storing info.language,
+    # language_probability, and the mean segment avg_logprob lets a later filter
+    # drop non-English / low-confidence transcripts cheaply.
     segments, info = whisper_model.transcribe(
         vocals_16k,
-        language="en",
         word_timestamps=True,
         vad_filter=True,
     )
 
     words = []
     full_text_parts = []
+    seg_logprobs = []
     for segment in segments:
         full_text_parts.append(segment.text.strip())
+        seg_logprobs.append(segment.avg_logprob)
         if segment.words:
             for w in segment.words:
                 words.append({"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)})
@@ -112,7 +176,17 @@ def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
     if not full_text:
         return None
 
-    return {"text": full_text, "words": words}
+    # Estimate on the 16 kHz vocals (Nyquist 8 kHz >> vocal F0; cheaper than 44.1).
+    gender = estimate_vocal_gender(vocals_16k, sr=16000)
+    avg_logprob = round(sum(seg_logprobs) / len(seg_logprobs), 4) if seg_logprobs else None
+    return {
+        "text": full_text,
+        "words": words,
+        "gender": gender,
+        "language": info.language,
+        "language_probability": round(info.language_probability, 4),
+        "avg_logprob": avg_logprob,
+    }
 
 
 def _flush_shards(lyrics_dir: Path, lyrics: dict, dirty: set[int]) -> None:

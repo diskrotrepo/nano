@@ -12,15 +12,19 @@ allowed-tools: Read, Bash
 # Train the nano model
 
 Assumes a packed token cache already exists on `nano-tokens` (see the
-**add-songs** skill).
+**add-songs** skill). For **melody conditioning** (the `/cover` capability) the pack
+must carry the chroma sidecar — run add-songs' melody step then repack. Without it
+the model trains the null path only (a `WARNING: ... pack has NO chroma sidecar` line
+is logged at startup) — harmless, just no melody signal.
 
 ## Pick your path
 
 | Path | Command | Use when |
 |---|---|---|
-| **Modal 8×H100 DDP** | `modal run --detach diskrot/modal_train.py --n-gpus 8` | **The real path.** Full ~1.5B model. |
-| Local | `python -m diskrot.train ...` | Pipeline validation only — the local CLI has **no** architecture flags, so it trains the full ~1.5B `GPTConfig` shape and won't fit on consumer GPUs. |
-| Modal single-GPU | `modal run --detach diskrot/modal_train.py` | Not recommended — each rank pays the CLAP precompute and memory is tight. |
+| **Modal 8×H100 DDP** | `modal run --detach diskrot/modal_train.py --n-gpus 8` | **The real path.** Full ~1.5B model, from scratch or full fine-tune. |
+| **LoRA (local or Modal 1×H100)** | `… --init-from <ckpt> --lora …` | Adapt a trained checkpoint on new data — the frozen base makes the 1.5B trainable on a single GPU / Apple Silicon. See [README.finetune.md](../../../README.finetune.md). |
+| Local from-scratch | `python -m diskrot.train ...` | Pipeline validation only — the local CLI has **no** architecture flags, so a from-scratch run trains the full ~1.5B `GPTConfig` shape and won't fit on consumer GPUs. (With `--init-from`, the architecture comes from the checkpoint instead.) |
+| Modal single-GPU from-scratch | `modal run --detach diskrot/modal_train.py` | Not recommended — each rank pays the CLAP precompute and memory is tight. (Single-GPU **is** the recommended LoRA path, though.) |
 
 `DEFAULTS` in [diskrot/modal_train.py](../../../diskrot/modal_train.py) is the
 source of truth for the model shape. Changing architecture requires fresh
@@ -39,7 +43,7 @@ DDP auto-picks per-rank batch 8 → global 64, matching the tuned LR. Common fla
 --steps 400000   --lr 3.0e-4   --warmup-steps 5000   --patience 20
 --ckpt-subdir v7_1500m
 --d-model 2048   --n-layers 22   --n-heads 16   --d-ff 8192
---text-conditioned True           # set False to disable text conditioning
+--text-conditioned True           # drives tags + lyrics + melody together (set False to disable)
 --segment-seconds 30.0   --max-seq-len 8192
 --wandb-project NAME   --wandb-run-name NAME    # needs WANDB_API_KEY secret
 ```
@@ -51,9 +55,46 @@ python -m diskrot.train --device cuda --cache-dir ./token_cache --ckpt-dir ./che
 # flags: --steps  --batch-size  --lr  --patience
 #        --tags-path ./tags.json        (text conditioning)
 #        --lyrics-path ./lyrics         (lyric conditioning)
+#        --melody                       (melody conditioning; needs a chroma-packed cache)
 ```
 For device-specific setup see [README.5090.md](../../../README.5090.md) (CUDA /
 RTX 5090) and [README.m4max.md](../../../README.m4max.md) (Apple MPS).
+
+## Fine-tune from an existing checkpoint
+
+Full walkthrough (modes, corpus prep, merge flow, rules of thumb):
+[README.finetune.md](../../../README.finetune.md). The short version — always a
+**new** `--ckpt-subdir`/`--ckpt-dir` (an existing `latest.pt` there resumes
+instead; precedence is `latest.pt` > `--init-from` > scratch):
+
+```bash
+# Full fine-tune (every weight, fresh optimizer/step, lower LR)
+modal run --detach diskrot/modal_train.py --n-gpus 8 \
+  --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
+# optional: --data-subdir my_corpus  (pack the fine-tune corpus under /tokens/my_corpus)
+```
+
+## LoRA training
+
+Freezes the base, trains ~21.6M low-rank adapters (defaults r=16, alpha=32);
+requires `--init-from`. Checkpoints are **adapter-only** (~100 MB) and must be
+**merged** before serving — inference is unchanged after the merge.
+
+```bash
+# Modal (single H100 is the recommended LoRA path)
+modal run --detach diskrot/modal_train.py \
+  --init-from v8_sing/best.pt --lora --ckpt-subdir v8_lora_x
+
+# Local (Apple Silicon / single GPU)
+python -m diskrot.train --device mps \
+  --init-from ./checkpoints/latest.pt --lora --ckpt-dir ./checkpoints/ft_run \
+  --cache-dir ./token_cache --tags-path ./tags.json --lyrics-path ./lyrics
+
+# Merge when done, then pull (drop-in standard checkpoint)
+modal run diskrot/modal_merge_lora.py --base v8_sing/best.pt --lora v8_lora_x/best.pt
+modal volume get nano-ckpts /v8_lora_x/merged_inference.pt ./checkpoints/latest.pt --force
+#   local merge: python -m diskrot.merge_lora --base ... --lora ... --out ...
+```
 
 ## Monitor
 

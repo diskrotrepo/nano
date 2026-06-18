@@ -18,6 +18,10 @@ dependencies = [
     "msclap",
     "transformers>=4.35",
     "torchcodec>=0.13.0",
+    # Phoneme g2p for the LyricEncoder — needed at BOTH train and inference (the
+    # single train==inference id mapping in model/lyric_encoder.py). Without it
+    # the lyric/structure equivalence tests silently skip and inference ImportErrors.
+    "g2p_en",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +30,10 @@ dev = ["ruff>=0.7", "pytest>=8"]
 # on arm64 macOS; NANO_MLX=0 forces the PyTorch-MPS path). The marker keeps it
 # out of CUDA/Linux installs.
 mlx = ["mlx>=0.18; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# CUDA weight-only int8/int4 quantization for the PyTorch serving path
+# (server/inference.py, NANO_BITS=8|4). Only needed on a CUDA serving box; the
+# Modal serve image installs it directly.
+quant = ["torchao>=0.7"]
 
 [tool.setuptools.packages.find]
 include = ["model*", "diskrot*", "server*"]

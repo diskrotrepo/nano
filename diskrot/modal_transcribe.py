@@ -8,6 +8,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -52,12 +53,31 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     gpu="L4",
     timeout=60 * 60,
     max_containers=50,
+    # Retry inputs whose container died under them (guard exits, preemptions,
+    # platform cancellations) so they complete in-run instead of staying
+    # pending for a manual relaunch sweep (2026-06-11: a ~34k mass input
+    # cancellation + poison-guard exits all fell back to "redo next run").
+    retries=modal.Retries(max_retries=2, initial_delay=1.0),
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 class Transcriber:
     @modal.enter()
     def load_models(self):
+        # Eagerly import scipy.signal and warm the librosa kernels the per-song
+        # path otherwise hits lazily (resample, pyin). A lazy import that dies
+        # mid-song (import race / transient memory pressure) leaves sys.modules
+        # permanently broken — the container then insta-fails every input with
+        # "name '_signal_api' is not defined" and eats the queue at ~3s/song
+        # (observed 2026-06-10, ~84% of a run's results dropped).
+        import numpy as np
+        import scipy.signal  # noqa: F401
+        import torch._dynamo.external_utils  # noqa: F401  (third observed lazy-import poison, 2026-06-11)
+        import librosa
+
+        librosa.resample(np.zeros(1600, dtype=np.float32), orig_sr=44100, target_sr=16000)
+        librosa.pyin(np.zeros(8000, dtype=np.float32), sr=16000, fmin=65.0, fmax=1047.0)
+
         from demucs.apply import apply_model
         from demucs.pretrained import get_model
         from faster_whisper import WhisperModel
@@ -66,7 +86,28 @@ class Transcriber:
         self.demucs_model.to("cuda")
         self.demucs_model.eval()
         self.apply_fn = apply_model
-        self.whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        # large-v3-turbo: 4 decoder layers vs 32, ~4-6x faster ASR at near-identical
+        # transcription quality. The first ~30k songs were done with large-v3; the
+        # transcript mix is fine for training data.
+        self.whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
+        # Warm the full transcribe path INCLUDING the VAD filter: faster-whisper
+        # imports onnxruntime lazily on the first vad_filter=True call, and that
+        # import sporadically dies under loaded-model memory pressure, leaving
+        # the container raising "Applying the VAD filter requires the
+        # onnxruntime package" on every input (the 2026-06-11 storm — same
+        # lazy-import poisoning as the scipy warmup above). Done here, a broken
+        # import fails @enter and the container never takes inputs.
+        list(self.whisper_model.transcribe(
+            np.zeros(16000, dtype=np.float32), language="en", vad_filter=True,
+        )[0])
+        # Poison guard state: consecutive in-band failures. A healthy container
+        # essentially never fails several distinct files in a row (prepare
+        # already dropped corrupt/over-long audio), but a container with broken
+        # persistent state — sticky CUDA device-side assert, dead cuDNN handle —
+        # fails EVERY input in ~4s and eats the queue (observed 2026-06-11:
+        # ~146k of 180k results failed in-band; the NameError-only guard below
+        # missed it because the storm wasn't a NameError).
+        self.consecutive_failures = 0
 
     @modal.method()
     def transcribe_file(self, mp3_name: str) -> tuple[str, dict | None, str | None]:
@@ -78,22 +119,54 @@ class Transcriber:
         try:
             vocals = _separate_vocals(self.demucs_model, self.apply_fn, mp3_path, "cuda")
             result = _transcribe(self.whisper_model, vocals)
+            self.consecutive_failures = 0
             return (key, result, None)
+        except NameError as e:
+            # Poisoned module state (a lazy import died and left sys.modules
+            # broken): every later input in this container would insta-fail the
+            # same way. Die so Modal replaces the container; this input stays
+            # pending and is redone on a healthy one.
+            print(f"poisoned container ({e}); exiting so Modal replaces it", flush=True)
+            os._exit(13)
         except Exception as e:
-            return (key, None, str(e))
+            self.consecutive_failures += 1
+            err = f"{type(e).__name__}: {str(e)[:300]}"
+            # Print in the WORKER so a failure storm is visible live in any
+            # container's logs — save_results only surfaces these at flush time.
+            print(f"ERROR (consecutive {self.consecutive_failures}) {key}: {err}",
+                  flush=True)
+            if self.consecutive_failures >= 3:
+                # Distinct files don't fail back-to-back on a healthy container;
+                # persistent broken state (sticky CUDA assert etc.) does. Same
+                # remedy as the NameError guard: die, get replaced, the inputs
+                # stay pending and are redone on a healthy container.
+                print("3 consecutive failures — poisoned container; exiting so "
+                      "Modal replaces it", flush=True)
+                os._exit(13)
+            return (key, None, err)
 
 
 LYRICS_DIR = "/tokens/lyrics"
+LOCK_PATH = "/tokens/lyrics/.orchestrator.lock"
+# A lock older than the orchestrator's own timeout belongs to a dead run and is
+# reclaimed; matches the orchestrate() function timeout below.
+LOCK_STALE_SEC = 24 * 60 * 60
 
 
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    # Globs the full corpus and parses every lyrics shard; at full coverage
+    # that's >1 GB of JSON — Modal's 300s default timeout is not enough.
+    timeout=30 * 60,
 )
 def list_pending() -> list[str]:
     """Return mp3 filenames not yet in the sharded lyrics dir."""
     from diskrot.transcribe_lyrics import load_lyrics_shards
 
+    # The orchestrator now calls this repeatedly (sweep loop) — a warm-reused
+    # container must see the shards committed by save_results since it started.
+    tokens_vol.reload()
     mp3s = sorted(Path("/corpus").glob("*.mp3"))
     existing = load_lyrics_shards(LYRICS_DIR)
     pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
@@ -104,6 +177,11 @@ def list_pending() -> list[str]:
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    # A 2000-result batch hash-spreads over all 256 shards, so each flush
+    # read-merge-rewrites ~the whole lyrics dir; per-flush time grows with
+    # corpus coverage and crossed Modal's 300s default overnight 2026-06-10
+    # (~100k songs, ~1.6 MB/shard), killing the orchestrator mid-run.
+    timeout=30 * 60,
 )
 def save_results(results: list[tuple[str, dict | None, str | None]]):
     """Merge a batch of results into the sharded lyrics dir.
@@ -165,7 +243,67 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     timeout=24 * 60 * 60,
 )
-def orchestrate(flush_every: int = 200):
+def _acquire_lock(call_id: str) -> bool:
+    """Best-effort single-orchestrator lease on the volume.
+
+    Returns False if a fresh lock from another orchestrator is present (refuse to
+    start so two runs don't race read-merge-write on the same shard). A lock older
+    than ``LOCK_STALE_SEC`` is a dead run and is reclaimed. The lock is re-entrant
+    by ``call_id``: a restarted orchestrate attempt (same function call, new
+    runner) reclaims its own lock instead of refusing and stranding the run.
+    Best-effort: two runs that start within the same reload window can both
+    acquire — that's a rare operator double-launch, and the synchronous flush
+    path bounds the damage.
+    """
+    from diskrot.transcribe_lyrics import _atomic_write_json
+
+    tokens_vol.reload()
+    lock = Path(LOCK_PATH)
+    if lock.exists():
+        owner = None
+        try:
+            data = json.loads(lock.read_text())
+            owner = data.get("call_id")
+            age = time.time() - data.get("started_at", 0)
+        except Exception:
+            age = 0  # unreadable lock — treat as fresh and refuse, to be safe
+        if owner == call_id:
+            print("Re-acquiring own lock after orchestrator restart.")
+        elif age < LOCK_STALE_SEC:
+            print(f"Another orchestrator holds the lock (age {age:.0f}s < "
+                  f"{LOCK_STALE_SEC}s) — refusing to start. Stop it first or wait.")
+            return False
+        else:
+            print(f"Reclaiming stale lock (age {age:.0f}s).")
+    _atomic_write_json(LOCK_PATH, {"started_at": time.time(), "call_id": call_id})
+    tokens_vol.commit()
+    return True
+
+
+@app.function(
+    image=image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+)
+def _release_lock() -> None:
+    # reload so this (fresh) container sees the lock the acquire container wrote,
+    # else the unlink silently misses and the lease lingers for LOCK_STALE_SEC.
+    tokens_vol.reload()
+    Path(LOCK_PATH).unlink(missing_ok=True)
+    tokens_vol.commit()
+
+
+@app.function(
+    image=image,
+    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    timeout=24 * 60 * 60,
+    # The orchestrator is the run's single point of failure: a preempted-and-
+    # restarted orchestrate would refuse on its own fresh lock and silently end
+    # the run. 3x CPU/mem pricing on one small container is nothing next to the
+    # L4 fleet. (GPU workers can't opt out, but their preemption is harmless —
+    # the file just stays pending.)
+    nonpreemptible=True,
+)
+def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
     """Dispatch transcription and merge results into the sharded lyrics dir.
 
     Runs the ``.map()`` collect/flush loop *remotely* (not in local_entrypoint)
@@ -173,62 +311,121 @@ def orchestrate(flush_every: int = 200):
     this loop locally, so closing the terminal killed the result-collector even
     though the worker containers kept running and billing.
 
-    Flushes partial results every ``flush_every`` completions (default 200).
-    The flushing path uses synchronous ``save_results.remote(...)`` so two
-    writers never race on a shard — each flush completes (read-merge-write-
-    commit) before the next is issued. ``list_pending`` skips songs already in
-    the shards on a prior run, so re-launching just resumes.
-    """
-    pending = list_pending.remote()
-    if not pending:
-        print("Nothing to transcribe — all files already transcribed")
-        return
+    Dispatches in **chunks** (default 3k ≈ 20-30 min of fleet work) inside a
+    **sweep loop** that re-lists pending files until they stop shrinking.
+    One giant ``.map()`` held ~190k inputs outstanding for ~20h, and twice on
+    2026-06-11 a server-side event cancelled tens of thousands of queued inputs
+    en masse (``RemoteError: Function call was cancelled...``) roughly an hour
+    into the run. Chunking caps the exposure (a storm can only kill the current
+    chunk) and the sweep loop automatically re-queues whatever was cancelled —
+    no more manual "final sweep" relaunches. 15k chunks still lost the back
+    ~60% of every chunk to the waves (inputs queued ≳1.5h get reaped); 3k
+    keeps queue residence under ~30 min, below the observed kill window,
+    while paying the end-of-chunk straggler idle 5× less often than 1k would.
 
-    print(f"Dispatching {len(pending)} files across parallel containers "
-          f"(flush_every={flush_every})...")
-    transcriber = Transcriber()
-    batch: list = []
-    n_seen = 0
-    n_errors = 0
-    # order_outputs=False: a preempted file must not head-of-line-block the
-    # in-order yield (that idles the other containers while they still bill).
-    # Results are flushed into shards by key, so order doesn't matter.
-    # return_exceptions=True: a single file raising (e.g. a worker that hard-
-    # crashes on a poison file) must NOT crash the orchestrator and lose the
-    # run — count it and continue. The file stays pending (not in the shards)
-    # and is picked up on the next launch via list_pending.
-    for result in transcriber.transcribe_file.map(
-        pending, order_outputs=False, return_exceptions=True
-    ):
-        n_seen += 1
-        if isinstance(result, Exception):
-            n_errors += 1
-            if n_errors <= 20:
-                print(f"FILE FAILED (stays pending, redone next run): "
-                      f"{type(result).__name__}: {str(result)[:140]}")
-            continue
-        batch.append(result)
-        if len(batch) >= flush_every:
-            print(f"flushing {len(batch)} results ({n_seen}/{len(pending)} done)")
-            save_results.remote(batch)
-            batch = []
-    if batch:
-        print(f"final flush of {len(batch)} results ({n_seen}/{len(pending)} done)")
-        save_results.remote(batch)
-    if n_errors:
-        print(f"file errors: {n_errors} "
-              f"(transient — affected files stay pending; re-run to finish them)")
+    Flushes partial results every ``flush_every`` completions (default 5000).
+    The flushing path uses synchronous ``save_results.remote(...)`` so two writers
+    never race on a shard — each flush completes (read-merge-write-commit) before
+    the next is issued. A larger ``flush_every`` cuts shard write-amplification
+    (each flush read-merge-writes whole JSON shards; ~256 shards fill to ~1k
+    entries, so frequent flushes rewrite most of the corpus repeatedly). The
+    trade-off: on orchestrator death, up to ``flush_every`` unflushed results are
+    redone — they stay pending via ``list_pending``, so it's recompute, not data
+    loss. A lease lock (see ``_acquire_lock``) refuses a concurrent second run.
+    ``list_pending`` skips songs already in the shards, so re-launching resumes.
+    """
+    if not _acquire_lock.remote(modal.current_function_call_id()):
+        return
+    try:
+        transcriber = Transcriber()
+        prev_pending: int | None = None
+        sweep = 0
+        while True:
+            sweep += 1
+            pending = list_pending.remote()
+            if not pending:
+                print("Nothing to transcribe — all files already transcribed")
+                return
+            if prev_pending is not None and len(pending) >= prev_pending:
+                # A sweep that doesn't shrink pending means the remaining files
+                # fail deterministically (undecodable etc.) — looping further
+                # would re-grind them forever. Leave them pending and stop.
+                print(f"sweep {sweep}: pending did not shrink "
+                      f"({prev_pending} -> {len(pending)}) — stopping. "
+                      f"Remaining files fail deterministically; inspect a few "
+                      f"with the single-file diagnostic before re-running.")
+                return
+            prev_pending = len(pending)
+            print(f"sweep {sweep}: {len(pending)} pending, dispatching in "
+                  f"chunks of {chunk_size} (flush_every={flush_every})...")
+
+            n_seen = n_errors = n_inband = 0
+            # n_inband: per-file errors (returned, not raised) — these stay
+            # pending and are NOT written; surfacing the count here is what
+            # makes a poisoned-container storm visible (2026-06-11: 146k of
+            # 180k "done" were silent, only visible in save_results logs).
+            for start in range(0, len(pending), chunk_size):
+                chunk = pending[start : start + chunk_size]
+                batch: list = []
+                # order_outputs=False: a preempted file must not head-of-line-
+                # block the in-order yield (that idles the other containers
+                # while they still bill). Results are flushed into shards by
+                # key, so order doesn't matter.
+                # return_exceptions=True: a single file raising (e.g. a worker
+                # that hard-crashes on a poison file) must NOT crash the
+                # orchestrator and lose the run — count it and continue. The
+                # file stays pending (not in the shards) and is re-queued by
+                # the next sweep.
+                for result in transcriber.transcribe_file.map(
+                    chunk, order_outputs=False, return_exceptions=True
+                ):
+                    n_seen += 1
+                    if isinstance(result, Exception):
+                        n_errors += 1
+                        if n_errors <= 20:
+                            print(f"FILE FAILED (re-queued next sweep): "
+                                  f"{type(result).__name__}: {str(result)[:140]}")
+                        continue
+                    batch.append(result)
+                    if result[2] is not None:
+                        n_inband += 1
+                    if len(batch) >= flush_every:
+                        print(f"flushing {len(batch)} results "
+                              f"({n_seen}/{len(pending)} seen: "
+                              f"{n_seen - n_errors - n_inband} transcribed, "
+                              f"{n_inband} failed in-band, "
+                              f"{n_errors} cancelled/errored)")
+                        save_results.remote(batch)
+                        batch = []
+                if batch:
+                    print(f"chunk flush of {len(batch)} results "
+                          f"({n_seen}/{len(pending)} seen: "
+                          f"{n_seen - n_errors - n_inband} transcribed, "
+                          f"{n_inband} failed in-band, "
+                          f"{n_errors} cancelled/errored)")
+                    save_results.remote(batch)
+            print(f"sweep {sweep} complete: {n_seen} seen, "
+                  f"{n_seen - n_errors - n_inband} transcribed, "
+                  f"{n_inband} failed in-band, {n_errors} cancelled/errored"
+                  + (" — re-sweeping for the remainder" if n_errors or n_inband
+                     else ""))
+            if not n_errors and not n_inband:
+                # Clean sweep — one more list_pending confirms completion (or
+                # catches files added meanwhile), then the loop exits above.
+                continue
+    finally:
+        _release_lock.remote()
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 200):
+def main(flush_every: int = 5000, chunk_size: int = 3000):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are
     required: ``.spawn()`` so the entrypoint exits without blocking, and
     ``--detach`` so the app isn't auto-stopped when the entrypoint completes).
     """
-    call = orchestrate.spawn(flush_every)
+    call = orchestrate.spawn(flush_every, chunk_size)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

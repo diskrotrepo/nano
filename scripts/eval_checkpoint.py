@@ -56,18 +56,22 @@ SAMPLING_CONFIGS = [
 ]
 
 
-def _build_text_cond(engine: InferenceEngine, tags: str, lyrics: str) -> torch.Tensor | None:
-    if engine.text_encoder is None:
-        return None
-    parts = []
-    if tags:
-        parts.append(engine.text_encoder.encode([tags]).to(engine.device))
-    if lyrics:
-        parts.append(engine.text_encoder.encode([lyrics]).to(engine.device))
-    if not parts:
-        return None
-    cond = torch.cat(parts, dim=1)
-    return cond.to(next(engine.model.parameters()).dtype)
+def _build_text_cond(engine: InferenceEngine, tags: str, lyrics: str):
+    """Build (tag_emb, lyric_ids, lyric_mask). Tags → pooled CLAP; lyrics →
+    phoneme ids for the LyricEncoder (NOT CLAP). Any may be None."""
+    tag_emb = None
+    if engine.text_encoder is not None and tags:
+        tag_emb = engine.text_encoder.encode([tags]).to(engine.device)
+        tag_emb = tag_emb.to(next(engine.model.parameters()).dtype)
+    lyric_ids = lyric_mask = None
+    if lyrics and getattr(engine.model.cfg, "use_lyric_conditioning", False):
+        from model.lyric_encoder import PAD_PHONEME_ID, text_to_phoneme_ids
+
+        ids = text_to_phoneme_ids(lyrics, max_len=engine.model.cfg.max_lyric_len)
+        if ids:
+            lyric_ids = torch.tensor(ids, dtype=torch.long, device=engine.device)[None]
+            lyric_mask = lyric_ids != PAD_PHONEME_ID
+    return tag_emb, lyric_ids, lyric_mask
 
 
 @torch.no_grad()
@@ -79,7 +83,10 @@ def generate_clip(engine: InferenceEngine, prompt: dict, sampling: dict, seconds
     max_total = engine.model.cfg.max_seq_len - K + 1
     new_frames = min(int(seconds * engine.codec.FRAME_RATE_HZ), max_total - 1)
 
-    cond_emb = _build_text_cond(engine, prompt.get("tags", ""), prompt.get("lyrics", ""))
+    tag_emb, lyric_ids, lyric_mask = _build_text_cond(
+        engine, prompt.get("tags", ""), prompt.get("lyrics", "")
+    )
+    has_cond = tag_emb is not None or lyric_ids is not None
 
     out_tokens = engine.model.generate(
         prompt=None,
@@ -87,8 +94,10 @@ def generate_clip(engine: InferenceEngine, prompt: dict, sampling: dict, seconds
         temperature=sampling["temp"],
         top_k=sampling["top_k"],
         top_p=sampling.get("top_p"),
-        text_emb=cond_emb,
-        cfg_scale=sampling["cfg"] if cond_emb is not None else 1.0,
+        text_emb=tag_emb,
+        lyric_ids=lyric_ids,
+        lyric_mask=lyric_mask,
+        cfg_scale=sampling["cfg"] if has_cond else 1.0,
     )
     # model.generate prepends a 1-frame random seed when prompt is None
     out_tokens = out_tokens[:, 1:]
@@ -106,6 +115,12 @@ def _compute_clap(wav: np.ndarray, sr: int, text_emb: torch.Tensor | None, clap)
         sf.write(tmp, wav, sr)
     try:
         audio_emb = clap.get_audio_embeddings([tmp]).cpu()  # [1, 1024]
+    except Exception as e:
+        # ffmpeg 8 is too new for torchcodec 4-7 → CLAP audio loading crashes
+        # locally. Generation/decode are unaffected; degrade to librosa-only
+        # ranking (composite_score treats clap=None as 0.0).
+        print(f"  [warn] CLAP audio scoring unavailable ({type(e).__name__}); ranking by librosa metrics only")
+        return None
     finally:
         os.unlink(tmp)
     a = audio_emb / (audio_emb.norm(dim=-1, keepdim=True) + 1e-9)

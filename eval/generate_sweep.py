@@ -45,9 +45,9 @@ SETTINGS = [
     ("cold_cfg1.5",  dict(temperature=[0.8,0.7,0.6,0.5,0.45,0.4,0.35,0.3,0.25], top_k=TOPK_LADDER, top_p=0.9, cfg_scale=1.5)),
 ]
 
-def gen(name, text, settings, seconds=10.0, seed_mode="random"):
+def gen(name, text, settings, seconds=10.0):
     t0 = time.time()
-    audio, mime = eng.generate_audio(seconds=seconds, text=text, seed_mode=seed_mode, **settings)
+    audio, mime = eng.generate_audio(seconds=seconds, text=text, **settings)
     ext = "mp3" if mime == "audio/mpeg" else "wav"
     path = f"{OUT}/{name}.{ext}"
     open(path, "wb").write(audio)

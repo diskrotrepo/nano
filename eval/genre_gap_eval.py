@@ -92,6 +92,19 @@ GAP_GENRES: dict[str, dict] = {
         "rx": r"\bafrobeat\b|\bafro[- ]?pop\b|\bhighlife\b|\bamapiano\b|\bsoukous\b",
         "clap": ["an afrobeat song", "an amapiano track", "an african highlife song"],
     },
+    # ── world traditions added 2026-06-13 (net-new coverage, build from ~0) ──
+    "indian": {
+        "rx": r"\bbollywood\b|\bhindustani\b|\bcarnatic\b|\bbhangra\b|\bqawwali\b|\bsitar\b|\btabla\b|\braga\b|\bghazal\b|\bfilmi\b|\bbansuri\b|\bharmonium\b",
+        "clap": ["a bollywood song", "an indian classical raga with sitar and tabla", "a bhangra track", "a qawwali devotional song"],
+    },
+    "east-asian": {
+        "rx": r"\bk-?pop\b|\bj-?pop\b|\bc-?pop\b|\bmandopop\b|\bcantopop\b|\benka\b|\bguzheng\b|\bshamisen\b|\berhu\b|\bkoto\b|\bgugak\b",
+        "clap": ["a k-pop song", "a j-pop song", "a traditional chinese piece with guzheng", "a traditional japanese piece with shamisen"],
+    },
+    "mediterranean": {
+        "rx": r"\barabic\b|\bmiddle eastern\b|\bturkish\b|\bflamenco\b|\bfado\b|\brebetiko\b|\boud\b|\bmaqam\b|\bbouzouki\b|\bbelly danc|\bandalusian\b|\bra[iï]\b",
+        "clap": ["an arabic music track", "a flamenco guitar song", "a portuguese fado song", "a turkish music piece with oud"],
+    },
 }
 
 # Non-gap anchors so the CLAP classifier has somewhere to send the dominant

@@ -54,6 +54,25 @@ uv pip install -e .
 python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 ```
 
+### Web UI
+
+A Flutter web front-end in [webapp/](webapp/) exposes every generation mode and
+parameter the server accepts. With the inference server running (above), start it
+in a second terminal:
+
+```bash
+cd webapp
+flutter pub get      # first run only — fetch dependencies
+flutter run -d chrome
+```
+
+It defaults to `http://127.0.0.1:8000`; point the **server url** field at any
+reachable host (e.g. a deployed Modal endpoint). See
+[webapp/README.md](webapp/README.md) for the full parameter list, `flutter build
+web` deploy bundle, and Modal hosting.
+
+### API
+
 Generate audio from scratch:
 
 ```bash
@@ -101,17 +120,8 @@ curl -X POST http://localhost:8000/generate \
   --output blended.mp3
 ```
 
-Continue an audio prompt (returns the prompt + generated audio):
-
-```bash
-curl -X POST http://localhost:8000/continue \
-  -F audio=@prompt.mp3 \
-  -F add_seconds=10 \
-  -F prompt_seconds=5 \
-  --output continued.mp3
-```
-
-Extend an existing clip by using its tail as the prompt (returns original + new audio):
+Extend a clip — continue forward from a point in time (returns the original up to
+the cut point, then newly generated audio):
 
 ```bash
 curl -X POST http://localhost:8000/extend \
@@ -121,4 +131,8 @@ curl -X POST http://localhost:8000/extend \
   --output extended.mp3
 ```
 
-Chain `/extend` calls to grow clips past the ~95 second single-shot limit. All endpoints accept optional `prompt`, `lyrics`, `style_audio`, and `style_weight` parameters.
+By default the cut point is the clip's tail, so this just appends 10s onto the end.
+Pass `-F from_seconds=30` to instead keep the original up to 0:30, regenerate from
+there, and discard whatever came after. Chain `/extend` calls to grow clips past the
+~95 second single-shot limit. All endpoints accept optional `prompt`, `lyrics`,
+`style_audio`, and `style_weight` parameters.

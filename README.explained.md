@@ -396,15 +396,9 @@ If all outputs collapse to one texture → drop `cfg_scale` to `2.0`.
 
 ### A note on seeding from scratch
 
-`/generate` (no audio prompt) has to bootstrap the autoregressive loop with *some* starting token per codebook. Two options exist, controlled by the `seed_mode` form param:
+`/generate` (no audio prompt) has to bootstrap the autoregressive loop with *some* starting token per codebook. It seeds with a single column of **random DAC tokens** (a fresh draw per call); tight sampling + CFG then drive the model to a coherent trajectory regardless of seed energy.
 
-- **`seed_mode=silence`** — seed with ~1 second (86 frames) of DAC-encoded digital silence. Gives the model concrete "you are mid-quiet-passage" context. Works well for prompts that align semantically with quiet content (lo-fi, ambient, slow tempo, dreamy). The seed frames are stripped from the output before decoding.
-
-- **`seed_mode=random`** (default) — seed with a single column of random DAC tokens. The model uses tight sampling + CFG to find a coherent trajectory regardless of seed energy.
-
-**Why two modes.** This took iterating to figure out. The original code seeded with one random token and produced pure noise because the old sampling was too loose; the noise compounded across hundreds of autoregressive steps. The first fix was silence-seeding with 86 frames, which worked beautifully for lo-fi prompts but produced **complete silence** for high-energy ones — a "hip-hop, intense, distorted" prompt couldn't escape because the causal self-attention path (where the audio seed lives) is structurally stronger than the cross-attention path (where the text conditioning lives), and there's essentially no training example of "absolute silence → drum hit in one frame," so the model stayed silent regardless of `cfg_scale`. Cutting silence to a single frame fixed neither case — high-energy prompts still went silent, *and* lo-fi prompts degraded to noise because the model had no on-distribution context to lock onto. The clean fix is to use silence-seeding when the prompt's character is compatible with starting quiet, and random-seeding when it isn't. Random + tight sampling + CFG produces coherent output across the board; the only loss vs. silence-seeding is a small loss of the natural "fade in" feel for quiet prompts.
-
-Use `seed_mode=silence` if your prompt is lo-fi/ambient/slow and you want a clean quiet opening. Use `seed_mode=random` (default) for anything energetic, or if you want the model to commit to its trajectory faster.
+**Why random.** This took iterating to figure out. The original code seeded with one random token and produced pure noise because the old sampling was too loose; the noise compounded across hundreds of autoregressive steps. An early fix was *silence-seeding* with ~1s (86 frames) of encoded digital silence, which worked beautifully for lo-fi prompts but produced **complete silence** for high-energy ones — a "hip-hop, intense, distorted" prompt couldn't escape because the causal self-attention path (where the audio seed lives) is structurally stronger than the cross-attention path (where the text conditioning lives), and there's essentially no training example of "absolute silence → drum hit in one frame," so the model stayed silent regardless of `cfg_scale`. Once sampling was tightened, a single random column produces coherent output across **all** prompt characters, so the silence-seed mode was removed — it only ever worked for quiet prompts and silently failed for energetic ones.
 
 ### Tuning `cfg_scale` in practice
 
@@ -416,7 +410,7 @@ The README table earlier in this section lists `cfg_scale=3.0` as the standard d
 - The training loop is the most "ML-y" file: [diskrot/train.py](diskrot/train.py).
 - The delay-pattern trick fits on one page: [model/delay_pattern.py](model/delay_pattern.py).
 - The codec wrapper makes clear what we treat as a black box: [model/codec.py](model/codec.py).
-- The inference engine, including CFG and silence seeding: [server/inference.py](server/inference.py).
+- The inference engine, including CFG and random seeding: [server/inference.py](server/inference.py).
 - The unit tests in [tests/](tests/) are good entry points if you want to see the building blocks exercised on tiny inputs — they double as worked examples of the data shapes flowing through each module.
 
 Once you've read those files, you've read essentially the whole project; the rest is data plumbing, Modal orchestration, and the HTTP server.

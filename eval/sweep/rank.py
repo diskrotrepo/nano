@@ -50,7 +50,7 @@ def main():
         sil = _avg(d["rows"], "sil")
         clap = _avg(d["rows"], "clap")
         n = len(d["scores"])
-        table.append((agg["rank_score"], sid, ex["cfg_scale"], ex["seed_mode"],
+        table.append((agg["rank_score"], sid, ex["cfg_scale"],
                       ex["profile"], agg["mean"], agg["min"], beat, sil, clap, n))
     table.sort(key=lambda x: -x[0])
 
@@ -59,32 +59,32 @@ def main():
     # lucky means and inflates their std — so a naive sort floats UNDER-tested
     # settings to the top. Only recommend from the most-tested tier (max n), and
     # surface n in the table so the bias is never silent.
-    max_n = max(row[10] for row in table)
-    finalists = [row for row in table if row[10] == max_n]
+    max_n = max(row[9] for row in table)
+    finalists = [row for row in table if row[9] == max_n]
 
     lines = [f"# Inference sweep — {tag}", "",
              f"Ranked on `mean - 0.5*std` of the blended score over {len(recs)} clips "
              f"(blend = collapse-gate x CLAP adherence). beat=rhythm (higher better), "
              f"sil%=collapse (lower better), clap=prompt adherence (higher better). "
              f"**n = clips per setting; only compare settings at equal n.**", "",
-             "| rank | setting | cfg | seed | profile | rankscore | mean | min | beat | sil% | clap | n |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    for i, (rk, sid, cfg, seed, prof, mean, mn, beat, sil, clap, n) in enumerate(table, 1):
+             "| rank | setting | cfg | profile | rankscore | mean | min | beat | sil% | clap | n |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for i, (rk, sid, cfg, prof, mean, mn, beat, sil, clap, n) in enumerate(table, 1):
         beat_s = "—" if beat is None else f"{beat:.2f}"
         sil_s = "—" if sil is None else f"{sil*100:.0f}%"
         clap_s = "—" if clap is None else f"{clap:.3f}"
-        lines.append(f"| {i} | {sid} | {cfg} | {seed} | {prof} | {rk:.3f} | "
+        lines.append(f"| {i} | {sid} | {cfg} | {prof} | {rk:.3f} | "
                      f"{mean:.3f} | {mn:.3f} | {beat_s} | {sil_s} | {clap_s} | {n} |")
 
     win = finalists[0]  # finalists is a slice of the rankscore-sorted table
-    _, wid, wcfg, wseed, wprof, *_ = win
+    _, wid, wcfg, wprof, *_ = win
     temp, topk = C.PROFILES[wprof]
     lines += ["", "## Recommended default",
               f"From the {len(finalists)} fully-refined finalists (n={max_n}); the "
               f"under-tested n<{max_n} rows above are NOT comparable and are excluded.",
               "```python",
               f'# winner: {wid}',
-              f'cfg_scale={wcfg}', f'seed_mode="{wseed}"',
+              f'cfg_scale={wcfg}',
               f'temperature={temp}', f'top_k={topk}', f'top_p={C.TOP_P}',
               "```",
               "",

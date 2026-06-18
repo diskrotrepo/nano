@@ -67,14 +67,14 @@ def eval_ablation(
     from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
     from model.text_encoder import CLAPTextEncoder
     from model.delay_pattern import build_train_inputs
-    from diskrot.dataset import TokenDataset
+    from diskrot.dataset import TokenDataset, collate_lyrics
     from diskrot.train import TrainConfig, _build_cond, _loss_fn
 
     device = "cuda"
     ckpt = torch.load("/ckpts/best.pt", map_location=device, weights_only=False)
     model_cfg = GPTConfig(**ckpt["cfg"])
-    if not model_cfg.use_text_conditioning:
-        raise SystemExit("checkpoint has no text conditioning — nothing to ablate")
+    if not model_cfg.use_lyric_conditioning:
+        raise SystemExit("checkpoint has no lyric conditioning — nothing to ablate")
 
     model = NanoAudioGPT(model_cfg).to(device)
     state_dict = {
@@ -110,6 +110,7 @@ def eval_ablation(
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=False, persistent_workers=True,
+        collate_fn=collate_lyrics,
     )
 
     regimes = ("full", "tags_only", "uncond")
@@ -118,37 +119,40 @@ def eval_ablation(
     n_seen = 0
 
     @torch.no_grad()
-    def regime_loss(inputs, targets, tags_sub, lyrics_sub, regime):
-        if regime == "uncond":
-            text_emb = None
-        elif regime == "tags_only":
-            text_emb = _build_cond(text_encoder, tags_sub, [""] * len(tags_sub), device, tag_cache)
-        else:  # full
-            text_emb = _build_cond(text_encoder, tags_sub, lyrics_sub, device, tag_cache)
+    def regime_loss(inputs, targets, tags_sub, l_ids, l_mask, regime):
+        # full = tags + phoneme lyrics; tags_only drops the lyric stream
+        # (lyric_ids=None → lyric cross-attn skipped); uncond drops both.
+        text_emb = None
+        if regime in ("full", "tags_only"):
+            text_emb = _build_cond(text_encoder, tags_sub, device, tag_cache)
+        lyric_ids = l_ids if regime == "full" else None
+        lyric_mask = l_mask if regime == "full" else None
         with torch.amp.autocast(device, enabled=True):
-            logits = model(inputs, text_emb=text_emb)
+            logits = model(inputs, text_emb=text_emb, lyric_ids=lyric_ids, lyric_mask=lyric_mask)
             total, _ = _loss_fn(logits, targets, pad_id)
         return total.item()
 
     with torch.no_grad():
-        for i, (batch, tags, lyrics) in enumerate(loader):
+        for i, (batch, tags, lyric_ids, lyric_mask) in enumerate(loader):
             if i >= n_batches:
                 break
-            n_seen += len(lyrics)
-            # Keep only samples whose served (window-filtered) lyric string is
-            # non-empty — those are the only ones where lyric conditioning
-            # differs from the tags_only regime.
-            keep = [j for j, ly in enumerate(lyrics) if ly.strip()]
+            n_seen += lyric_ids.shape[0]
+            # Keep only samples that carry real lyrics (>1 token, i.e. more than
+            # the lone BOS) — the only ones where the lyric stream differs from
+            # the tags_only regime.
+            real_len = lyric_mask.sum(dim=1)  # [B]
+            keep = (real_len > 1).nonzero(as_tuple=True)[0].tolist()
             if not keep:
                 continue
             idx = torch.tensor(keep, device=device)
             sub = batch.to(device, non_blocking=True).long().index_select(0, idx)
             tags_sub = [tags[j] for j in keep]
-            lyrics_sub = [lyrics[j] for j in keep]
+            l_ids = lyric_ids.to(device, non_blocking=True).index_select(0, idx)
+            l_mask = lyric_mask.to(device, non_blocking=True).index_select(0, idx)
             inputs, targets = build_train_inputs(sub, pad_id)
             n = len(keep)
             for r in regimes:
-                sums[r] += regime_loss(inputs, targets, tags_sub, lyrics_sub, r) * n
+                sums[r] += regime_loss(inputs, targets, tags_sub, l_ids, l_mask, r) * n
             n_scored += n
 
     if n_scored == 0:

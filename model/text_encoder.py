@@ -25,6 +25,10 @@ class CLAPTextEncoder(nn.Module):
         self.d_out = d_out
         self._device = device
         self.proj = nn.Linear(self.CLAP_DIM, d_out, bias=False)
+        # House-style init (std=0.02) instead of PyTorch's Linear default
+        # (~2.2x larger at this fan-in) — the projection feeds the decoder's
+        # cross-attention cond and shouldn't start louder than everything else.
+        nn.init.normal_(self.proj.weight, std=0.02)
         self._clap = None  # lazy-loaded
 
     def _ensure_clap(self) -> None:

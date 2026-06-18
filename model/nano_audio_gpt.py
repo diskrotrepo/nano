@@ -7,15 +7,17 @@ the next token for each codebook. Sized to ~1.5B params with the default config
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .delay_pattern import revert_delay
+from .lyric_encoder import PHONEME_VOCAB_SIZE, LyricEncoder
+from .melody_encoder import MelodyEncoder
 
 KVCache = tuple[torch.Tensor, torch.Tensor]  # (past_k, past_v)
 
@@ -81,16 +83,81 @@ class GPTConfig:
     dropout: float = 0.05
     max_seq_len: int = 8192  # delayed sequence length cap (also sizes RoPE cos/sin table)
     use_text_conditioning: bool = False
+    # Lyric (phoneme-sequence) conditioning — separate from the pooled-CLAP tag
+    # path. When enabled, a LyricEncoder submodule encodes phoneme ids into a
+    # sequence the decoder cross-attends to (so the model can sing actual words).
+    use_lyric_conditioning: bool = False
+    phoneme_vocab_size: int = PHONEME_VOCAB_SIZE
+    lyric_enc_layers: int = 3
+    lyric_enc_heads: int = 8
+    lyric_enc_d_ff: int = 4096
+    # 512 (up from 256): a dense 60s crop can carry ~400-600 phoneme tokens, which
+    # the 256 cap silently truncated (lyric_encoder.append_unit_capped), dropping
+    # the tail words' alignment signal. Only sizes the encoder's non-persistent
+    # sinusoidal PE + the dataset truncation cap (no learned-weight reshape).
+    max_lyric_len: int = 512
+    # Melody (chromagram-sequence) conditioning — a time-aligned, MusicGen-Melody
+    # style stream, separate from both the pooled-CLAP tag path and the lyric
+    # cross-attention. When enabled, a MelodyEncoder projects a [B,T,12] chroma
+    # sequence and the decoder ADDS it to the per-frame token-sum input at the cb0
+    # anchor (delayed position p ↔ frame p), so a hummed melody is regenerated in
+    # whatever timbre the tags ask for. Dense+time-aligned, so additive rather than
+    # cross-attention. Adding it is checkpoint-incompatible (new submodule).
+    use_melody_conditioning: bool = False
+    melody_n_bins: int = 12
+    melody_enc_layers: int = 2
+    # Fill-in-the-middle (infill). When enabled, training reorders a fraction of
+    # crops into the canonical FIM layout `prefix <SUF> suffix <MID> middle` (a
+    # frame-domain reorder before the delay pattern — attention and the delay
+    # logic are untouched) so the decoder learns to bridge a gap it has been
+    # shown the suffix of. Adds two per-codebook control ids (<SUF>/<MID>) after
+    # pad, so enabling it grows the embedding/head vocab and is
+    # checkpoint-incompatible (a fresh start, like adding the melody encoder).
+    use_fim: bool = False
     rope_base: float = 10000.0
     use_gradient_checkpointing: bool = True
+    # QK-norm: RMSNorm on the per-head queries/keys of self-attention and both
+    # cross-attentions (Gemma 2 / OLMo 2 / Qwen style). Bounds attention logits
+    # regardless of LR — both 2026-06-12 v8 launches diverged cb0-first with the
+    # classic logit-growth signature (onset ~5e-5–1.2e-4, even after the
+    # zero-gated conditioning init and with Adam beta2 already 0.95); this is
+    # the structural fix. Default False so pre-qk-norm checkpoint cfg dicts
+    # (v7) still load everywhere GPTConfig(**ckpt["cfg"]) is called; the train
+    # entrypoints (DEFAULTS / TrainConfig) enable it explicitly, and v8+
+    # checkpoints carry the key in their saved cfg.
+    use_qk_norm: bool = False
+    # Same QK-norm, applied inside the LyricEncoder's bidirectional self-attention
+    # (model/lyric_encoder.py). Separate flag because the encoder was added after
+    # use_qk_norm and the original v8_sing run trained without it: grad forensics
+    # traced that run's gradient explosion to lyric_encoder.layers.0 (unbounded
+    # encoder attention logits). Default False so every existing checkpoint's cfg
+    # dict still loads strictly; the train entrypoints enable it for v8+.
+    use_lyric_qk_norm: bool = False
+
+    @property
+    def n_control(self) -> int:
+        """Reserved ids appended after the DAC vocab: pad, plus the two FIM
+        sentinels when use_fim is on."""
+        return 1 + (2 if self.use_fim else 0)
 
     @property
     def vocab_with_pad(self) -> int:
-        return self.vocab_per_codebook + 1
+        """Embedding/head size: DAC vocab + control ids (pad [+ FIM sentinels])."""
+        return self.vocab_per_codebook + self.n_control
 
     @property
     def pad_id(self) -> int:
         return self.vocab_per_codebook
+
+    @property
+    def suf_id(self) -> int:
+        """FIM <SUF> sentinel (separates prefix from suffix). Valid iff use_fim."""
+        return self.vocab_per_codebook + 1
+
+    @property
+    def mid_id(self) -> int:
+        """FIM <MID> sentinel (marks the start of the to-be-generated middle)."""
+        return self.vocab_per_codebook + 2
 
 
 class CausalSelfAttention(nn.Module):
@@ -101,6 +168,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = cfg.d_model // cfg.n_heads
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # Per-head-dim gains, shared across heads (Qwen style). See
+        # GPTConfig.use_qk_norm for why.
+        self.q_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
+        self.k_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
         self.dropout = cfg.dropout
 
     def forward(
@@ -109,6 +180,8 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: KVCache | StaticLayerKVCache | None = None,
+        input_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | StaticLayerKVCache]:
         B, T, D = x.shape
         q, k, v = self.qkv(x).split(D, dim=-1)
@@ -116,11 +189,29 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        # QK-norm before RoPE (and before the cache write, so cached keys are
+        # already normed — decode steps see the identical transform).
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         # Apply RoPE *before* writing to cache so cached keys carry their
         # original positions; subsequent decode steps don't need to re-rotate.
         q, k = apply_rotary(q, k, cos, sin)
 
-        if isinstance(cache, StaticLayerKVCache):
+        if input_pos is not None:
+            # CUDA-graph-friendly decode step: write k/v at a TENSOR position and
+            # attend over the FULL pre-allocated cache buffer with a static-shape
+            # mask (no python-int position, no growing slice) so torch.compile can
+            # capture one reusable graph for every step. Correct in eager too.
+            assert isinstance(cache, StaticLayerKVCache)
+            cache.k[:, :, input_pos] = k
+            cache.v[:, :, input_pos] = v
+            y = F.scaled_dot_product_attention(
+                q, cache.k, cache.v, attn_mask=attn_mask,
+            )
+            new_cache = cache
+        elif isinstance(cache, StaticLayerKVCache):
             old_pos = cache.pos
             end = old_pos + T
             cache.k[:, :, old_pos:end] = k
@@ -130,20 +221,24 @@ class CausalSelfAttention(nn.Module):
             cache.pos = end
             new_cache = cache
             is_causal = old_pos == 0
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         elif cache is not None:
             k = torch.cat([cache[0], k], dim=2)
             v = torch.cat([cache[1], v], dim=2)
             new_cache = (k, v)
-            is_causal = False
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=False,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         else:
             new_cache = (k, v)
-            is_causal = True
-
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=is_causal,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         y = y.transpose(1, 2).contiguous().view(B, T, D)
         return self.proj(y), new_cache
 
@@ -159,18 +254,37 @@ class CrossAttention(nn.Module):
         self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.kv_proj = nn.Linear(cfg.d_model, 2 * cfg.d_model, bias=False)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        # See GPTConfig.use_qk_norm. RMSNorm(0) == 0, so the zeros-uncond
+        # convention (zero cond embedding == skipping the block exactly,
+        # tests/test_cfg_uncond.py) survives the norm.
+        self.q_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
+        self.k_norm = nn.RMSNorm(self.head_dim) if cfg.use_qk_norm else None
         self.dropout = cfg.dropout
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, D] audio hidden states, cond: [B, T_cond, D] text embeddings."""
+    def forward(
+        self, x: torch.Tensor, cond: torch.Tensor, kv_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """x: [B, T, D] audio hidden states, cond: [B, T_cond, D] text embeddings.
+
+        kv_mask: optional additive attention mask broadcastable to
+        [B, n_heads, T, T_cond] (0 keep, -inf drop) — used to mask padded
+        positions in a variable-length lyric sequence. Callers must guarantee
+        each query row has at least one un-masked key (a fully -inf row makes
+        SDPA's softmax produce NaN); the lyric path ensures this by always
+        keeping the BOS phoneme valid.
+        """
         B, T, D = x.shape
         T_c = cond.shape[1]
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k, v = self.kv_proj(cond).split(D, dim=-1)
         k = k.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         y = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=kv_mask,
             is_causal=False,
             dropout_p=self.dropout if self.training else 0.0,
         )
@@ -198,6 +312,13 @@ class Block(nn.Module):
         if self.has_cross_attn:
             self.ln_cross = nn.RMSNorm(cfg.d_model)
             self.cross_attn = CrossAttention(cfg)
+        # Separate cross-attention for the lyric phoneme sequence (kept distinct
+        # from the pooled tag vector so one softmax doesn't pit a global vibe
+        # vector against 256 phonemes, and so each stream drops independently).
+        self.has_lyric_attn = cfg.use_lyric_conditioning
+        if self.has_lyric_attn:
+            self.ln_lyric = nn.RMSNorm(cfg.d_model)
+            self.lyric_attn = CrossAttention(cfg)
         self.ln2 = nn.RMSNorm(cfg.d_model)
         self.mlp = MLP(cfg)
         self.use_gradient_checkpointing = cfg.use_gradient_checkpointing
@@ -208,12 +329,16 @@ class Block(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         text_emb: torch.Tensor | None,
+        lyric_emb: torch.Tensor | None,
+        lyric_kv_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         # Training-only path (no KV cache). Wrapped by gradient checkpointing.
         attn_out, _ = self.attn(self.ln1(x), cos, sin, cache=None)
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
             x = x + self.cross_attn(self.ln_cross(x), text_emb)
+        if self.has_lyric_attn and lyric_emb is not None:
+            x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -224,14 +349,26 @@ class Block(nn.Module):
         sin: torch.Tensor,
         cache: KVCache | None = None,
         text_emb: torch.Tensor | None = None,
+        lyric_emb: torch.Tensor | None = None,
+        lyric_kv_mask: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, KVCache | None]:
         if cache is None and self.training and self.use_gradient_checkpointing:
-            x = checkpoint(self._body, x, cos, sin, text_emb, use_reentrant=False)
+            x = checkpoint(
+                self._body, x, cos, sin, text_emb, lyric_emb, lyric_kv_mask,
+                use_reentrant=False,
+            )
             return x, None
-        attn_out, new_cache = self.attn(self.ln1(x), cos, sin, cache=cache)
+        attn_out, new_cache = self.attn(
+            self.ln1(x), cos, sin, cache=cache,
+            input_pos=input_pos, attn_mask=attn_mask,
+        )
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
             x = x + self.cross_attn(self.ln_cross(x), text_emb)
+        if self.has_lyric_attn and lyric_emb is not None:
+            x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
         x = x + self.mlp(self.ln2(x))
         return x, new_cache
 
@@ -240,18 +377,68 @@ class NanoAudioGPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
+        # Optional torch.compile'd forward for the per-step decode loop. Set by the
+        # inference engine after load (a no-op for training). When present,
+        # _generate_stream routes each decode step through it so CUDA graphs apply;
+        # the eager self.forward is the fallback (identical results, just slower).
+        self._compiled_forward = None
         self.tok_embeds = nn.ModuleList(
             [nn.Embedding(cfg.vocab_with_pad, cfg.d_model) for _ in range(cfg.n_codebooks)]
         )
         head_dim = cfg.d_model // cfg.n_heads
         self.rotary = RotaryEmbedding(head_dim, cfg.max_seq_len, cfg.rope_base)
         self.drop = nn.Dropout(cfg.dropout)
+        # LyricEncoder lives INSIDE the model so DDP syncs its grads and it
+        # saves/restores with the model state_dict (no sidecar key like the CLAP
+        # projection). It runs once per forward; its output sequence feeds every
+        # block's lyric cross-attention.
+        if cfg.use_lyric_conditioning:
+            self.lyric_encoder = LyricEncoder(
+                d_model=cfg.d_model,
+                n_layers=cfg.lyric_enc_layers,
+                n_heads=cfg.lyric_enc_heads,
+                d_ff=cfg.lyric_enc_d_ff,
+                max_len=cfg.max_lyric_len,
+                vocab_size=cfg.phoneme_vocab_size,
+                dropout=cfg.dropout,
+                use_qk_norm=cfg.use_lyric_qk_norm,
+            )
+        # MelodyEncoder also lives INSIDE the model (same rationale as the lyric
+        # encoder: DDP grad-sync + saves in the model state_dict). Its output is
+        # added to the decoder input per frame rather than cross-attended.
+        if cfg.use_melody_conditioning:
+            self.melody_encoder = MelodyEncoder(
+                d_model=cfg.d_model,
+                n_bins=cfg.melody_n_bins,
+                n_layers=cfg.melody_enc_layers,
+                dropout=cfg.dropout,
+            )
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.ln_final = nn.RMSNorm(cfg.d_model)
-        self.heads = nn.ModuleList(
-            [nn.Linear(cfg.d_model, cfg.vocab_with_pad, bias=False) for _ in range(cfg.n_codebooks)]
+        # The K per-codebook output heads, fused into one Linear (one matmul per
+        # forward instead of K kernel launches); the forward's view+transpose
+        # recovers the per-codebook [B, K, T, V] layout.
+        self.head = nn.Linear(
+            cfg.d_model, cfg.n_codebooks * cfg.vocab_with_pad, bias=False
         )
         self.apply(self._init_weights)
+        # Stability hardening (v8 diverged at lr ~4e-5 without it, cb0-led):
+        # (1) GPT-2 depth-scaled init on the residual out-projs — each block
+        # adds up to 4 streams to the residual, so shrink every contribution by
+        # 1/sqrt(2*n_layers) to keep activation variance flat across the stack.
+        # (2) Conditioning cross-attns start as exact no-ops (zero out_proj,
+        # ControlNet/Flamingo-style): step-0 dynamics match an unconditioned
+        # decoder and the paths open up as their gradients arrive. The melody
+        # path is gated the same way inside MelodyEncoder (zero ln_final gain —
+        # zeroing a pre-norm Linear would NOT gate, the norm re-amplifies).
+        resid_std = 0.02 / math.sqrt(2 * cfg.n_layers)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.proj.weight, std=resid_std)
+            nn.init.normal_(block.mlp.fc2.weight, std=resid_std)
+            if block.has_cross_attn:
+                nn.init.zeros_(block.cross_attn.out_proj.weight)
+            if block.has_lyric_attn:
+                nn.init.zeros_(block.lyric_attn.out_proj.weight)
 
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
@@ -262,12 +449,104 @@ class NanoAudioGPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
+    def encode_lyrics(
+        self, lyric_ids: torch.Tensor, lyric_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the lyric encoder once: (ids [B,L], mask [B,L]) -> (emb [B,L,D],
+        additive cross-attn mask [B,1,1,L]).
+
+        The additive mask is 0 at real phonemes and -inf at padding. Callers must
+        ensure every row keeps at least one valid phoneme (BOS) so no query row is
+        fully masked (that would NaN the cross-attn softmax)."""
+        lyric_emb, lyric_mask = self.lyric_encoder(lyric_ids, lyric_mask)
+        kv_mask = torch.zeros(
+            lyric_mask.shape[0], 1, 1, lyric_mask.shape[1],
+            dtype=lyric_emb.dtype, device=lyric_emb.device,
+        ).masked_fill(~lyric_mask[:, None, None, :], float("-inf"))
+        return lyric_emb, kv_mask
+
+    def _melody_add(
+        self,
+        melody: torch.Tensor | None,
+        melody_emb: torch.Tensor | None,
+        B: int,
+        T: int,
+        start_pos: int,
+        keep: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The per-frame melody term added to the decoder input, shape [B, T, D].
+
+        Three sources, in precedence order:
+        - ``melody_emb`` (pre-built full delayed-length [B, seq, D], from
+          ``encode_melody_delayed``): sliced ``[start_pos:start_pos+T]`` so the
+          same tensor serves the prefill and each KV-cached decode step (mirrors
+          the RoPE ``self.rotary(start_pos, T)`` slice).
+        - ``melody`` (raw chroma [B, Tc, 12], the training path, start_pos=0):
+          encoded here so DDP syncs the encoder grads, then null-padded to T (the
+          K-2 delay-tail positions) or truncated.
+        - neither (melody dropped / unconditional): the learned null, so the model
+          always receives a melody signal — train and inference agree that "no
+          melody" means the null, not the absence of any add.
+        """
+        if melody_emb is not None:
+            # Decode path indexes by the tensor input_pos (graph-friendly); the
+            # prefill / training path uses the contiguous start_pos slice.
+            if input_pos is not None:
+                return melody_emb[:, input_pos, :]
+            return melody_emb[:, start_pos:start_pos + T, :]
+        if melody is not None:
+            enc = self.melody_encoder.encode_melody(melody)  # [B, Tc, D]
+            Tc = enc.shape[1]
+            if Tc < T:
+                enc = torch.cat([enc, self.melody_encoder.null_emb(B, T - Tc)], dim=1)
+            elif Tc > T:
+                enc = enc[:, :T, :]
+            if keep is not None:
+                # CFG gate: keep=0 -> exactly the null path (the dropped /
+                # unconditional state), but the encoder ran, so one compiled
+                # graph serves both and its params are never DDP-"unused".
+                enc = keep * enc + (1 - keep) * self.melody_encoder.null_emb(B, T)
+            return enc
+        return self.melody_encoder.null_emb(B, T)
+
+    def encode_melody_delayed(
+        self, melody: torch.Tensor, seq_len: int, offset: int = 0,
+    ) -> torch.Tensor:
+        """Encode chroma once into a full delayed-length tensor [B, seq_len, D].
+
+        The encoded melody (one frame per new audio frame) is placed at delayed
+        positions ``[offset, offset+Tc)`` — ``offset`` is the prompt length, so the
+        melody lines up with the NEW frames at the cb0 anchor — and every other
+        position (prompt/seed prefix + the K-1 delay tail) is the learned null.
+        Used by ``generate`` to encode the (fully-known) melody ONCE and reuse the
+        result across all decode steps via the ``[start_pos:start_pos+T]`` slice.
+        """
+        B = melody.shape[0]
+        enc = self.melody_encoder.encode_melody(melody)  # [B, Tc, D]
+        Tc = enc.shape[1]
+        full = self.melody_encoder.null_emb(B, seq_len).clone()  # [B, seq_len, D]
+        end = min(offset + Tc, seq_len)
+        if end > offset:
+            full[:, offset:end, :] = enc[:, :end - offset, :]
+        return full
+
     def forward(
         self,
         tokens: torch.Tensor,
         kv_caches: list[KVCache] | None = None,
         start_pos: int = 0,
         text_emb: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_emb: torch.Tensor | None = None,
+        lyric_kv_mask: torch.Tensor | None = None,
+        lyric_keep: torch.Tensor | None = None,
+        melody: torch.Tensor | None = None,
+        melody_emb: torch.Tensor | None = None,
+        melody_keep: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
@@ -275,7 +554,27 @@ class NanoAudioGPT(nn.Module):
         kv_caches: when None, training path (returns logits only).
                    when a list, returns (logits, new_caches).
         start_pos: positional offset for the tokens (used with KV cache).
-        text_emb: [B, T_text, D] optional text conditioning embeddings.
+        text_emb: [B, T_text, D] optional (pooled CLAP) tag conditioning.
+        lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask. When given (and
+            lyric conditioning is enabled), the lyric encoder runs INSIDE this
+            forward — so DDP syncs its grads. Used on the training path.
+        lyric_emb/lyric_kv_mask: pre-encoded lyric sequence + additive mask (from
+            encode_lyrics). Used on the generate path to encode once and reuse
+            across decode steps. Takes precedence over lyric_ids.
+        melody: [B, Tc, n_bins] chroma sequence. Encoded INSIDE this forward (DDP
+            grad-sync) and added per-frame; the training path. ``melody=None`` with
+            melody conditioning enabled adds the learned null (the dropped /
+            unconditional state) so train and inference agree.
+        melody_emb: pre-built full delayed-length melody term [B, seq, D] (from
+            encode_melody_delayed). Used on the generate path to encode once and
+            slice per decode step. Takes precedence over ``melody``.
+        lyric_keep / melody_keep: optional 0/1 scalar tensors — the train-time
+            CFG-dropout gates. The encoders ALWAYS run and the contribution is
+            multiplied by keep (0 -> exactly the unconditional state: zero lyric
+            cond / the melody null), so torch.compile sees ONE graph per stream
+            and every parameter participates in every step (which is what lets
+            DDP run with find_unused_parameters=False). ``None`` = keep=1
+            behavior — the inference paths never pass these.
         returns: logits [B, K, T, V] or (logits, new_caches)
         """
         B, K, T = tokens.shape
@@ -285,21 +584,54 @@ class NanoAudioGPT(nn.Module):
             f"(RoPE table size — bump GPTConfig.max_seq_len if you need longer)"
         )
 
+        if (
+            lyric_emb is None
+            and lyric_ids is not None
+            and self.cfg.use_lyric_conditioning
+        ):
+            lyric_emb, lyric_kv_mask = self.encode_lyrics(lyric_ids, lyric_mask)
+        if lyric_emb is not None and lyric_keep is not None:
+            # CFG gate: keep=0 zeroes the cond sequence, and zero K/V through
+            # the bias-free cross-attn is exactly zero output — identical to
+            # skipping the stream, but the encoder stays in the autograd graph.
+            lyric_emb = lyric_emb * lyric_keep
+
         x = self.tok_embeds[0](tokens[:, 0])
         for k in range(1, K):
             x = x + self.tok_embeds[k](tokens[:, k])
+        # Melody is time-aligned: add it to the per-frame input at the cb0 anchor
+        # (delayed position p ↔ frame p). The slice inside _melody_add keeps the
+        # prefill / single-step decode paths aligned, exactly like the RoPE slice.
+        if self.cfg.use_melody_conditioning:
+            x = x + self._melody_add(melody, melody_emb, B, T, start_pos,
+                                     keep=melody_keep, input_pos=input_pos)
         x = self.drop(x)
 
-        cos, sin = self.rotary(start_pos, T)
+        # RoPE positions: the CUDA-graph decode path indexes by the TENSOR
+        # input_pos (no python-int start_pos guard → one reusable compiled
+        # graph); every other path uses the contiguous start_pos slice.
+        if input_pos is not None:
+            cos = self.rotary.cos_cached[input_pos]
+            sin = self.rotary.sin_cached[input_pos]
+        else:
+            cos, sin = self.rotary(start_pos, T)
 
         new_caches: list[KVCache] = []
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches else None
-            x, new_cache = block(x, cos, sin, cache=cache, text_emb=text_emb)
+            x, new_cache = block(
+                x, cos, sin, cache=cache, text_emb=text_emb,
+                lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask,
+                input_pos=input_pos, attn_mask=attn_mask,
+            )
             new_caches.append(new_cache)
         x = self.ln_final(x)
 
-        logits = torch.stack([head(x) for head in self.heads], dim=1)
+        logits = (
+            self.head(x)
+            .view(B, T, self.cfg.n_codebooks, self.cfg.vocab_with_pad)
+            .transpose(1, 2)  # [B, K, T, V]
+        )
         if kv_caches is not None:
             return logits, new_caches
         return logits
@@ -318,15 +650,43 @@ class NanoAudioGPT(nn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
+        melody: torch.Tensor | None = None,
+        melody_cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """Continue a prompt, or generate unconditionally when prompt is None.
 
         prompt: [K, T_prompt] or [B, K, T_prompt], or None for unconditional
         text_emb: [B, 1, D] optional text conditioning (from CLAPTextEncoder)
+        melody: [B, num_new_frames, n_bins] chroma for the frames being generated.
+            Encoded ONCE into a full delayed-length tensor (placed at the new-frame
+            positions, learned-null elsewhere) and reused across decode steps. The
+            CFG baseline uses the learned null, so melody is guided like the other
+            axes. Length should match num_new_frames (the cover length).
+        melody_cfg_scale: when set (and melody is given), guide the melody axis with
+            its OWN scale via an extra composed stream — analogous to
+            lyric_cfg_scale, nesting after it (tags → lyrics → melody). When None,
+            melody is guided jointly with the rest by cfg_scale (one fewer pass).
+        lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask for the lyric
+            conditioning stream. Encoded once and reused across decode steps.
+        lyric_ids_neg/lyric_mask_neg: optional *negative* lyric stream for the
+            CFG baseline (default baseline drops lyrics entirely).
+        lyric_cfg_scale: when set (and lyric conditioning is active), guide the
+            lyric axis with its OWN scale via composed guidance — runs a third
+            "tags-only, lyrics-dropped" stream and blends
+            logits = base + cfg_scale*(tags_only - base)
+                          + lyric_cfg_scale*(cond - tags_only).
+            This lets a user push lyric intelligibility harder than tag adherence.
+            When None, lyrics are guided jointly with tags by cfg_scale (cheaper,
+            one fewer forward pass).
         cfg_scale: classifier-free guidance scale. 1.0 = no guidance (single
             forward pass). >1.0 = run an additional baseline forward pass and
-            blend logits = base + cfg_scale * (cond - base). Active when either
-            text_emb or text_emb_neg is set.
+            blend logits = base + cfg_scale * (cond - base). Active when any of
+            text_emb / text_emb_neg / lyric conditioning is set.
         text_emb_neg: [B, N, D] optional *negative* conditioning. The CFG
             baseline pass is run with this instead of None, so guidance steers
             *away* from it: logits = neg + cfg_scale * (cond - neg). When None
@@ -346,10 +706,35 @@ class NanoAudioGPT(nn.Module):
             Applied before top_k (consistent with HF transformers / MusicGen).
         returns: [B, K, T_prompt + num_new_frames]
 
-        When prompt is None a single random seed frame is used internally; the
-        InferenceEngine seeds with DAC-encoded silence instead to keep the
-        from-scratch path on-distribution.
-        Uses KV cache for efficient autoregressive decoding.
+        When prompt is None a single random seed frame is used internally — the
+        from-scratch path the InferenceEngine relies on (a fresh random seed per
+        call). Uses KV cache for efficient autoregressive decoding.
+        """
+        prompt, squeeze_batch = self._resolve_prompt(prompt)
+        chunks = list(self._generate_stream(
+            prompt, num_new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=text_emb, cfg_scale=cfg_scale, text_emb_neg=text_emb_neg,
+            lyric_ids=lyric_ids, lyric_mask=lyric_mask,
+            lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
+            lyric_cfg_scale=lyric_cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+        ))
+        new = (
+            torch.cat(chunks, dim=-1) if chunks
+            else prompt.new_zeros((prompt.shape[0], prompt.shape[1], 0))
+        )
+        out = torch.cat([prompt, new], dim=-1)
+        return out.squeeze(0) if squeeze_batch else out
+
+    def _resolve_prompt(
+        self, prompt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, bool]:
+        """Resolve generate()'s prompt arg to a batched [B, K, T_prompt] tensor.
+
+        prompt=None -> a single random DAC seed column (the from-scratch path); a
+        2D [K, T] prompt is unsqueezed to [1, K, T] and squeeze_batch=True is
+        returned so the caller can squeeze the result back to 2D.
         """
         if prompt is None:
             device = next(self.parameters()).device
@@ -361,8 +746,49 @@ class NanoAudioGPT(nn.Module):
         squeeze_batch = prompt.dim() == 2
         if squeeze_batch:
             prompt = prompt.unsqueeze(0)
+        return prompt, squeeze_batch
+
+    @torch.no_grad()
+    def _generate_stream(
+        self,
+        prompt: torch.Tensor,
+        num_new_frames: int,
+        temperature: float | Sequence[float] = 1.0,
+        top_k: int | None | Sequence[int | None] = 250,
+        top_p: float | None | Sequence[float | None] = None,
+        text_emb: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
+        text_emb_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
+        melody: torch.Tensor | None = None,
+        melody_cfg_scale: float | None = None,
+        emit_every: int = 256,
+        first_emit: int | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """The shared autoregressive decode loop behind generate().
+
+        Yields the NEW frames (never the prompt) as un-delayed [B, K, n]
+        LongTensor chunks, in generation order, emitting once >= emit_every new
+        frames have become fully known across all K codebooks (the first chunk
+        after `first_emit` frames — smaller by default, for a faster
+        time-to-first-audio when streaming). generate() concatenates these onto the
+        prompt to reproduce its full result bit-identically — this IS the loop, so
+        the per-step RNG order is shared and there is no train/inference drift.
+        `prompt` must be a resolved, batched [B, K, T_prompt] tensor (see
+        _resolve_prompt). emit_every is irrelevant to generate() (it concatenates
+        every chunk regardless); it only sets the streaming cadence.
+
+        A new frame f is fully known once the delayed decode step p = f + (K-1)
+        completes — codebook k of frame f lands at delayed position f + k.
+        """
         B, K, T_prompt = prompt.shape
         assert K == self.cfg.n_codebooks
+        if first_emit is None:
+            first_emit = emit_every
 
         def _per_cb(val, kind: str) -> list:
             if val is None or isinstance(val, (int, float)):
@@ -387,7 +813,10 @@ class NanoAudioGPT(nn.Module):
         for k in range(K):
             tokens[:, k, k:k + T_prompt] = prompt[:, k]
 
-        use_cfg = cfg_scale != 1.0 and (text_emb is not None or text_emb_neg is not None)
+        def _emit(s: int, e: int) -> torch.Tensor:
+            # Un-delay new frames [s, e): codebook k's value for frame f sits at
+            # delayed position f + k (the inverse of apply_delay; cf. revert_delay).
+            return torch.stack([tokens[:, k, s + k:e + k] for k in range(K)], dim=1)
 
         was_training = self.training
         self.eval()
@@ -396,44 +825,184 @@ class NanoAudioGPT(nn.Module):
             dtype = next(self.parameters()).dtype
 
             def _make_caches() -> list[StaticLayerKVCache]:
-                return [
-                    StaticLayerKVCache(
-                        torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype),
-                        torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype),
-                    )
-                    for _ in range(self.cfg.n_layers)
-                ]
+                caches = []
+                for _ in range(self.cfg.n_layers):
+                    k = torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype)
+                    v = torch.zeros(B, self.cfg.n_heads, T_delay, head_dim, device=device, dtype=dtype)
+                    # These KV buffers persist across decode steps and are mutated
+                    # in place — mark them as static-address so torch.compile's
+                    # CUDA graphs can own them (without this, the in-place cache
+                    # mutation makes cudagraphs fall back to plain compiled kernels).
+                    if device.type == "cuda":
+                        torch._dynamo.mark_static_address(k)
+                        torch._dynamo.mark_static_address(v)
+                    caches.append(StaticLayerKVCache(k, v))
+                return caches
 
-            caches_cond = _make_caches()
-            caches_uncond = _make_caches() if use_cfg else None
+            # Encode lyric streams ONCE (the encoder is ~100M params — encoding
+            # per decode step would dominate cost). Reused across all steps.
+            lyric_pos = lyric_kv_pos = None
+            lyric_neg = lyric_kv_neg = None
+            if self.cfg.use_lyric_conditioning and lyric_ids is not None:
+                lyric_pos, lyric_kv_pos = self.encode_lyrics(lyric_ids, lyric_mask)
+            if self.cfg.use_lyric_conditioning and lyric_ids_neg is not None:
+                lyric_neg, lyric_kv_neg = self.encode_lyrics(lyric_ids_neg, lyric_mask_neg)
 
-            # prefill: run full prompt through transformer
+            # Encode the (fully-known) melody ONCE into a full delayed-length term,
+            # placed at the new-frame positions (offset by the prompt). The CFG
+            # baseline is the learned null. Both are reused across decode steps.
+            mel_pos = mel_neg = None
+            has_melody = self.cfg.use_melody_conditioning and melody is not None
+            if self.cfg.use_melody_conditioning:
+                mel_neg = self.melody_encoder.null_emb(B, T_delay)  # [B, T_delay, D]
+                mel_pos = (
+                    self.encode_melody_delayed(melody, T_delay, offset=T_prompt)
+                    if melody is not None else mel_neg
+                )
+
+            has_cond = any(
+                v is not None for v in (text_emb, text_emb_neg, lyric_pos, lyric_neg)
+            ) or has_melody
+            composed_lyric = (
+                lyric_cfg_scale is not None and lyric_cfg_scale != 1.0
+                and lyric_pos is not None
+            )
+            composed_melody = (
+                melody_cfg_scale is not None and melody_cfg_scale != 1.0
+                and has_melody
+            )
+            use_cfg = (cfg_scale != 1.0 and has_cond) or composed_lyric or composed_melody
+
+            # Guidance as an ordered list of stages from the CFG baseline to the
+            # fully-conditioned state. Each consecutive pair contributes
+            # scale_i * (stage_{i+1} - stage_i); axes WITHOUT their own scale are
+            # folded into the cfg_scale (tags) step so they're still guided with no
+            # extra forward pass. Nesting order is tags → lyrics → melody.
+            #   logits = stages[0] + Σ scales[i] * (stages[i+1] - stages[i])
+            # Each stage is a full conditioning state {text, lemb, lkv, mel} with
+            # its own KV cache.
+            full = {"text": text_emb, "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
+            if not use_cfg:
+                stages = [full]
+                scales: list[float] = []
+            else:
+                off = {"text": text_emb_neg, "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
+                # The cfg (tags) step turns on everything that isn't separately
+                # composed; composed axes start off and are switched on later.
+                tags_on = dict(full)
+                if composed_lyric:
+                    tags_on["lemb"], tags_on["lkv"] = lyric_neg, lyric_kv_neg
+                if composed_melody:
+                    tags_on["mel"] = mel_neg
+                stages = [off, tags_on]
+                scales = [cfg_scale]
+                if composed_lyric:
+                    lyr_on = dict(stages[-1])
+                    lyr_on["lemb"], lyr_on["lkv"] = lyric_pos, lyric_kv_pos
+                    stages.append(lyr_on)
+                    scales.append(lyric_cfg_scale)
+                if composed_melody:
+                    mel_on = dict(stages[-1])
+                    mel_on["mel"] = mel_pos
+                    stages.append(mel_on)
+                    scales.append(melody_cfg_scale)
+            for s in stages:
+                s["caches"] = _make_caches()
+
+            # Mutable holder so a runtime compile/cudagraph failure can disable the
+            # compiled path mid-generation and fall back to eager (identical
+            # results, just slower) instead of failing the whole request.
+            # Mutable holder so a runtime compile/cudagraph failure can disable the
+            # compiled path mid-generation and fall back to eager (identical
+            # results, just slower) instead of failing the whole request.
+            compiled_box = [self._compiled_forward]
+
+            def _run(inp, start, input_pos=None, attn_mask=None):
+                # Decode steps (input_pos given) go through the compiled forward
+                # when available — that's where CUDA graphs remove the per-step
+                # launch overhead. Prefill stays eager (it runs once).
+                use_compiled = input_pos is not None and compiled_box[0] is not None
+                fwd = compiled_box[0] if use_compiled else self.forward
+                for s in stages:
+                    try:
+                        out, s["caches"] = fwd(
+                            inp, kv_caches=s["caches"], start_pos=start,
+                            text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                            melody_emb=s["mel"],
+                            input_pos=input_pos, attn_mask=attn_mask,
+                        )
+                    except Exception as e:  # noqa: BLE001 — compile/cudagraph fallback
+                        if not use_compiled:
+                            raise
+                        compiled_box[0] = None
+                        fwd = self.forward
+                        print(f"[generate] compiled decode failed ({e!r}); "
+                              f"falling back to eager for the rest of this run")
+                        out, s["caches"] = fwd(
+                            inp, kv_caches=s["caches"], start_pos=start,
+                            text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                            melody_emb=s["mel"],
+                            input_pos=input_pos, attn_mask=attn_mask,
+                        )
+                    # Clone: under CUDA graphs the compiled forward's output is a
+                    # reused static buffer, so two sequential CFG-stage calls would
+                    # otherwise alias — _combine must see each stage's own logits.
+                    s["logits"] = out.clone()
+
+            def _combine():
+                out = stages[0]["logits"]
+                for i, sc in enumerate(scales):
+                    out = out + sc * (stages[i + 1]["logits"] - stages[i]["logits"])
+                return out
+
+            # prefill: run full prompt through transformer (eager, legacy path)
             prefill_len = max(1, T_prompt)
             prefill_inp = tokens[:, :, :prefill_len]
-            logits, caches_cond = self.forward(
-                prefill_inp, kv_caches=caches_cond, start_pos=0, text_emb=text_emb,
-            )
-            if use_cfg:
-                logits_base, caches_uncond = self.forward(
-                    prefill_inp, kv_caches=caches_uncond, start_pos=0, text_emb=text_emb_neg,
-                )
-                logits = logits_base + cfg_scale * (logits - logits_base)
+            _run(prefill_inp, 0)
+            logits = _combine()
+            # The decode loop may capture a CUDA graph that reads the KV cache the
+            # eager prefill just wrote. Sync so those writes are visible before the
+            # capture stream reads them (a missing barrier here surfaced as
+            # intermittent NaN logits / device-side asserts at capture).
+            if device.type == "cuda" and compiled_box[0] is not None:
+                torch.cuda.synchronize()
 
-            # decode: one position at a time using cached K/V
+            # decode: one position at a time using cached K/V, yielding new frames
+            # as soon as they are fully known across all K codebooks. Each step
+            # passes a TENSOR position + a static-shape additive mask over the full
+            # cache buffer (no python-int position, no growing slice) so the
+            # compiled decode graph is captured once and replayed every step.
+            # The mask is a FINITE float (not bool/-inf): a bool mask becomes -inf,
+            # and flash-attention tiles keys into blocks — an all-masked early
+            # block then has block-max -inf and the online-softmax rescale yields
+            # NaN (fp16, CUDA). A large finite negative avoids that and still zeros
+            # the masked weights (exp(-1e4) == 0). cf. the cached-decode test.
+            # The fixed-shape input_pos path exists to enable torch.compile/CUDA
+            # graphs; it's only worth its extra (full-buffer) attention when we're
+            # actually compiling. Eager (no compiled forward) uses the original
+            # growing-slice legacy path — faster, and the proven fallback.
+            use_input_pos = compiled_box[0] is not None
+            emitted = 0  # count of new frames already yielded
+            threshold = first_emit
             for p in range(prefill_len, T_delay):
                 if p > prefill_len:
-                    inp = tokens[:, :, p - 1:p]
-                    logits, caches_cond = self.forward(
-                        inp, kv_caches=caches_cond, start_pos=p - 1, text_emb=text_emb,
-                    )
-                    if use_cfg:
-                        logits_base, caches_uncond = self.forward(
-                            inp, kv_caches=caches_uncond, start_pos=p - 1, text_emb=text_emb_neg,
-                        )
-                        logits = logits_base + cfg_scale * (logits - logits_base)
+                    if use_input_pos:
+                        pos = p - 1
+                        input_pos = torch.tensor([pos], device=device, dtype=torch.long)
+                        attn_mask = torch.zeros(T_delay, dtype=dtype, device=device)
+                        attn_mask[pos + 1:] = -1e4
+                        attn_mask = attn_mask.view(1, 1, 1, T_delay)
+                        _run(tokens[:, :, pos:pos + 1], 0,
+                             input_pos=input_pos, attn_mask=attn_mask)
+                    else:
+                        _run(tokens[:, :, p - 1:p], p - 1)
+                    logits = _combine()
 
                 step_logits = logits[:, :, -1, :].clone()  # [B, K, V]
-                step_logits[..., pad] = float("-inf")
+                # Mask every control id (pad, plus the FIM <SUF>/<MID> sentinels
+                # when use_fim) so generation only ever emits real DAC tokens —
+                # the FIM middle must never contain a sentinel.
+                step_logits[..., self.cfg.vocab_per_codebook:] = float("-inf")
 
                 # Per-codebook sampling: each cb gets its own temperature/top_k/top_p
                 # so later codebooks (high-entropy DAC residuals) can be sampled
@@ -469,12 +1038,19 @@ class NanoAudioGPT(nn.Module):
                 for k in range(K):
                     if k + T_prompt <= p < k + T_total:
                         tokens[:, k, p] = sampled[:, k]
+
+                # Emit any new frames now fully known: frame f completes at p=f+K-1.
+                n_complete = min(p - (K - 1), T_total - 1) - T_prompt + 1
+                if n_complete - emitted >= threshold:
+                    yield _emit(T_prompt + emitted, T_prompt + n_complete)
+                    emitted = n_complete
+                    threshold = emit_every
+            # flush the remaining tail
+            if emitted < num_new_frames:
+                yield _emit(T_prompt + emitted, T_total)
         finally:
             if was_training:
                 self.train()
-
-        out = revert_delay(tokens, T_total)
-        return out.squeeze(0) if squeeze_batch else out
 
 
 if __name__ == "__main__":

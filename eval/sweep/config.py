@@ -7,9 +7,6 @@ the 287M winner does not transfer to 1.5B. Run the whole sweep per checkpoint.
 # ── fixed (held constant so the sweep measures settings, not these) ──────────
 SECONDS = 8.0          # long enough for onset-autocorr to find a beat at 86 fps
 TOP_P = 0.95           # never the deciding lever in prior runs
-SEED_MODES = ["random"]   # silence-seed collapses to no audio on v7_1500m for
-#   these (mostly high-energy) genre prompts — the silence audio context
-#   overpowers cross-attention conditioning. random seeds for everything.
 CFG_SCALES = [3.0, 4.0, 5.0, 6.0, 7.0]   # sweep the full 3-7 band; collapse
 #   sensitivity is per-checkpoint, so don't pre-prune (the v6 "cfg7 too hot"
 #   finding does not transfer to v7_1500m — re-measure here).
@@ -37,21 +34,37 @@ PROMPTS = {
 }
 
 
+# ── lyric-conditioned prompts: the same cfg×profile grid is swept over these too,
+# so we find non-collapse settings for SUNG generation, not just instrumental.
+# tags are caption-style (vocals-forward); lyrics are a clear English line. The
+# runner combines them as "tags. lyrics" (server convention) AFTER flattening any
+# internal ". " in the tags, so the caption can't spill into the lyric stream. ──
+LYRIC_CFG = 3.0   # moderate lyric guidance, held constant while cfg/profile sweep
+LYRIC_PROMPTS = {
+    "pop_vocal": {
+        "tags": "An upbeat pop song with a clear female lead vocal, bright synths, punchy drums and warm bass, catchy and energetic",
+        "lyrics": "Hold me close under the city lights tonight, we are electric and we will never fade away",
+    },
+    "ballad": {
+        "tags": "A slow emotional piano ballad with a soft male lead vocal, gentle strings, intimate and warm",
+        "lyrics": "I remember every word you said, the quiet way you held my hand in the dark",
+    },
+}
+
+
 def all_settings():
-    """24 settings: cfg(4) x seed(2) x profile(3). Each is a dict ready for
+    """15 settings: cfg(5) x profile(3). Each is a dict ready for
     InferenceEngine.generate_audio + an id string."""
     out = []
     for cfg in CFG_SCALES:
-        for seed in SEED_MODES:
-            for pname, (temp, topk) in PROFILES.items():
-                sid = f"cfg{cfg}_{seed}_{pname}"
-                out.append({
-                    "id": sid,
-                    "cfg_scale": cfg,
-                    "seed_mode": seed,
-                    "profile": pname,
-                    "temperature": temp,
-                    "top_k": topk,
-                    "top_p": TOP_P,
-                })
+        for pname, (temp, topk) in PROFILES.items():
+            sid = f"cfg{cfg}_{pname}"
+            out.append({
+                "id": sid,
+                "cfg_scale": cfg,
+                "profile": pname,
+                "temperature": temp,
+                "top_k": topk,
+                "top_p": TOP_P,
+            })
     return out
