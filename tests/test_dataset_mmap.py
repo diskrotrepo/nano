@@ -29,9 +29,12 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     bundle = load_mmap_bundle(out_dir, segment_frames=400, val_ratio=0.2, seed=42)
     train = TokenDataset.from_mmap(bundle, split="train", segment_frames=400)
     val = TokenDataset.from_mmap(bundle, split="val", segment_frames=400)
-    # 6 songs, val_ratio=0.2 -> max(1, 1.2) = 1 val; rest train.
-    assert len(val) == 1
-    assert len(train) == 5
+    # Stable per-song hash split: total is preserved and val is a non-empty
+    # proper subset. (Exact counts depend on the name hashes now, not on the old
+    # max(1, int(N*ratio)) arithmetic.)
+    assert len(train) + len(val) == 6
+    assert 1 <= len(val) < 6
+    assert len(train) >= 1
     tokens, tag, lyric_ids, _melody = train[0]
     assert isinstance(tokens, torch.Tensor)
     assert tokens.dtype == torch.int16

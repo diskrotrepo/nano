@@ -89,8 +89,79 @@ def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bo
     print(f"[done] packed shards live at {out_dir}", flush=True)
 
 
+@app.function(
+    image=image,
+    cpu=8.0,
+    memory=16 * 1024,
+    # A wave is ~100k songs -> ~20 shards, so this is far quicker than a full
+    # pack, but keep the generous ceiling for safety.
+    timeout=60 * 60 * 18,
+    nonpreemptible=True,
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
+    volumes={"/tokens": tokens_vol, "/melody": melody_vol},
+)
+def pack_append_remote(
+    wave_id: str, shard_target_songs: int = 5_000, n_workers: int = 16,
+    melody: bool = True,
+):
+    """Append one wave's tokens (``/tokens/waves/wave_<id>/*.pt``) as NEW shards
+    to the existing ``/tokens/packed`` — leaving every prior shard untouched (see
+    pack_cache.pack_append). Melody must match the existing pack's has_melody;
+    that's honored here and enforced (fail-fast) inside pack_append."""
+    from pathlib import Path
+
+    from diskrot.pack_cache import SHARD_INDEX_NAME, load_shard_index, pack_append
+
+    wave_dir = f"/tokens/waves/wave_{wave_id}"
+    if next(Path(wave_dir).glob("*.pt"), None) is None:
+        raise SystemExit(f"no .pt files in {wave_dir} — tokenize this wave first")
+
+    # Match the existing pack's melody flag when a pack already exists; otherwise
+    # (first wave) fall back to whether this wave actually has chroma.
+    packed_dir = Path("/tokens/packed")
+    existing_has_melody = None
+    if (packed_dir / SHARD_INDEX_NAME).exists():
+        existing_has_melody = bool(load_shard_index(packed_dir).get("has_melody", False))
+    wave_mel_dir = f"/melody/waves/wave_{wave_id}"
+    wave_has_mel = next(Path(wave_mel_dir).glob("*.mel.npy"), None) is not None
+    want_melody = (
+        existing_has_melody if existing_has_melody is not None
+        else (melody and wave_has_mel)
+    )
+    mel_cache_dir = wave_mel_dir if want_melody else None
+    if want_melody:
+        print(f"[pack-append] melody on — chroma from {wave_mel_dir} "
+              f"(missing songs zero-filled)", flush=True)
+
+    out_dir = pack_append(
+        wave_dir,
+        "/tokens/packed",
+        shard_target_songs=shard_target_songs,
+        n_workers=n_workers,
+        verbose=True,
+        commit_cb=tokens_vol.commit,
+        mel_cache_dir=mel_cache_dir,
+    )
+    tokens_vol.commit()  # idempotent safety net if commit_cb was a no-op
+    print(f"[done] appended wave {wave_id} -> {out_dir}", flush=True)
+
+
 @app.local_entrypoint()
-def main(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True):
+def main(
+    shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True,
+    append: bool = False, wave_id: str = "",
+):
+    if append:
+        if not wave_id:
+            raise SystemExit("--append requires --wave-id (e.g. --wave-id 17)")
+        fc = pack_append_remote.spawn(
+            wave_id=wave_id, shard_target_songs=shard_target_songs,
+            n_workers=n_workers, melody=melody,
+        )
+        print(f"pack-append launched (detached) for wave {wave_id} "
+              f"-- function call id: {fc.object_id}")
+        print("monitor with: modal app logs nano-pack")
+        return
     fc = pack_remote.spawn(
         shard_target_songs=shard_target_songs,
         n_workers=n_workers,

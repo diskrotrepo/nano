@@ -10,6 +10,7 @@ Serves random fixed-length crops via ``__getitem__``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import time
@@ -236,9 +237,9 @@ def _build_mmap_split_index(
     """Build (train_entries, val_entries, shard_metas) over a packed/ dir.
 
     ``entries`` is a list of (shard_id, local_idx, name, n_frames). Songs too
-    short for ``segment_frames`` are filtered out. Train/val split uses the
-    same ``random.Random(seed).shuffle()`` discipline as ``_split_files`` and
-    ``_split_packed`` (sort by name first for shard-order independence).
+    short for ``segment_frames`` are filtered out. Train/val split is a stable
+    per-song hash of the name (+ seed), so adding songs/waves never moves an
+    existing song between splits (see the split block below).
 
     ``shard_metas`` is a dict ``{shard_id: meta}`` so the dataset can read
     offsets without re-opening each JSON sidecar per access.
@@ -256,15 +257,32 @@ def _build_mmap_split_index(
             continue
         all_entries.append((shard_id, local_idx, name, n_frames))
 
-    # Same deterministic shuffle as _split_packed: sort by name then
-    # random.Random(seed).shuffle(). Same seed -> same split as the v1 path
-    # so re-training on a repacked corpus with the same seed gives the same
-    # train/val partition.
-    all_entries.sort(key=lambda e: e[2])
-    rng = random.Random(seed)
-    rng.shuffle(all_entries)
-    n_val = max(1, int(len(all_entries) * val_ratio))
-    return all_entries[n_val:], all_entries[:n_val], shard_metas
+    # Stable, corpus-growth-invariant split: a song's train/val assignment is a
+    # pure function of its name (+ seed), NOT of the corpus size. So appending
+    # waves never moves an existing song between splits. (The old
+    # sort+random.Random(seed).shuffle()+slice reshuffled the whole corpus every
+    # time it grew, silently churning val membership and leaking val<->train
+    # across waves.) Bucket on sha1(name) — the same hashing discipline the
+    # metadata shards use (transcribe_lyrics._shard_for) — into 10k buckets so
+    # val_ratio is honored to 0.0001 and the realized ratio converges as the
+    # corpus grows. One-time breaking change vs the shuffle split: val membership
+    # differs, so val loss is comparable across all FUTURE runs but not to
+    # pre-switch checkpoints.
+    all_entries.sort(key=lambda e: e[2])  # stable, shard-order-independent order
+    val_cut = int(val_ratio * 10_000)
+
+    def _is_val(name: str) -> bool:
+        h = int(hashlib.sha1(f"{seed}:{name}".encode()).hexdigest()[:8], 16)
+        return (h % 10_000) < val_cut
+
+    train_entries = [e for e in all_entries if not _is_val(e[2])]
+    val_entries = [e for e in all_entries if _is_val(e[2])]
+    # Guarantee a non-empty val set on tiny corpora (e.g. tests / pipeline runs)
+    # where the hash bucket might miss; mirrors the old max(1, ...) floor.
+    if not val_entries and all_entries:
+        val_entries = [all_entries[0]]
+        train_entries = all_entries[1:]
+    return train_entries, val_entries, shard_metas
 
 
 def load_mmap_bundle(

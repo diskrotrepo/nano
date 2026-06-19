@@ -57,10 +57,16 @@ def test_train_val_split_disjoint(synth_tokens_dir):
 
 
 def test_val_ratio_respected(synth_tokens_dir):
-    """val_ratio=0.2 over 10 files → 2 val files."""
-    tokens_dir = _packed_dir(synth_tokens_dir(n_files=10, T=1000))
+    """The per-song hash split honors val_ratio in aggregate: over a larger
+    corpus the realized val fraction converges to val_ratio. (It's no longer the
+    old exact int(N*ratio) — each song is assigned independently by name hash so
+    the split stays stable as the corpus grows; see _build_mmap_split_index.)"""
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=300, T=600))
     val = TokenDataset(tokens_dir, segment_frames=500, split="val", seed=42, val_ratio=0.2)
-    assert len(val) == 2
+    train = TokenDataset(tokens_dir, segment_frames=500, split="train", seed=42, val_ratio=0.2)
+    assert len(train) + len(val) == 300
+    frac = len(val) / 300
+    assert 0.13 <= frac <= 0.27, f"realized val fraction {frac:.3f} not near 0.2"
 
 
 def test_skips_too_short_files(synth_tokens_dir):
