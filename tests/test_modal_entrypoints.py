@@ -38,6 +38,7 @@ BLOCKING_OK = {
     "modal_inspect_ckpts.py",   # seconds — prints the checkpoint table
     "modal_merge_lora.py",      # minutes — prints the pull command
     "modal_test_transcribe.py", # diagnostic probe, inline output
+    "modal_wave_cleanup.py",    # quick per-wave inode reclaim; dry-run reports inline
 }
 
 MODAL_RUN_RE = re.compile(

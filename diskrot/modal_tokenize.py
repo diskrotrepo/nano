@@ -78,6 +78,11 @@ class Tokenizer:
     # float. Integer seconds is fine here since min_frames = min_seconds * 86
     # rounds to int anyway.
     min_seconds: int = modal.parameter(default=20)
+    # Wave ingestion: when set (e.g. "waves/wave_17"), read mp3s from
+    # /corpus/<subdir>/ and write .pt to /tokens/<subdir>/ so one wave's tokens
+    # are isolated for pack_append + per-wave cleanup. Empty = the flat legacy
+    # layout (/corpus/*.mp3 -> /tokens/*.pt).
+    subdir: str = modal.parameter(default="")
 
     @modal.enter()
     def load_codec(self):
@@ -92,11 +97,15 @@ class Tokenizer:
     ) -> list[tuple[str, str, int, str | None]]:
         """Tokenize a batch of files within one container with prefetched audio
         loading and a single batched DAC forward pass. Returns one
-        (key, status, frames, error) per input."""
+        (key, status, frames, error) per input. ``mp3_names`` are basenames
+        within the (wave) corpus subdir."""
         from diskrot.tokenize import tokenize_files_streaming
 
+        corpus_dir = Path("/corpus") / self.subdir
+        out_dir = Path("/tokens") / self.subdir
+        out_dir.mkdir(parents=True, exist_ok=True)
         items = [
-            (Path("/corpus") / name, Path("/tokens") / (Path(name).stem + ".pt"))
+            (corpus_dir / name, out_dir / (Path(name).stem + ".pt"))
             for name in mp3_names
         ]
         out: list[tuple[str, str, int, str | None]] = []
@@ -135,14 +144,21 @@ class Tokenizer:
 orchestrator_image = modal.Image.debian_slim(python_version="3.12")
 
 
+def _wave_subdir(wave_id: str) -> str:
+    """'' (flat legacy layout) or 'waves/wave_<id>' for a wave ingest."""
+    return f"waves/wave_{wave_id}" if wave_id else ""
+
+
 @app.function(
     image=orchestrator_image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending() -> list[str]:
-    """Return mp3 filenames not yet tokenized (no matching .pt in /tokens)."""
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
-    existing = {p.stem for p in Path("/tokens").glob("*.pt")}
+def list_pending(wave_id: str = "") -> list[str]:
+    """Return mp3 basenames not yet tokenized (no matching .pt) within the
+    (wave) corpus subdir."""
+    sub = _wave_subdir(wave_id)
+    mp3s = sorted((Path("/corpus") / sub).glob("*.mp3"))
+    existing = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
     pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
     print(f"found {len(mp3s)} total mp3s, {len(existing)} already tokenized, "
           f"{len(pending)} pending")
@@ -161,12 +177,14 @@ def list_pending() -> list[str]:
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
-def run_tokenize(min_seconds: int, batch_size: int) -> None:
+def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
     """Run the full tokenize pass: list pending, fan out to GPU containers,
     aggregate results, print summary. Designed to be `.spawn()`-ed from the
-    local entrypoint so the user can launch and walk away."""
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
-    existing = {p.stem for p in Path("/tokens").glob("*.pt")}
+    local entrypoint so the user can launch and walk away. ``wave_id`` scopes
+    the pass to /corpus/waves/wave_<id> -> /tokens/waves/wave_<id>."""
+    sub = _wave_subdir(wave_id)
+    mp3s = sorted((Path("/corpus") / sub).glob("*.mp3"))
+    existing = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
     pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
     if existing:
         print(f"RESUMING: {len(existing)} of {len(mp3s)} already tokenized, "
@@ -183,7 +201,7 @@ def run_tokenize(min_seconds: int, batch_size: int) -> None:
               for i in range(0, len(pending), batch_size)]
     print(f"Dispatching {len(pending)} files in {len(chunks)} batches of "
           f"~{batch_size} across parallel containers...", flush=True)
-    tokenizer = Tokenizer(min_seconds=min_seconds)
+    tokenizer = Tokenizer(min_seconds=min_seconds, subdir=sub)
 
     n_done = n_short = n_failed = 0
     n_oom = n_decode = n_other = 0
@@ -266,11 +284,13 @@ def run_tokenize(min_seconds: int, batch_size: int) -> None:
 
 
 @app.local_entrypoint()
-def main(min_seconds: int = 20, batch_size: int = 8):
+def main(min_seconds: int = 20, batch_size: int = 8, wave_id: str = ""):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.
-    fc = run_tokenize.spawn(min_seconds=min_seconds, batch_size=batch_size)
+    # --wave-id N scopes the pass to /corpus/waves/wave_N -> /tokens/waves/wave_N.
+    fc = run_tokenize.spawn(
+        min_seconds=min_seconds, batch_size=batch_size, wave_id=wave_id)
     print(f"tokenize launched (detached) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "
           f"awk '/nano-tokenize.*ephemeral/{{print $2; exit}}') -f")

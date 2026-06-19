@@ -71,6 +71,11 @@ _BATCH = 200           # songs per worker call (bounds commit frequency)
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol, "/melody": melody_vol},
 )
 class MelodyExtractor:
+    # Wave ingestion: '' = flat legacy layout; 'waves/wave_<id>' reads mp3/.pt
+    # from and writes .mel.npy into that subdir so a wave's chroma is isolated
+    # for pack_append + per-wave cleanup.
+    subdir: str = modal.parameter(default="")
+
     @modal.method()
     def extract_batch(self, stems: list[str]) -> tuple[int, int, int]:
         """Extract chroma for a batch of song stems. Returns (done, missing, failed).
@@ -84,11 +89,15 @@ class MelodyExtractor:
 
         from diskrot.melody import extract_chroma
 
+        corpus_dir = Path("/corpus") / self.subdir
+        pt_dir = Path("/tokens") / self.subdir
+        mel_dir = Path("/melody") / self.subdir
+        mel_dir.mkdir(parents=True, exist_ok=True)
         n_done = n_missing = n_failed = 0
         for stem in stems:
-            mp3 = Path("/corpus") / f"{stem}.mp3"
-            pt = Path("/tokens") / f"{stem}.pt"
-            out = Path("/melody") / f"{stem}{_MEL_EXT}"
+            mp3 = corpus_dir / f"{stem}.mp3"
+            pt = pt_dir / f"{stem}.pt"
+            out = mel_dir / f"{stem}{_MEL_EXT}"
             if not mp3.exists() or not pt.exists():
                 n_missing += 1
                 continue
@@ -112,12 +121,19 @@ class MelodyExtractor:
         return (n_done, n_missing, n_failed)
 
 
+def _wave_subdir(wave_id: str) -> str:
+    """'' (flat legacy layout) or 'waves/wave_<id>' for a wave ingest."""
+    return f"waves/wave_{wave_id}" if wave_id else ""
+
+
 @app.function(image=image, volumes={"/tokens": tokens_vol, "/melody": melody_vol})
-def list_pending() -> list[str]:
+def list_pending(wave_id: str = "") -> list[str]:
     """Stems with a tokenized ``.pt`` (nano-tokens) but no ``.mel.npy`` yet
-    (nano-melody)."""
-    pt_stems = {p.stem for p in Path("/tokens").glob("*.pt")}
-    done = {p.name[: -len(_MEL_EXT)] for p in Path("/melody").glob(f"*{_MEL_EXT}")}
+    (nano-melody), within the (wave) subdir."""
+    sub = _wave_subdir(wave_id)
+    pt_stems = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
+    done = {p.name[: -len(_MEL_EXT)]
+            for p in (Path("/melody") / sub).glob(f"*{_MEL_EXT}")}
     pending = sorted(pt_stems - done)
     print(f"{len(pt_stems)} tokenized, {len(done)} with chroma, {len(pending)} pending")
     return pending
@@ -128,19 +144,21 @@ def list_pending() -> list[str]:
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol, "/melody": melody_vol},
     timeout=24 * 60 * 60,
 )
-def orchestrate(batch: int = _BATCH):
+def orchestrate(batch: int = _BATCH, wave_id: str = ""):
     """Dispatch chroma extraction across parallel containers (runs remotely so
-    ``--detach`` survives terminal close — mirrors modal_transcribe.orchestrate)."""
+    ``--detach`` survives terminal close — mirrors modal_transcribe.orchestrate).
+    ``wave_id`` scopes the pass to the /…/waves/wave_<id> subdirs."""
     tokens_vol.reload()
     melody_vol.reload()
-    pending = list_pending.remote()
+    sub = _wave_subdir(wave_id)
+    pending = list_pending.remote(wave_id=wave_id)
     if not pending:
         print("Nothing to extract — all tokenized songs already have chroma")
         return
 
     chunks = [pending[i:i + batch] for i in range(0, len(pending), batch)]
     print(f"Dispatching {len(pending)} songs in {len(chunks)} batches of {batch}...")
-    extractor = MelodyExtractor()
+    extractor = MelodyExtractor(subdir=sub)
     t0 = time.time()
     tot_done = tot_missing = tot_failed = 0
     n_chunks_seen = 0
@@ -166,9 +184,10 @@ def orchestrate(batch: int = _BATCH):
 
 
 @app.local_entrypoint()
-def main(batch: int = _BATCH):
-    """Spawn the remote orchestrator and return (use with --detach)."""
-    call = orchestrate.spawn(batch)
+def main(batch: int = _BATCH, wave_id: str = ""):
+    """Spawn the remote orchestrator and return (use with --detach).
+    --wave-id N scopes to /…/waves/wave_N."""
+    call = orchestrate.spawn(batch, wave_id=wave_id)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("monitor with: modal app logs nano-melody "
           "(safe to close terminal if launched with --detach)")
