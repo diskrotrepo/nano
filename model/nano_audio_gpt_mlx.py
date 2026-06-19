@@ -681,21 +681,84 @@ class MLXNanoAudioGPT(mnn.Module):
                 mel_on["mel"] = mel_pos
                 stages.append(mel_on)
                 scales.append(melody_cfg_scale)
-        for s in stages:
-            s["caches"] = self._new_caches(B, T_delay)
+        # --- Batch the guidance stages into ONE forward ----------------------
+        # Each decode step needs len(stages) forward passes (baseline + one per
+        # guidance axis: tags / lyrics / melody). Single-token decode is
+        # memory-bandwidth-bound — the model's weights are streamed from memory
+        # once per forward regardless of batch — so running the S stages as ONE
+        # batched forward (batch S*B) costs ≈ a single B forward instead of S of
+        # them (the big win for /cover and lyric-guided gen, which stack 3–4
+        # stages). The stages share the SAME input tokens (we sample one sequence
+        # from the *combined* logits) and differ only in conditioning, so we tile
+        # the tokens and stack each stage's conditioning along the batch dim.
+        # Cross-attn projections are bias-free, so a zeros conditioning row
+        # contributes exactly 0 — identical to skipping it — which lets every row
+        # share one uniform forward (the "off" rows just carry zeros). Verified
+        # logit-identical to the per-stage loop (tests/test_mlx_parity.py).
+        S = len(stages)
+        D = cfg.d_model
+
+        def _stack_text():
+            reals = [s["text"] for s in stages if s["text"] is not None]
+            if not reals:
+                return None
+            # Text cross-attn takes NO padding mask, so a zero "off" row must match
+            # the real text length to contribute nothing (V=0 → 0) without diluting
+            # the softmax. Real text is the pooled CLAP vector — length 1 in
+            # production (style-audio blends still pool to 1), so there is only ever
+            # one real length; null rows pad to it.
+            Lt = reals[0].shape[1]
+            zero = mx.zeros((B, Lt, D), dtype=self._dtype)
+            return mx.concatenate(
+                [s["text"] if s["text"] is not None else zero for s in stages], axis=0
+            )
+
+        def _stack_melody():
+            if not self.has_melody:
+                return None  # additive null handled inside __call__
+            return mx.concatenate([s["mel"] for s in stages], axis=0)
+
+        def _stack_lyric():
+            if all(s["lemb"] is None for s in stages):
+                return None, None
+            Lmax = max(s["lemb"].shape[1] for s in stages if s["lemb"] is not None)
+            embs, masks = [], []
+            for s in stages:
+                if s["lemb"] is None:
+                    # Null lyric: zero emb + an all-finite (all-attend) mask so the
+                    # softmax is well-defined; V=0 makes the contribution exactly 0.
+                    embs.append(mx.zeros((B, Lmax, D), dtype=self._dtype))
+                    masks.append(mx.zeros((B, 1, 1, Lmax), dtype=self._dtype))
+                    continue
+                emb, msk, L = s["lemb"], s["lkv"], s["lemb"].shape[1]
+                if L < Lmax:  # pad to the common length; mask the pad out (-inf)
+                    emb = mx.concatenate(
+                        [emb, mx.zeros((B, Lmax - L, D), dtype=emb.dtype)], axis=1)
+                    msk = mx.concatenate(
+                        [msk, mx.full((B, 1, 1, Lmax - L), NEG_INF, dtype=msk.dtype)], axis=-1)
+                embs.append(emb)
+                masks.append(msk)
+            return mx.concatenate(embs, axis=0), mx.concatenate(masks, axis=0)
+
+        text_b = _stack_text()
+        mel_b = _stack_melody()
+        lemb_b, lkv_b = _stack_lyric()
+        caches_b = self._new_caches(S * B, T_delay)
 
         def _run(inp, start):
-            for s in stages:
-                s["logits"] = self(
-                    inp, caches=s["caches"], start_pos=start,
-                    text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
-                    melody_emb=s["mel"],
-                )
+            inp_b = mx.tile(inp, (S, 1, 1)) if S > 1 else inp
+            return self(
+                inp_b, caches=caches_b, start_pos=start,
+                text_emb=text_b, lyric_emb=lemb_b, lyric_kv_mask=lkv_b, melody_emb=mel_b,
+            )
 
-        def _combine():
-            out = stages[0]["logits"]
+        def _combine(logits_b):
+            if S == 1:
+                return logits_b
+            parts = [logits_b[i * B:(i + 1) * B] for i in range(S)]
+            out = parts[0]
             for i, sc in enumerate(scales):
-                out = out + sc * (stages[i + 1]["logits"] - stages[i]["logits"])
+                out = out + sc * (parts[i + 1] - parts[i])
             return out
 
         def _emit(s, e):
@@ -705,17 +768,15 @@ class MLXNanoAudioGPT(mnn.Module):
             return torch.from_numpy(np.array(chunk, copy=False)).to(torch.long)
 
         prefill_len = max(1, T_prompt)
-        _run(tokens[:, :, :prefill_len], 0)
-        logits = _combine()
-        mx.eval(logits, [c.k for c in stages[0]["caches"]])
+        logits = _combine(_run(tokens[:, :, :prefill_len], 0))
+        mx.eval(logits, [c.k for c in caches_b])
 
         emitted = 0  # count of new frames already yielded
         threshold = first_emit
         for pos in range(prefill_len, T_delay):
             if pos > prefill_len:
                 inp = tokens[:, :, pos - 1:pos]
-                _run(inp, pos - 1)
-                logits = _combine()
+                logits = _combine(_run(inp, pos - 1))
 
             step = logits[:, :, -1, :]  # [B, K, V]
             # Mask all control ids (pad, plus FIM <SUF>/<MID> when use_fim) so the
