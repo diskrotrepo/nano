@@ -728,20 +728,26 @@ class NanoAudioGPT(nn.Module):
         return out.squeeze(0) if squeeze_batch else out
 
     def _resolve_prompt(
-        self, prompt: torch.Tensor | None
+        self, prompt: torch.Tensor | None, batch_size: int = 1
     ) -> tuple[torch.Tensor, bool]:
         """Resolve generate()'s prompt arg to a batched [B, K, T_prompt] tensor.
 
-        prompt=None -> a single random DAC seed column (the from-scratch path); a
-        2D [K, T] prompt is unsqueezed to [1, K, T] and squeeze_batch=True is
-        returned so the caller can squeeze the result back to 2D.
+        prompt=None -> a random DAC seed column (the from-scratch path); with
+        batch_size>1, B INDEPENDENT random seed columns [B, K, 1] (each row a
+        distinct from-scratch clip — the batched-generation path). A 2D [K, T]
+        prompt is unsqueezed to [1, K, T] and squeeze_batch=True is returned so the
+        caller can squeeze the result back to 2D. batch_size is only consulted when
+        prompt is None; an explicit prompt carries its own batch dim. (batch_size=1
+        reproduces the original [K, 1] seed exactly, so the B=1 path is unchanged.)
         """
         if prompt is None:
             device = next(self.parameters()).device
+            shape = (
+                (self.cfg.n_codebooks, 1) if batch_size == 1
+                else (batch_size, self.cfg.n_codebooks, 1)
+            )
             prompt = torch.randint(
-                0, self.cfg.vocab_per_codebook,
-                (self.cfg.n_codebooks, 1),
-                device=device,
+                0, self.cfg.vocab_per_codebook, shape, device=device,
             )
         squeeze_batch = prompt.dim() == 2
         if squeeze_batch:

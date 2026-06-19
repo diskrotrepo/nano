@@ -1,0 +1,34 @@
+[
+  {
+    "setting": "cfg3.0_HOT_FLAT",
+    "cfg_scale": 3.0,
+    "profile": "HOT_FLAT",
+    "prompt": "synthwave",
+    "clip": 0,
+    "file": "eval/sweep/samples/best_inference_step97000/cfg3.0_HOT_FLAT__synthwave__c0.mp3",
+    "rms": 0.41852042078971863,
+    "beat": 0.5755158566197784,
+    "sil": 0.013589324618736383,
+    "centroid": 523.6315745580329,
+    "collapse": 0.3296677703741944,
+    "clap": 0.30363,
+    "score": 0.2649309103058139,
+    "gen_sec": 256.2
+  },
+  {
+    "setting": "cfg3.0_HOT_FLAT",
+    "cfg_scale": 3.0,
+    "profile": "HOT_FLAT",
+    "prompt": "liquid_dnb",
+    "clip": 0,
+    "file": "eval/sweep/samples/best_inference_step97000/cfg3.0_HOT_FLAT__liquid_dnb__c0.mp3",
+    "rms": 0.3525635898113251,
+    "beat": 0.4737023870580642,
+    "sil": 0.0108909767610748,
+    "centroid": 2779.910768399847,
+    "collapse": 0.2739032688566085,
+    "clap": 0.060093,
+    "score": 0.15341130356370442,
+    "gen_sec": 100.1
+  }
+]

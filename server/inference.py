@@ -357,6 +357,64 @@ class InferenceEngine:
 
         return tag_emb, lyric_ids, lyric_mask
 
+    def _stack_conditioning(
+        self,
+        per_item: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Stack a list of per-item ``_build_conditioning`` results into one batch.
+
+        Input is ``B`` tuples of ``(tag_emb [1,1,D] | None, lyric_ids [1,L] | None,
+        lyric_mask [1,L] | None)``; output is the batched
+        ``(tag_emb [B,1,D] | None, lyric_ids [B,Lmax] | None, lyric_mask [B,Lmax] |
+        None)`` the model's batch-general decode loop consumes.
+
+        Two NaN/equivalence subtleties make this non-trivial:
+        - **Tags:** a row without tags gets a ZERO embedding, which (with qk-norm,
+          ``RMSNorm(0)==0``) is *exactly* "skip text conditioning" for that row —
+          so a mixed present/absent batch is well-defined. If no row has tags the
+          whole axis is ``None`` (the model skips it entirely).
+        - **Lyrics:** ``encode_lyrics`` masks padded positions with ``-inf``, and a
+          *fully* padded row would NaN the cross-attn softmax. So when the batch has
+          any lyrics, rows without their own stream are given the minimal BOS+header
+          stream (``text_with_markers_to_phoneme_ids("")`` — the same wordless
+          header the model trains on, never fully padded). If no row has lyrics the
+          axis is ``None``."""
+        B = len(per_item)
+        tags = [t for (t, _, _) in per_item]
+        lyr = [l for (_, l, _) in per_item]
+
+        if all(t is None for t in tags):
+            tag_emb = None
+        else:
+            ref = next(t for t in tags if t is not None)
+            zero = torch.zeros(1, 1, ref.shape[-1], dtype=ref.dtype, device=ref.device)
+            tag_emb = torch.cat([t if t is not None else zero for t in tags], dim=0)
+
+        if all(l is None for l in lyr):
+            lyric_ids = lyric_mask = None
+        else:
+            from model.lyric_encoder import (
+                BOS_PHONEME_ID, PAD_PHONEME_ID, text_with_markers_to_phoneme_ids,
+            )
+
+            rows: list[torch.Tensor] = []
+            for l in lyr:
+                if l is not None:
+                    rows.append(l[0])  # [L_i]
+                else:  # synthesize the wordless BOS+header stream (never fully padded)
+                    ids = text_with_markers_to_phoneme_ids(
+                        "", max_len=self.model.cfg.max_lyric_len
+                    ) or [BOS_PHONEME_ID]
+                    rows.append(torch.tensor(ids, dtype=torch.long, device=self.device))
+            Lmax = max(r.shape[0] for r in rows)
+            lyric_ids = torch.full(
+                (B, Lmax), PAD_PHONEME_ID, dtype=torch.long, device=self.device
+            )
+            for i, r in enumerate(rows):
+                lyric_ids[i, : r.shape[0]] = r
+            lyric_mask = lyric_ids != PAD_PHONEME_ID
+        return tag_emb, lyric_ids, lyric_mask
+
     def _build_melody(self, melody_audio_bytes: bytes) -> "torch.Tensor":
         """Chroma for the uploaded hum -> melody tensor [1, T, 12] on device.
 
@@ -751,6 +809,86 @@ class InferenceEngine:
             finally:
                 os.unlink(tmp)
         return body, mime, clap
+
+    @torch.no_grad()
+    def generate_audio_batch(
+        self,
+        requests: list[dict],
+        seconds: float = 30.0,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 7.0,
+        lyric_cfg_scale: float | None = None,
+        on_item=None,
+    ) -> list[tuple[bytes, str]]:
+        """Generate B clips from scratch in ONE batched forward — the throughput
+        path behind POST /generate_batch ("generate 8 at once" on a single GPU).
+
+        Because autoregressive decode is memory-bandwidth-bound (each step streams
+        all ~2B weights from HBM regardless of batch), B clips cost ≈ the wall-clock
+        of one. The model's decode loop is already batch-general; this method only
+        builds the batched prompt/conditioning and decodes each row to its own mp3.
+
+        ``requests``: one dict per clip with keys ``text`` / ``negative_text`` /
+        ``gender`` / ``bpm`` (all optional). ``seconds``, the sampling ladder,
+        ``cfg_scale`` and ``lyric_cfg_scale`` are SHARED across the batch — the
+        decode loop applies one set batch-wide (per-item sampling/length would mean
+        un-batching the sampler; not worth it). ``on_item(i, body, mime)`` is called
+        as each clip finishes encoding, so the caller can persist/emit eagerly.
+
+        Returns ``[(body, mime), ...]`` in request order."""
+        if not requests:
+            return []
+        B = len(requests)
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        seed_frames = 1
+        new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
+        if seed_frames + new_frames > max_total:
+            new_frames = max(0, max_total - seed_frames)
+        if new_frames == 0:
+            raise ValueError("Requested duration exceeds model context limit.")
+
+        pos = [
+            self._build_conditioning(r.get("text"), gender=r.get("gender"), bpm=r.get("bpm"))
+            for r in requests
+        ]
+        neg = [self._build_conditioning(r.get("negative_text")) for r in requests]
+        cond_emb, cond_lids, cond_lmask = self._stack_conditioning(pos)
+        neg_emb, neg_lids, neg_lmask = self._stack_conditioning(neg)
+
+        prompt, _ = self.model._resolve_prompt(None, batch_size=B)  # [B, K, 1]
+        has_cond = any(
+            x is not None for x in (cond_emb, neg_emb, cond_lids, neg_lids)
+        )
+        out = self.model.generate(
+            prompt=prompt, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale if has_cond else 1.0,
+            lyric_cfg_scale=lyric_cfg_scale,
+        )  # [B, K, seed_frames + new_frames]
+        out = out[:, :, seed_frames:].cpu()  # strip seed -> [B, K, new_frames]
+
+        results: list[tuple[bytes, str]] = []
+        for i in range(B):
+            wav = self.codec.decode(out[i])  # [samples]
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            meta = self._gen_metadata(
+                "generate", text=requests[i].get("text"),
+                negative_text=requests[i].get("negative_text"),
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                cfg_scale=cfg_scale, seconds=seconds,
+            )
+            body, mime = _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
+            if on_item is not None:
+                on_item(i, body, mime)
+            results.append((body, mime))
+        return results
 
     def _decode_chunk(
         self, all_new: torch.Tensor, f0: int, f1: int, ctx: int, hop: int

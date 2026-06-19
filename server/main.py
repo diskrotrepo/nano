@@ -32,11 +32,19 @@ from datetime import datetime, timezone
 
 import glob
 
+import base64
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from server.inference import InferenceEngine
+
+# Upper bound on a single batched generation. Decode is memory-bandwidth-bound so
+# the wall-clock barely grows with B, but the KV cache scales linearly with it;
+# 8 fits a 30s clip on an H100 with huge headroom (see the plan's budget).
+MAX_BATCH = int(os.environ.get("NANO_MAX_BATCH", "8"))
 
 # --- Model registry (switch between checkpoints at serve time) ---------------
 # The server can hold several named checkpoints (e.g. "full"=v8_sing4 and
@@ -393,6 +401,164 @@ async def generate_endpoint(
     return Response(content=body, media_type=mime, headers=headers)
 
 
+class BatchItem(BaseModel):
+    """One clip in a /generate_batch request. Any field left unset inherits the
+    batch-level shared default of the same name."""
+    prompt: str | None = None
+    lyrics: str | None = None
+    gender: str | None = None
+    bpm: float | None = None
+    negative_prompt: str | None = None
+    req_id: str | None = None
+
+
+class BatchRequest(BaseModel):
+    """Generate several clips in ONE batched forward ("8 at once" on one GPU).
+
+    Two ways to specify the batch:
+    - ``items``: an explicit list of per-clip params (many DIFFERENT prompts), each
+      inheriting the shared fields below where unset.
+    - ``count`` (with no ``items``): N identical TAKES of the shared prompt/lyrics.
+
+    Sampling, cfg, and ``seconds`` are shared across the batch (the decode loop
+    applies one set batch-wide)."""
+    items: list[BatchItem] | None = None
+    count: int = 1
+    # shared conditioning (defaults for items, or the prompt replicated `count`x)
+    prompt: str = ""
+    lyrics: str = ""
+    gender: str = ""
+    bpm: float = 0.0
+    negative_prompt: str = ""
+    # shared sampling / guidance
+    seconds: float = 30.0
+    temperature: float = 0.9
+    top_k: int = 50
+    top_p: float = 0.95
+    per_cb_temperature: str = "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"
+    per_cb_top_k: str = "120,90,70,50,36,26,18,12,8"
+    per_cb_top_p: str = ""
+    cfg_scale: float = 7.0
+    lyric_cfg_scale: float = 0.0
+    sweeten: bool = True
+    model: str = ""
+
+
+@app.post("/generate_batch")
+def generate_batch_endpoint(req: BatchRequest) -> dict:
+    """Generate up to NANO_MAX_BATCH clips from scratch in a SINGLE batched run.
+
+    Because autoregressive decode is memory-bandwidth-bound, B clips cost ≈ the
+    wall-clock of one — so this is the cheap "generate 8 at once" path (one GPU,
+    one batched forward) as opposed to fanning N requests across N containers.
+
+    Returns a JSON manifest: ``{"items": [{req_id, mime, sweetened_prompt,
+    audio_b64}, ...], "count", "seconds"}``. Each clip is returned inline as base64
+    (works with no server-side persistence) AND saved to OUTPUT_DIR when configured
+    (fetchable later via GET /outputs/{req_id})."""
+    _get_engine(req.model)
+    assert engine is not None
+    if req.seconds <= 0:
+        raise HTTPException(400, "seconds must be > 0")
+
+    # Resolve the batch into a flat list of per-clip param dicts.
+    raw_items = req.items if req.items else [BatchItem() for _ in range(max(1, req.count))]
+    if not raw_items:
+        raise HTTPException(400, "empty batch")
+    if len(raw_items) > MAX_BATCH:
+        raise HTTPException(400, f"batch too large: {len(raw_items)} > NANO_MAX_BATCH={MAX_BATCH}")
+
+    def _pick(item_val, shared_val):
+        return item_val if item_val is not None else shared_val
+
+    # Sweeten each DISTINCT prompt once (N identical takes -> one LLM call).
+    sweet_cache: dict[str, tuple[str, dict]] = {}
+
+    def _sweet(p: str) -> str:
+        if p not in sweet_cache:
+            sweet_cache[p] = _maybe_sweeten(p, req.sweeten)
+        return sweet_cache[p][0]
+
+    manifest: list[dict] = []
+    gen_requests: list[dict] = []
+    for n, item in enumerate(raw_items):
+        prompt = _pick(item.prompt, req.prompt)
+        lyrics = _pick(item.lyrics, req.lyrics)
+        gender = _pick(item.gender, req.gender)
+        bpm = _pick(item.bpm, req.bpm)
+        neg = _pick(item.negative_prompt, req.negative_prompt)
+        sweetened = _sweet(prompt)
+        gen_requests.append({
+            "text": _combine_text_lyrics(sweetened, lyrics),
+            "negative_text": neg.strip() or None,
+            "gender": _norm_gender(gender),
+            "bpm": bpm or None,
+        })
+        req_id = (item.req_id or "").strip() or f"b{n}{uuid.uuid4().hex[:10]}"
+        manifest.append({"req_id": req_id, "sweetened_prompt": sweetened, "_prompt": prompt})
+
+    def _on_item(i: int, body: bytes, mime: str) -> None:
+        ext = "mp3" if "mpeg" in mime else "wav"
+        name = _output_name("generate", manifest[i]["_prompt"], ext, uid=manifest[i]["req_id"])
+        _save_named(body, name)
+        manifest[i]["mime"] = mime
+        manifest[i]["audio_b64"] = base64.b64encode(body).decode("ascii")
+        manifest[i]["file"] = name
+
+    try:
+        engine.generate_audio_batch(
+            gen_requests,
+            seconds=req.seconds,
+            temperature=_parse_per_cb_temp(req.per_cb_temperature, req.temperature),
+            top_k=_parse_per_cb_topk(req.per_cb_top_k, req.top_k),
+            top_p=_parse_per_cb_topp(req.per_cb_top_p, req.top_p),
+            cfg_scale=req.cfg_scale,
+            lyric_cfg_scale=req.lyric_cfg_scale or None,
+            on_item=_on_item,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    for m in manifest:
+        m.pop("_prompt", None)
+    return {"items": manifest, "count": len(manifest), "seconds": req.seconds}
+
+
+def _generate_stream_response(
+    *, seconds, temperature, top_k, top_p, per_cb_temperature, per_cb_top_k,
+    per_cb_top_p, cfg_scale, prompt, lyrics, gender, bpm, negative_prompt,
+    sweeten, lyric_cfg_scale, req_id, model,
+) -> StreamingResponse:
+    """Shared body for the GET and POST /generate_stream endpoints."""
+    _get_engine(model)
+    assert engine is not None
+    if seconds <= 0:
+        raise HTTPException(400, "seconds must be > 0")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    combined = _combine_text_lyrics(prompt, lyrics)
+    name = _output_name("generate", prompt, "mp3", uid=req_id or None)
+
+    stream = engine.generate_audio_stream(
+        seconds=seconds,
+        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+        cfg_scale=cfg_scale,
+        text=combined,
+        negative_text=negative_prompt.strip() or None,
+        lyric_cfg_scale=lyric_cfg_scale or None,
+        gender=_norm_gender(gender),
+        bpm=bpm or None,
+        on_complete=lambda body, mime: _save_named(body, name),
+    )
+    headers = dict(sweet_headers)
+    headers["X-Nano-Output-File"] = name
+    headers["Access-Control-Expose-Headers"] = (
+        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+    )
+    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
+
+
 @app.get("/generate_stream")
 def generate_stream_endpoint(
     seconds: float = 30.0,
@@ -424,34 +590,48 @@ def generate_stream_endpoint(
     Pass a client-generated `req_id`; the canonical gapless clip is saved under a
     filename ending in that id, so the client can fetch it from GET /outputs/{id}
     after playback for download / accurate duration / a gapless re-listen.
-    """
-    _get_engine(model)
-    assert engine is not None
-    if seconds <= 0:
-        raise HTTPException(400, "seconds must be > 0")
-    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
-    name = _output_name("generate", prompt, "mp3", uid=req_id or None)
 
-    stream = engine.generate_audio_stream(
-        seconds=seconds,
-        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
-        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
-        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
-        cfg_scale=cfg_scale,
-        text=combined,
-        negative_text=negative_prompt.strip() or None,
-        lyric_cfg_scale=lyric_cfg_scale or None,
-        gender=_norm_gender(gender),
-        bpm=bpm or None,
-        on_complete=lambda body, mime: _save_named(body, name),
+    Lyrics longer than a GET URL can carry should use POST /generate_stream.
+    """
+    return _generate_stream_response(
+        seconds=seconds, temperature=temperature, top_k=top_k, top_p=top_p,
+        per_cb_temperature=per_cb_temperature, per_cb_top_k=per_cb_top_k,
+        per_cb_top_p=per_cb_top_p, cfg_scale=cfg_scale, prompt=prompt,
+        lyrics=lyrics, gender=gender, bpm=bpm, negative_prompt=negative_prompt,
+        sweeten=sweeten, lyric_cfg_scale=lyric_cfg_scale, req_id=req_id, model=model,
     )
-    headers = dict(sweet_headers)
-    headers["X-Nano-Output-File"] = name
-    headers["Access-Control-Expose-Headers"] = (
-        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+
+
+@app.post("/generate_stream")
+def generate_stream_post_endpoint(
+    seconds: float = Form(30.0),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form("1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"),
+    per_cb_top_k: str = Form("120,90,70,50,36,26,18,12,8"),
+    per_cb_top_p: str = Form(""),
+    cfg_scale: float = Form(7.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    gender: str = Form(""),
+    bpm: float = Form(0.0),
+    negative_prompt: str = Form(""),
+    sweeten: bool = Form(True),
+    lyric_cfg_scale: float = Form(0.0),
+    req_id: str = Form(""),
+    model: str = Form(""),
+) -> StreamingResponse:
+    """POST form variant of GET /generate_stream — same progressive MP3 stream,
+    but lyrics ride the request body, so long lyrics that would overflow a GET URL
+    still stream (instead of dropping to a no-progress buffered POST /generate)."""
+    return _generate_stream_response(
+        seconds=seconds, temperature=temperature, top_k=top_k, top_p=top_p,
+        per_cb_temperature=per_cb_temperature, per_cb_top_k=per_cb_top_k,
+        per_cb_top_p=per_cb_top_p, cfg_scale=cfg_scale, prompt=prompt,
+        lyrics=lyrics, gender=gender, bpm=bpm, negative_prompt=negative_prompt,
+        sweeten=sweeten, lyric_cfg_scale=lyric_cfg_scale, req_id=req_id, model=model,
     )
-    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
 
 
 @app.get("/outputs/{name}")

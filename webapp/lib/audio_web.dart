@@ -50,8 +50,12 @@ class AudioBlob {
 Future<Uint8List> fetchAudioStream(
   String url, {
   void Function(int receivedBytes)? onProgress,
+  web.RequestInit? requestInit,
 }) async {
-  final resp = await web.window.fetch(url.toJS).toDart;
+  final resp = await (requestInit == null
+          ? web.window.fetch(url.toJS)
+          : web.window.fetch(url.toJS, requestInit))
+      .toDart;
   if (resp.status != 200) {
     throw Exception('stream HTTP ${resp.status}');
   }
@@ -92,22 +96,25 @@ bool mseMp3Supported() {
   }
 }
 
-/// Build a POST `RequestInit` carrying a multipart form (text [fields] plus one
-/// uploaded file) — used to stream /extend and /cover, which need a file upload a
-/// GET URL can't carry. Pass the result to [MseStream]'s `requestInit`.
+/// Build a POST `RequestInit` carrying a multipart form ([fields], plus an
+/// optional uploaded file). extend/cover need the file upload a GET URL can't
+/// carry; generate uses the file-less form when long lyrics would overflow the
+/// GET query. Pass the result to [MseStream] / [fetchAudioStream]'s `requestInit`.
 web.RequestInit streamPostInit({
   required Map<String, String> fields,
-  required String fileField,
-  required Uint8List fileBytes,
-  required String fileName,
+  String? fileField,
+  Uint8List? fileBytes,
+  String? fileName,
 }) {
   final fd = web.FormData();
   fields.forEach((k, v) => fd.append(k, v.toJS));
-  final blob = web.Blob(
-    [fileBytes.toJS].toJS,
-    web.BlobPropertyBag(type: 'application/octet-stream'),
-  );
-  fd.append(fileField, blob, fileName);
+  if (fileField != null && fileBytes != null) {
+    final blob = web.Blob(
+      [fileBytes.toJS].toJS,
+      web.BlobPropertyBag(type: 'application/octet-stream'),
+    );
+    fd.append(fileField, blob, fileName ?? 'upload');
+  }
   return web.RequestInit(method: 'POST', body: fd);
 }
 

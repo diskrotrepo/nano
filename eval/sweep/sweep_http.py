@@ -64,7 +64,9 @@ def _form_for_profile(setting: dict) -> dict:
 
 
 def ckpt_tag(base: str) -> str:
-    h = requests.get(f"{base}/health", timeout=30).json()
+    # Generous timeout: a cold Modal container loads the ~2B model + DAC + CLAP +
+    # sweetener (can exceed a minute) before /health responds.
+    h = requests.get(f"{base}/health", timeout=300).json()
     if not h.get("text_conditioning"):
         raise SystemExit(
             "server reports text_conditioning: false -> CFG is a no-op; "
@@ -163,8 +165,13 @@ def main():
     ap.add_argument("--stage", type=int, default=1)
     ap.add_argument("--top-n", type=int, default=4)
     ap.add_argument("--smoke", action="store_true", help="one 3s gen, sanity only")
+    ap.add_argument("--seconds", type=float, default=None,
+                    help="clip length override (default config.SECONDS=8); "
+                         "gen_one reads C.SECONDS at call time")
     args = ap.parse_args()
     base = args.base.rstrip("/")
+    if args.seconds is not None:
+        C.SECONDS = args.seconds  # module-wide override picked up by gen_one
 
     tag = ckpt_tag(base)
     print(f"[sweep] base={base}  ckpt_tag={tag}")

@@ -149,6 +149,17 @@ ckpts_vol = modal.Volume.from_name("nano-ckpts", create_if_missing=True)
 output_vol = modal.Volume.from_name("nano-output", create_if_missing=True)
 
 
+# Horizontal scale-out: how many GPU containers Modal may run in parallel, so a
+# burst of N requests (e.g. the webapp's "generate 8") fans out to N containers
+# instead of serializing on one. Each container still runs ONE generation at a
+# time (max_inputs=1, KV-cache safety) — true server-side batching (8 clips in
+# one batched forward on a single GPU) is the cheaper companion via POST
+# /generate_batch. Set NANO_MIN_CONTAINERS=1 to keep one always warm (kills the
+# cold-start tax on the first burst, at the cost of idle GPU time).
+_MAX_CONTAINERS = int(os.environ.get("NANO_MAX_CONTAINERS", "8"))
+_MIN_CONTAINERS = int(os.environ.get("NANO_MIN_CONTAINERS", "0"))
+
+
 @app.function(
     image=image,
     gpu="H100",  # autoregressive decode is memory-bandwidth-bound: each token
@@ -157,13 +168,15 @@ output_vol = modal.Volume.from_name("nano-output", create_if_missing=True)
     # model fine but are bandwidth-starved on long 90s gens.)
     volumes={"/ckpts": ckpts_vol, "/outputs": output_vol},
     # Keep a warm container for 5 min after the last request so back-to-back
-    # generations don't each pay the model-load cold start. Set min_containers=1
-    # to keep one always warm (costs idle GPU time).
+    # generations don't each pay the model-load cold start.
     scaledown_window=300,
+    min_containers=_MIN_CONTAINERS,
+    max_containers=_MAX_CONTAINERS,
     timeout=60 * 10,  # a 90s single-shot gen on L4 is minutes, not seconds.
 )
 # Generation is GPU-bound and the engine's static KV cache is not safe to share
-# across concurrent generations — serialize requests onto each container.
+# across concurrent generations — serialize requests onto each container (and let
+# max_containers handle concurrency by spreading them across containers).
 @modal.concurrent(max_inputs=1)
 @modal.asgi_app()
 def serve():
@@ -172,6 +185,11 @@ def serve():
     # (its default detection only knows MPS/CPU locally).
     os.environ.setdefault("NANO_DEVICE", "cuda")
     os.environ.setdefault("NANO_OUTPUT_DIR", "/outputs")
+    # Decode runs ~2x faster compiled (fusion, mode="default") and the decode loop
+    # falls back to eager on any compile error (identical tokens), so it's the safe
+    # production default. NOT "graphs" — CUDA-graph capture intermittently NaNs on
+    # this model. An explicit local NANO_COMPILE (forwarded into the image) wins.
+    os.environ.setdefault("NANO_COMPILE", "default")
     # NANO_MODELS ("fast=/ckpts/v8_distill/best_inference.pt,full=/ckpts/v8_sing4/
     # best_inference.pt") registers several switchable checkpoints; the request's
     # `model` field picks one, the rest lazy-load. When it's set the server reads

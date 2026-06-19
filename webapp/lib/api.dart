@@ -235,7 +235,9 @@ class NanoApi {
       'req_id': reqId,
       'model': p.model,
     };
-    if (mode == NanoMode.extend) {
+    if (mode == NanoMode.generate) {
+      f['seconds'] = p.seconds.toString();
+    } else if (mode == NanoMode.extend) {
       f['add_seconds'] = p.addSeconds.toString();
       f['overlap_seconds'] = p.overlapSeconds.toString();
       f['from_seconds'] = p.fromSeconds.toString();
