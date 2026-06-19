@@ -25,6 +25,8 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import corpus_mount
+
 app = modal.App("nano-tokenize")
 
 
@@ -62,7 +64,7 @@ image = (
     .add_local_python_source("model", "diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 

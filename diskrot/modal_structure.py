@@ -22,6 +22,8 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import corpus_mount, wave_subdir
+
 app = modal.App("nano-structure")
 
 
@@ -86,7 +88,7 @@ image = (
     .add_local_python_source("model", "diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 
@@ -175,13 +177,16 @@ STRUCTURE_DIR = "/tokens/structure"
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending() -> list[str]:
-    """Return mp3 filenames not yet in the sharded structure dir."""
+def list_pending(wave_id: str = "") -> list[str]:
+    """Return mp3 names (relative to /corpus) not yet in the sharded structure
+    dir. ``wave_id`` scopes the glob to /corpus/waves/wave_<id>; structure shards
+    key on the song stem either way."""
     from diskrot.structure import load_structure_shards
 
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     existing = load_structure_shards(STRUCTURE_DIR)
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
+               if mp3.stem not in existing]
     print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, {len(pending)} pending")
     return pending
 
@@ -252,8 +257,10 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     nonpreemptible=True,
     retries=modal.Retries(max_retries=3, backoff_coefficient=1.0, initial_delay=10.0),
 )
-def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
+def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
+                wave_id: str = ""):
     """Dispatch analysis and merge results into the sharded structure dir.
+    ``wave_id`` scopes the pass to /corpus/waves/wave_<id>.
 
     Runs the ``.map()`` collect/flush loop *remotely* so ``--detach`` survives
     terminal close. ``limit`` (>0) caps the number of pending files dispatched —
@@ -261,7 +268,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
     shards, so re-launching resumes. ``batch_size`` songs share one allin1 call
     (one demucs subprocess + one ensemble load per chunk instead of per song).
     """
-    pending = list_pending.remote()
+    pending = list_pending.remote(wave_id=wave_id)
     if limit and limit > 0:
         pending = pending[:limit]
     if not pending:
@@ -303,14 +310,16 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
+def main(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
+         wave_id: str = ""):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` (both pieces required: ``.spawn()`` so the entrypoint
     exits without blocking, and ``--detach`` so the app isn't auto-stopped when
     the entrypoint completes). ``--limit 200`` runs the calibration subset.
+    --wave-id N scopes analysis to /corpus/waves/wave_N.
     """
-    call = orchestrate.spawn(flush_every, limit, batch_size)
+    call = orchestrate.spawn(flush_every, limit, batch_size, wave_id=wave_id)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

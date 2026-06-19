@@ -23,6 +23,8 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import corpus_mount, wave_subdir
+
 app = modal.App("nano-auto-tag")
 
 
@@ -60,7 +62,7 @@ orchestrator_image = (
     .add_local_python_source("diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 
@@ -124,17 +126,19 @@ class Captioner:
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
-def run_auto_tag(batch_size: int, flush_every_batches: int) -> None:
+def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "") -> None:
     """Full pass: list pending, fan out across Captioner containers, merge into
     tags.json with periodic flushes. Spawned from the local entrypoint so
-    the user can launch and walk away."""
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    the user can launch and walk away. ``wave_id`` scopes the input glob to
+    /corpus/waves/wave_<id>; tags.json keys stay the song stem either way."""
+    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     tags_path = Path("/tokens/tags.json")
     existing: dict = {}
     if tags_path.exists():
         existing = json.loads(tags_path.read_text())
 
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
+               if mp3.stem not in existing]
     if existing:
         print(f"RESUMING: {len(existing):,} of {len(mp3s):,} already captioned, "
               f"{len(pending):,} still pending", flush=True)
@@ -215,13 +219,15 @@ def run_auto_tag(batch_size: int, flush_every_batches: int) -> None:
 
 
 @app.local_entrypoint()
-def main(batch_size: int = 16, flush_every_batches: int = 4):
+def main(batch_size: int = 16, flush_every_batches: int = 4, wave_id: str = ""):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.
+    # --wave-id N scopes captioning to /corpus/waves/wave_N.
     fc = run_auto_tag.spawn(
         batch_size=batch_size,
         flush_every_batches=flush_every_batches,
+        wave_id=wave_id,
     )
     print(f"auto-tag launched (detached) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "

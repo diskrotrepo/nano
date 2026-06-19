@@ -14,6 +14,8 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import corpus_mount, wave_subdir
+
 app = modal.App("nano-transcribe")
 
 
@@ -44,7 +46,7 @@ image = (
     .add_local_python_source("model", "diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 
@@ -160,16 +162,19 @@ LOCK_STALE_SEC = 24 * 60 * 60
     # that's >1 GB of JSON — Modal's 300s default timeout is not enough.
     timeout=30 * 60,
 )
-def list_pending() -> list[str]:
-    """Return mp3 filenames not yet in the sharded lyrics dir."""
+def list_pending(wave_id: str = "") -> list[str]:
+    """Return mp3 names (relative to /corpus) not yet in the sharded lyrics dir.
+    ``wave_id`` scopes the glob to /corpus/waves/wave_<id>; lyrics shards key on
+    the song stem either way."""
     from diskrot.transcribe_lyrics import load_lyrics_shards
 
     # The orchestrator now calls this repeatedly (sweep loop) — a warm-reused
     # container must see the shards committed by save_results since it started.
     tokens_vol.reload()
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     existing = load_lyrics_shards(LYRICS_DIR)
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
+               if mp3.stem not in existing]
     print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, {len(pending)} pending")
     return pending
 
@@ -303,8 +308,9 @@ def _release_lock() -> None:
     # the file just stays pending.)
     nonpreemptible=True,
 )
-def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
+def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = ""):
     """Dispatch transcription and merge results into the sharded lyrics dir.
+    ``wave_id`` scopes the pass to /corpus/waves/wave_<id>.
 
     Runs the ``.map()`` collect/flush loop *remotely* (not in local_entrypoint)
     so ``--detach`` truly survives terminal close — the previous version ran
@@ -342,7 +348,7 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
         sweep = 0
         while True:
             sweep += 1
-            pending = list_pending.remote()
+            pending = list_pending.remote(wave_id=wave_id)
             if not pending:
                 print("Nothing to transcribe — all files already transcribed")
                 return
@@ -418,14 +424,15 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 5000, chunk_size: int = 3000):
+def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = ""):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are
     required: ``.spawn()`` so the entrypoint exits without blocking, and
     ``--detach`` so the app isn't auto-stopped when the entrypoint completes).
+    --wave-id N scopes transcription to /corpus/waves/wave_N.
     """
-    call = orchestrate.spawn(flush_every, chunk_size)
+    call = orchestrate.spawn(flush_every, chunk_size, wave_id=wave_id)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

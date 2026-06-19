@@ -52,6 +52,8 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import corpus_mount, wave_subdir
+
 app = modal.App("nano-prepare")
 
 image = (
@@ -59,7 +61,9 @@ image = (
     .apt_install("ffmpeg")  # ffprobe ships with ffmpeg
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+# read_only=False: prepare deletes undecodable/dup/too-long files in place
+# (works on the nano-corpus Volume or an object-storage bucket).
+corpus_vol = corpus_mount(read_only=False)
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 MIN_DURATION_S = 20.0
@@ -163,18 +167,21 @@ class Validator:
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending() -> tuple[list[str], dict, list[str]]:
-    """Return (mp3s not yet in manifest, current manifest, all mp3 names on disk)."""
+def list_pending(wave_id: str = "") -> tuple[list[str], dict, list[str]]:
+    """Return (mp3s not yet in manifest, current manifest, all mp3 names on disk).
+    Names are relative to /corpus (wave-prefixed when ``wave_id`` is set); the
+    manifest stays GLOBAL on /tokens so duplicates are caught across waves."""
     import json
 
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
-    all_names = [mp3.name for mp3 in mp3s]
+    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
+    all_names = [str(mp3.relative_to("/corpus")) for mp3 in mp3s]
     manifest_path = Path(MANIFEST_PATH)
     manifest: dict = {"version": 1, "files": {}}
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
     known = manifest.get("files", {})
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in known]
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
+               if mp3.stem not in known]
     print(f"found {len(mp3s):,} mp3s on volume, "
           f"{len(known):,} already in manifest, "
           f"{len(pending):,} pending validation")
@@ -326,15 +333,17 @@ def _build_report(
 def run_prepare(
     apply: bool = False,
     batch_size: int = 64,
+    wave_id: str = "",
 ):
     """Full prepare pass: list pending, validate across CPU containers, dedup,
     re-classify, then (if --apply) delete undecodable / too_short / duplicate /
     too_long files. Designed to be `.spawn()`-ed from the local entrypoint so
     the user can launch and walk away — progress and the dry-run report stream
-    to this orchestrator's container logs."""
+    to this orchestrator's container logs. ``wave_id`` scopes the pass to
+    /corpus/waves/wave_<id> (the dedup manifest stays global)."""
     from datetime import datetime, timezone
 
-    pending, manifest, all_names = list_pending.remote()
+    pending, manifest, all_names = list_pending.remote(wave_id=wave_id)
     manifest.setdefault("files", {})
     manifest["version"] = 1
 
@@ -435,13 +444,15 @@ def run_prepare(
 def main(
     apply: bool = False,
     batch_size: int = 64,
+    wave_id: str = "",
 ):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away. The
     # validation report and progress stream to the orchestrator's logs (watch
     # below), not this terminal — unlike the old inline entrypoint.
-    fc = run_prepare.spawn(apply=apply, batch_size=batch_size)
+    # --wave-id N scopes prepare to /corpus/waves/wave_N.
+    fc = run_prepare.spawn(apply=apply, batch_size=batch_size, wave_id=wave_id)
     mode = "apply" if apply else "dry-run"
     print(f"prepare launched (detached, {mode}) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "
