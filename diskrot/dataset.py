@@ -30,7 +30,12 @@ def _load_tags(tags_path: str | Path | None, verbose: bool = True) -> dict[str, 
     tp = Path(tags_path)
     if not tp.exists():
         return {}
-    raw = json.loads(tp.read_text())
+    # Sharded dir (tags/tags_NNN.json) at scale, or the legacy single tags.json.
+    if tp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(tp, "tags")
+    else:
+        raw = json.loads(tp.read_text())
     tags = {key: val["description"] for key, val in raw.items()
             if isinstance(val, dict) and "description" in val}
     if verbose:
@@ -85,7 +90,12 @@ def _load_keys(keys_path: str | Path | None, verbose: bool = True) -> dict[str, 
     kp = Path(keys_path)
     if not kp.exists():
         return {}
-    raw = json.loads(kp.read_text())
+    # Sharded dir (keys/keys_NNN.json) at scale, or the legacy single keys.json.
+    if kp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(kp, "keys")
+    else:
+        raw = json.loads(kp.read_text())
     keys = {name: val["key"] for name, val in raw.items()
             if isinstance(val, dict) and isinstance(val.get("key"), str)}
     if verbose:

@@ -39,6 +39,7 @@ BLOCKING_OK = {
     "modal_merge_lora.py",      # minutes — prints the pull command
     "modal_test_transcribe.py", # diagnostic probe, inline output
     "modal_wave_cleanup.py",    # quick per-wave inode reclaim; dry-run reports inline
+    "modal_shard_stores.py",    # one-time JSON->shards migration, seconds, inline
 }
 
 MODAL_RUN_RE = re.compile(
