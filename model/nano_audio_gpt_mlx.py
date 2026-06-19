@@ -7,11 +7,12 @@ transformer runs here — the DAC codec and CLAP text encoder stay on PyTorch/MP
 and exchange tensors at the boundaries.
 
 `MLXNanoAudioGPT` duck-types the parts of NanoAudioGPT that server/inference.py
-touches: `.cfg`, `.num_params()`, `.param_dtype`, and a `generate(...)` with the
-same signature/return semantics (accepts torch tensors, returns a torch
-LongTensor after revert_delay). The math is kept faithful to the PyTorch source so
-fp32 logits match within tolerance (see tests/test_mlx_parity.py); fp16 and
-quantized weights trade exact parity for speed.
+touches: `.cfg`, `.num_params()`, `.param_dtype`, `_resolve_prompt`,
+`_generate_stream` (streaming + batched gen), and a `generate(...)` with the same
+signature/return semantics (accepts torch tensors, returns a torch LongTensor of
+un-delayed frames). The math is kept faithful to the PyTorch source so fp32 logits
+match within tolerance (see tests/test_mlx_parity.py); fp16 and quantized weights
+trade exact parity for speed.
 
 Import is lazy from the engine: this module (and `mlx`) are only loaded on
 Apple-Silicon macOS.
@@ -25,7 +26,6 @@ import mlx.nn as mnn
 import numpy as np
 import torch
 
-from .delay_pattern import revert_delay
 from .nano_audio_gpt import GPTConfig
 
 NEG_INF = float("-inf")
@@ -99,6 +99,11 @@ class _LyricEncLayer(mnn.Module):
         self.ln1 = _RMSNorm(d)
         self.qkv = mnn.Linear(d, 3 * d, bias=False)
         self.proj = mnn.Linear(d, d, bias=False)
+        # Optional QK-norm on the encoder's own attention (GPTConfig.use_lyric_qk_norm,
+        # default off but ON in the trained v8 checkpoint). RMSNorm over head_dim.
+        head_dim = d // cfg.lyric_enc_heads
+        self.q_norm = _RMSNorm(head_dim) if cfg.use_lyric_qk_norm else None
+        self.k_norm = _RMSNorm(head_dim) if cfg.use_lyric_qk_norm else None
         self.ln2 = _RMSNorm(d)
         self.fc1 = mnn.Linear(d, cfg.lyric_enc_d_ff, bias=False)
         self.fc2 = mnn.Linear(cfg.lyric_enc_d_ff, d, bias=False)
@@ -250,8 +255,47 @@ class MLXNanoAudioGPT(mnn.Module):
             self._bits = 16
 
         mx.eval(self.parameters())
+        self._prime_kernels()
 
     # ---- construction helpers -------------------------------------------------
+
+    def _prime_kernels(self) -> None:
+        """Run one tiny generation NOW, on the construction (main) thread, so every
+        MLX GPU op is initialized here before the first request.
+
+        MLX lazily initializes each *distinct* GPU operation the first time it
+        runs, and that first init must happen on the thread that owns the default
+        GPU stream (the main / construction thread). The server drives generation
+        from ephemeral per-request producer threads (see server/inference.py
+        `_stream_mp3`), so any op that was *not* already initialized on the main
+        thread raises ``RuntimeError: There is no Stream(gpu, 0) in current
+        thread`` the first time a worker thread hits it. The decoder path is
+        covered by the server's warmup gen, but the lyric/melody encoders are not
+        (warmup passes no lyrics/melody) — so a lyrics or /cover request was the
+        first place those kernels ran, on a worker thread, and crashed. Exercising
+        every conditioning path here (decoder + 3-stage CFG combine + lyric encoder
+        + melody encoder + the sampling kernels) primes them all. Init is
+        shape-agnostic, so a tiny fixed-shape pass covers real requests of any
+        length. Best-effort: a hiccup here only forfeits priming, it must never
+        brick model construction."""
+        try:
+            cfg = self.cfg
+            frames = max(cfg.n_codebooks + 2, 32)  # run the decode loop + one emit
+            text = torch.zeros(1, 1, cfg.d_model)
+            kw: dict = dict(
+                num_new_frames=frames, temperature=0.9, top_k=5, top_p=0.95,
+                text_emb=text, text_emb_neg=text, cfg_scale=2.0,
+            )
+            if self.has_lyric:
+                ids = torch.ones(1, 4, dtype=torch.long)
+                msk = torch.ones(1, 4, dtype=torch.bool)
+                kw.update(lyric_ids=ids, lyric_mask=msk, lyric_ids_neg=ids,
+                          lyric_mask_neg=msk, lyric_cfg_scale=2.0)
+            if self.has_melody:
+                kw.update(melody=torch.zeros(1, frames, 12), melody_cfg_scale=2.0)
+            self.generate(prompt=None, **kw)
+        except Exception as e:  # noqa: BLE001 — priming is best-effort
+            print(f"[mlx] kernel prime skipped: {type(e).__name__}: {e}", flush=True)
 
     def _load_torch_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         weights: list[tuple[str, mx.array]] = []
@@ -368,6 +412,9 @@ class MLXNanoAudioGPT(mnn.Module):
             q = q.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
             k = k.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
             v = v.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
+            if layer.q_norm is not None:
+                q = layer.q_norm(q)
+                k = layer.k_norm(k)
             y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self._lyric_scale, mask=add)
             y = y.transpose(0, 2, 1, 3).reshape(B, L, D)
             x = x + layer.proj(y)
@@ -492,10 +539,29 @@ class MLXNanoAudioGPT(mnn.Module):
 
     # ---- generate -------------------------------------------------------------
 
+    def _resolve_prompt(
+        self, prompt: torch.Tensor | None, batch_size: int = 1
+    ) -> tuple[torch.Tensor, bool]:
+        """torch-tensor counterpart of NanoAudioGPT._resolve_prompt — the server
+        calls this and feeds the result back into generate / _generate_stream
+        (which convert torch->mx internally). prompt=None -> a random DAC seed
+        column ([K,1], or [batch_size,K,1] when batched, each row an independent
+        from-scratch clip). A 2D [K,T] prompt unsqueezes to [1,K,T]."""
+        if prompt is None:
+            shape = (
+                (self.n_codebooks, 1) if batch_size == 1
+                else (batch_size, self.n_codebooks, 1)
+            )
+            prompt = torch.randint(0, self.cfg.vocab_per_codebook, shape)
+        squeeze_batch = prompt.dim() == 2
+        if squeeze_batch:
+            prompt = prompt.unsqueeze(0)
+        return prompt, squeeze_batch
+
     @torch.no_grad()
-    def generate(
+    def _generate_stream(
         self,
-        prompt: torch.Tensor | None,
+        prompt: torch.Tensor,
         num_new_frames: int,
         temperature: float | Sequence[float] = 1.0,
         top_k: int | None | Sequence[int | None] = 250,
@@ -510,21 +576,22 @@ class MLXNanoAudioGPT(mnn.Module):
         lyric_cfg_scale: float | None = None,
         melody: torch.Tensor | None = None,
         melody_cfg_scale: float | None = None,
-    ) -> torch.Tensor:
-        """Drop-in for NanoAudioGPT.generate. Accepts/returns torch tensors."""
+        emit_every: int = 256,
+        first_emit: int | None = None,
+    ):
+        """Shared decode loop behind generate(); yields the NEW frames as
+        un-delayed [B,K,n] torch LongTensor chunks (the cadence the server's
+        streaming path consumes). `prompt` must be a resolved [B,K,T] torch tensor
+        (see _resolve_prompt). generate() collects these chunks, so streamed and
+        one-shot tokens are identical by construction — the MLX analog of the torch
+        _generate_stream streaming contract."""
         cfg = self.cfg
         K = cfg.n_codebooks
         pad = cfg.pad_id
+        if first_emit is None:
+            first_emit = emit_every
 
-        if prompt is None:
-            seed = np.random.randint(0, cfg.vocab_per_codebook, size=(K, 1))
-            prompt_m = mx.array(seed.astype(np.int32))[None]  # [1, K, 1]
-            squeeze_batch = True
-        else:
-            squeeze_batch = prompt.dim() == 2
-            p = prompt.unsqueeze(0) if squeeze_batch else prompt
-            prompt_m = mx.array(p.detach().to(torch.int64).cpu().numpy().astype(np.int32))
-
+        prompt_m = mx.array(prompt.detach().to(torch.int64).cpu().numpy().astype(np.int32))
         B, _, T_prompt = prompt_m.shape
 
         def _per_cb(val, kind):
@@ -631,11 +698,19 @@ class MLXNanoAudioGPT(mnn.Module):
                 out = out + sc * (stages[i + 1]["logits"] - stages[i]["logits"])
             return out
 
+        def _emit(s, e):
+            # Un-delay new frames [s, e): cb k of frame f sits at delayed pos f+k.
+            chunk = mx.stack([tokens[:, k, s + k:e + k] for k in range(K)], axis=1)
+            mx.eval(chunk)
+            return torch.from_numpy(np.array(chunk, copy=False)).to(torch.long)
+
         prefill_len = max(1, T_prompt)
         _run(tokens[:, :, :prefill_len], 0)
         logits = _combine()
         mx.eval(logits, [c.k for c in stages[0]["caches"]])
 
+        emitted = 0  # count of new frames already yielded
+        threshold = first_emit
         for pos in range(prefill_len, T_delay):
             if pos > prefill_len:
                 inp = tokens[:, :, pos - 1:pos]
@@ -654,7 +729,51 @@ class MLXNanoAudioGPT(mnn.Module):
                     tokens[:, k, pos] = tok
             mx.eval(tokens[:, :, pos])
 
-        mx.eval(tokens)
-        delayed = torch.from_numpy(np.array(tokens, copy=False)).to(torch.long)
-        out = revert_delay(delayed, T_total)
+            # Emit any new frames now fully known: frame f completes at pos=f+K-1.
+            n_complete = min(pos - (K - 1), T_total - 1) - T_prompt + 1
+            if n_complete - emitted >= threshold:
+                yield _emit(T_prompt + emitted, T_prompt + n_complete)
+                emitted = n_complete
+                threshold = emit_every
+        if emitted < num_new_frames:
+            yield _emit(T_prompt + emitted, T_total)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: torch.Tensor | None,
+        num_new_frames: int,
+        temperature: float | Sequence[float] = 1.0,
+        top_k: int | None | Sequence[int | None] = 250,
+        top_p: float | None | Sequence[float | None] = None,
+        text_emb: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
+        text_emb_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
+        melody: torch.Tensor | None = None,
+        melody_cfg_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Drop-in for NanoAudioGPT.generate. Accepts/returns torch tensors.
+
+        Thin collector over _generate_stream (mirrors the torch generate), so the
+        streamed and one-shot token sequences are identical by construction."""
+        prompt, squeeze_batch = self._resolve_prompt(prompt)
+        chunks = list(self._generate_stream(
+            prompt, num_new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=text_emb, cfg_scale=cfg_scale, text_emb_neg=text_emb_neg,
+            lyric_ids=lyric_ids, lyric_mask=lyric_mask,
+            lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
+            lyric_cfg_scale=lyric_cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+        ))
+        new = (
+            torch.cat(chunks, dim=-1) if chunks
+            else prompt.new_zeros((prompt.shape[0], prompt.shape[1], 0))
+        )
+        out = torch.cat([prompt, new], dim=-1)
         return out.squeeze(0) if squeeze_batch else out

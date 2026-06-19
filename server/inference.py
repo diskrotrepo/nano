@@ -1,6 +1,8 @@
 """Inference: mp3 in → mp3 (or wav) out via the trained nano audio GPT."""
 from __future__ import annotations
 
+import contextlib
+import functools
 import io
 import os
 import platform
@@ -78,6 +80,47 @@ def _quantize_torch_linears(model: torch.nn.Module, bits: int, group_size: int =
     quantize_(model, config, filter_fn=filter_fn)
 
 
+# ---- single-GPU generation gate -------------------------------------------
+# The Apple GPU watchdog aborts the whole process ("[METAL] Command buffer
+# execution failed: ... GPU Hang Error", with the other in-flight buffers
+# "Discarded (victim of GPU error/recovery)") when several long MLX generations
+# run on the one local GPU at once — e.g. the webapp's multi-"take" UI firing N
+# concurrent /generate_stream. It's an uncaught C++ abort, not a catchable Python
+# exception, so the only defense is to PREVENT the overcommit: serialize GPU
+# generation. Only the MLX (local Apple-Silicon) path needs this — CUDA/Modal
+# handle concurrency via batching + container scale-out, so the gate stays a
+# no-op there (enabled only once an MLX engine loads). Tune with
+# NANO_MAX_CONCURRENT_GEN (default 1 = strict serialize).
+_GEN_GATE = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("NANO_MAX_CONCURRENT_GEN", "1")))
+)
+_GEN_GATE_ON = False  # flipped True the first time an MLX engine is built
+
+
+@contextlib.contextmanager
+def _gpu_gen_gate():
+    """Serialize GPU generation when gating is active (MLX); no-op otherwise."""
+    if not _GEN_GATE_ON:
+        yield
+        return
+    _GEN_GATE.acquire()
+    try:
+        yield
+    finally:
+        _GEN_GATE.release()
+
+
+def _gated(fn):
+    """Hold the GPU gate for a whole (non-streaming) generate call. Streaming
+    methods are generators — they gate inside `_stream_mp3` instead, so the gate
+    spans the actual generation rather than just the generator's creation."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _gpu_gen_gate():
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 class InferenceEngine:
     def __init__(self, ckpt_path: str | None = None, device: str | None = None):
         self.device = device or os.environ.get("NANO_DEVICE") or (
@@ -123,6 +166,10 @@ class InferenceEngine:
                 )
                 print(f"[inference] backend: mlx (Apple Silicon), weights="
                       f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}")
+                # One local GPU — serialize generation so concurrent requests
+                # can't overcommit it into a watchdog GPU hang (see _gpu_gen_gate).
+                global _GEN_GATE_ON
+                _GEN_GATE_ON = True
             else:
                 self.model = NanoAudioGPT(cfg).to(self.device)
                 self.model.load_state_dict(state)
@@ -444,6 +491,7 @@ class InferenceEngine:
             return torch.float32 if self.device == "cpu" else self._torch_dtype
         return torch.float16
 
+    @_gated
     @torch.no_grad()
     def extend_audio(
         self,
@@ -548,6 +596,7 @@ class InferenceEngine:
         return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
 
 
+    @_gated
     @torch.no_grad()
     def cover_audio(
         self,
@@ -612,6 +661,7 @@ class InferenceEngine:
         )
         return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
 
+    @_gated
     @torch.no_grad()
     def infill_audio(
         self,
@@ -723,6 +773,7 @@ class InferenceEngine:
             os.unlink(in_path)
         return wav, codes
 
+    @_gated
     @torch.no_grad()
     def generate_audio(
         self,
@@ -810,6 +861,7 @@ class InferenceEngine:
                 os.unlink(tmp)
         return body, mime, clap
 
+    @_gated
     @torch.no_grad()
     def generate_audio_batch(
         self,
@@ -943,7 +995,11 @@ class InferenceEngine:
 
         def _produce():
             try:
-                producer_fn(_append, cancel)
+                # Hold the single-GPU gate for the whole generation (incl. the
+                # interleaved DAC decode the consumer drives between chunks), so
+                # concurrent stream requests serialize instead of hanging the GPU.
+                with _gpu_gen_gate():
+                    producer_fn(_append, cancel)
             except BaseException as e:  # BrokenPipe on disconnect, OOM, etc.
                 err_box["err"] = e
                 cancel.set()
@@ -1222,6 +1278,7 @@ class InferenceEngine:
                 ) from e
         return self._demucs
 
+    @_gated
     @torch.no_grad()
     def separate_stems(self, audio_bytes: bytes, keep: list[str]) -> tuple[bytes, str]:
         """Separate the upload with Demucs and remix only the ``keep`` stems.

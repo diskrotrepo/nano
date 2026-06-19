@@ -255,3 +255,124 @@ def test_quantized_runs_in_range(bits):
     out = qm.generate(tokens[0], num_new_frames=5, temperature=0.9, top_k=50,
                       top_p=0.95, text_emb=text_emb, cfg_scale=3.0)
     assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
+
+
+# --- streaming + batched entry points (server /generate_stream, /generate_batch) ---
+# These guard the MLX _generate_stream / _resolve_prompt added so the streaming and
+# batched server paths work on Apple Silicon (they crash without them). Mirrors
+# tests/test_generate_stream.py and tests/test_generate_batch.py.
+
+
+def _stream_equiv(cfg, *, num_new_frames, emit_every, seed=0, **gen_kw):
+    """MLX generate() (collector) vs _generate_stream() chunks — identical tokens.
+    temperature=0 (argmax) so both paths are deterministic regardless of RNG state."""
+    _, mlx_m = _build_pair(cfg, seed=seed)
+    K = cfg.n_codebooks
+    prompt = torch.randint(0, cfg.vocab_per_codebook, (K, 3))
+    T_prompt = prompt.shape[1]
+    ref = mlx_m.generate(prompt, num_new_frames=num_new_frames, temperature=0.0, **gen_kw)
+    chunks = list(mlx_m._generate_stream(
+        prompt.unsqueeze(0), num_new_frames=num_new_frames, temperature=0.0,
+        emit_every=emit_every, **gen_kw,
+    ))
+    streamed = torch.cat(chunks, dim=-1).squeeze(0)
+    assert ref.shape == (K, T_prompt + num_new_frames)
+    assert torch.equal(ref[:, T_prompt:], streamed)
+    return chunks, T_prompt
+
+
+def test_mlx_stream_matches_generate_plain():
+    _stream_equiv(_tiny_cfg(use_text_conditioning=False),
+                  num_new_frames=20, emit_every=7, top_k=50)
+
+
+def test_mlx_stream_matches_generate_with_cfg():
+    cfg = _tiny_cfg(use_text_conditioning=True)
+    torch.manual_seed(7)
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    _stream_equiv(cfg, num_new_frames=18, emit_every=8, top_k=40,
+                  text_emb=text_emb, cfg_scale=3.0)
+
+
+def test_mlx_stream_matches_generate_with_lyrics():
+    cfg = _lyric_cfg(use_text_conditioning=True)
+    torch.manual_seed(7)
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    ids, mask = _lyric_inputs()
+    _stream_equiv(cfg, num_new_frames=16, emit_every=6, top_k=40,
+                  text_emb=text_emb, cfg_scale=2.0, lyric_ids=ids, lyric_mask=mask)
+
+
+def test_mlx_stream_cadence():
+    """first_emit makes the first chunk smaller, then steady emit_every; sizes
+    sum to num_new_frames (mirrors the torch streaming cadence)."""
+    cfg = _tiny_cfg(use_text_conditioning=False)
+    _, mlx_m = _build_pair(cfg, seed=0)
+    K = cfg.n_codebooks
+    prompt = torch.randint(0, cfg.vocab_per_codebook, (K, 1))
+    chunks = list(mlx_m._generate_stream(
+        prompt.unsqueeze(0), num_new_frames=30, emit_every=10, first_emit=4,
+        temperature=1.0, top_k=50, top_p=0.95,
+    ))
+    sizes = [c.shape[-1] for c in chunks]
+    assert sum(sizes) == 30
+    assert sizes[0] == 4 and sizes[1] == 10
+
+
+def test_mlx_resolve_prompt_batch_shape():
+    cfg = _tiny_cfg(use_text_conditioning=False)
+    _, mlx_m = _build_pair(cfg, seed=0)
+    p, sq = mlx_m._resolve_prompt(None, batch_size=4)
+    assert tuple(p.shape) == (4, cfg.n_codebooks, 1) and sq is False
+    p1, _ = mlx_m._resolve_prompt(None, batch_size=1)
+    assert tuple(p1.shape) == (1, cfg.n_codebooks, 1)
+
+
+def test_mlx_batched_matches_single():
+    """Batched generation (the /generate_batch path): each row of a batch of
+    identical prompts equals the B=1 result (temp=0, deterministic)."""
+    cfg = _tiny_cfg(use_text_conditioning=False)
+    _, mlx_m = _build_pair(cfg, seed=0)
+    K = cfg.n_codebooks
+    prompt = torch.randint(0, cfg.vocab_per_codebook, (K, 3))
+    ref = mlx_m.generate(prompt, num_new_frames=15, temperature=0.0, top_k=50)
+    B = 3
+    bprompt = prompt.unsqueeze(0).expand(B, K, 3).contiguous()
+    out = mlx_m.generate(bprompt, num_new_frames=15, temperature=0.0, top_k=50)
+    assert out.shape == (B, K, 3 + 15)
+    for i in range(B):
+        assert torch.equal(out[i], ref)
+
+
+def test_mlx_batched_rows_independent():
+    """Different prompts batched together: each row matches its own B=1 run, so
+    rows don't leak through attention or the KV cache."""
+    cfg = _tiny_cfg(use_text_conditioning=False)
+    _, mlx_m = _build_pair(cfg, seed=1)
+    K = cfg.n_codebooks
+    p0 = torch.randint(0, cfg.vocab_per_codebook, (K, 3))
+    p1 = torch.randint(0, cfg.vocab_per_codebook, (K, 3))
+    ref0 = mlx_m.generate(p0, num_new_frames=12, temperature=0.0, top_k=50)
+    ref1 = mlx_m.generate(p1, num_new_frames=12, temperature=0.0, top_k=50)
+    out = mlx_m.generate(torch.stack([p0, p1], 0), num_new_frames=12,
+                         temperature=0.0, top_k=50)
+    assert torch.equal(out[0], ref0)
+    assert torch.equal(out[1], ref1)
+
+
+@pytest.mark.parametrize("lyric_qk", [False, True])
+def test_lyric_qk_norm_generate_matches_torch(lyric_qk):
+    """Lyric-encoder QK-norm (GPTConfig.use_lyric_qk_norm, ON in the trained v8
+    checkpoint) must load and match torch — guards the MLX _LyricEncLayer
+    q_norm/k_norm port (without it, the real checkpoint won't even load on MLX)."""
+    cfg = _lyric_cfg(use_text_conditioning=True, use_lyric_qk_norm=lyric_qk)
+    m, mlx_m = _build_pair(cfg, seed=9)
+    K = cfg.n_codebooks
+    tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 10))
+    text_emb = torch.randn(1, 1, cfg.d_model)
+    ids, mask = _lyric_inputs()
+    kw = dict(num_new_frames=6, temperature=0.0, top_k=None, top_p=None,
+              text_emb=text_emb, cfg_scale=1.0, lyric_ids=ids, lyric_mask=mask)
+    out_t = m.generate(tokens[0], **kw)
+    out_m = mlx_m.generate(tokens[0], **kw)
+    assert torch.equal(out_t, out_m)
