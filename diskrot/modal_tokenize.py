@@ -20,6 +20,7 @@ Pull tokens locally (optional):
 # '__name__'` at module import time. Python 3.12 doesn't need the future
 # import anyway (`list[str]`, `str | None` work natively).
 
+import os
 import time
 from pathlib import Path
 
@@ -28,6 +29,14 @@ import modal
 from diskrot.modal_common import corpus_mount
 
 app = modal.App("nano-tokenize")
+
+# Codec is chosen LOCALLY at `modal run` time via NANO_CODEC (read from your shell),
+# so the image + GPU are built for the right codec. "dac" = the legacy mono image;
+# "spectrostream"/"ss" = v9 stereo (Magenta RealTime's prebuilt GPU image carrying
+# the JAX/TF/T5X stack — same one the codec spike validated).
+_CODEC = os.environ.get("NANO_CODEC", "dac").lower()
+_IS_SS = _CODEC in ("spectrostream", "ss")
+_MAGENTA_GPU_IMAGE = "us-docker.pkg.dev/brain-magenta/magenta-rt/magenta-rt:gpu"
 
 
 def _cache_dac():
@@ -38,42 +47,77 @@ def _cache_dac():
     dac.utils.download(model_type="44khz")
 
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
-    .pip_install(
-        "torch==2.4.1",
-        "torchaudio==2.4.1",
-        index_url="https://download.pytorch.org/whl/cu121",
+if _IS_SS:
+    # SpectroStream: TF/JAX codec (the codec compute is TensorFlow on GPU), so
+    # torch is CPU-only (just tensor plumbing in model.codec) to avoid contending
+    # with JAX/TF for CUDA. NANO_SS_DEPTH=32 = the stored RVQ depth (the model
+    # slices to 24). HF weights cache on nano-ss-cache so 50 containers don't each
+    # re-download. pyloudnorm powers the loudness-norm in tokenize._load_audio.
+    image = (
+        modal.Image.from_registry(_MAGENTA_GPU_IMAGE)
+        .apt_install("ffmpeg", "libsndfile1")
+        .pip_install("soundfile>=0.12", "librosa>=0.10", "pyloudnorm>=0.1", "tqdm>=4.66")
+        .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")
+        .env(
+            {
+                "NANO_CODEC": "spectrostream",
+                "NANO_SS_DEPTH": os.environ.get("NANO_SS_DEPTH", "32"),
+                "NANO_LOUDNORM_LUFS": os.environ.get("NANO_LOUDNORM_LUFS", "-14.0"),
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.4",
+                "TF_FORCE_GPU_ALLOW_GROWTH": "true",
+                "HF_HOME": "/cache/hf",
+                "HF_HUB_CACHE": "/cache/hf",
+                "XDG_CACHE_HOME": "/cache",
+            }
+        )
+        .add_local_python_source("model", "diskrot")
     )
-    .pip_install(
-        "librosa>=0.10",
-        "descript-audio-codec>=1.0.0",
-        "numpy>=1.26",
-        "tqdm>=4.66",
-        "soundfile>=0.12",
+    _GPU = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
+    _cache_vol = modal.Volume.from_name("nano-ss-cache", create_if_missing=True)
+else:
+    image = (
+        modal.Image.debian_slim(python_version="3.12")
+        .apt_install("ffmpeg", "libsndfile1")
+        .pip_install(
+            "torch==2.4.1",
+            "torchaudio==2.4.1",
+            index_url="https://download.pytorch.org/whl/cu121",
+        )
+        .pip_install(
+            "librosa>=0.10",
+            "descript-audio-codec>=1.0.0",
+            "numpy>=1.26",
+            "tqdm>=4.66",
+            "soundfile>=0.12",
+            "pyloudnorm>=0.1",
+        )
+        .run_commands("pip install 'protobuf>=4'")  # override descript-audiotools' old pin
+        # `expandable_segments:True` switches the PyTorch caching allocator to a
+        # strategy that doesn't fragment as the encoder loop grinds through files.
+        # Without it, ~20 files into a container the GPU reports 21 GiB used /
+        # 22 GiB total even though no single encode needs >5 GiB — fragmentation
+        # eats the rest. PyTorch's own CUDA-OOM error suggests setting this.
+        .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+        .run_function(_cache_dac)
+        .add_local_python_source("model", "diskrot")
     )
-    .run_commands("pip install 'protobuf>=4'")  # override descript-audiotools' old pin
-    # `expandable_segments:True` switches the PyTorch caching allocator to a
-    # strategy that doesn't fragment as the encoder loop grinds through files.
-    # Without it, ~20 files into a container the GPU reports 21 GiB used /
-    # 22 GiB total even though no single encode needs >5 GiB — fragmentation
-    # eats the rest. PyTorch's own CUDA-OOM error suggests setting this.
-    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
-    .run_function(_cache_dac)
-    .add_local_python_source("model", "diskrot")
-)
+    _GPU = "L4"
+    _cache_vol = None
 
 corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
+_VOLUMES = {"/corpus": corpus_vol, "/tokens": tokens_vol}
+if _cache_vol is not None:
+    _VOLUMES["/cache"] = _cache_vol
 
 
 @app.cls(
     image=image,
-    gpu="L4",
+    gpu=_GPU,  # L4 for DAC; A100-40GB for the SpectroStream TF/JAX stack
     timeout=60 * 60,
     max_containers=50,
-    volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
+    volumes=_VOLUMES,
 )
 class Tokenizer:
     # Modal restricts modal.parameter() types to {int, str, bytes, bool} — no
@@ -88,9 +132,11 @@ class Tokenizer:
 
     @modal.enter()
     def load_codec(self):
-        from model.codec import DACodec
+        from model.codec import get_codec
 
-        self.codec = DACodec(device="cuda")
+        # NANO_CODEC (baked into the image env): dac -> DACodec, spectrostream ->
+        # SpectroStreamCodec (stereo, stored depth NANO_SS_DEPTH).
+        self.codec = get_codec(device="cuda")
         self.min_frames = int(self.min_seconds * self.codec.FRAME_RATE_HZ)
 
     @modal.method()
@@ -144,6 +190,9 @@ class Tokenizer:
 # Lightweight image for the orchestrator (no torch/DAC needed — it just
 # lists files, dispatches .map(), and tallies results).
 orchestrator_image = modal.Image.debian_slim(python_version="3.12")
+if _IS_SS:
+    # So the in-container summary reports the SpectroStream frame rate (25 Hz).
+    orchestrator_image = orchestrator_image.env({"NANO_CODEC": "spectrostream"})
 
 
 def _wave_subdir(wave_id: str) -> str:
@@ -279,9 +328,10 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
               f"(transient — affected files stay pending; re-run to finish them)",
               flush=True)
     if n_done > 0:
-        # FRAME_RATE_HZ is 86 (DAC 44.1kHz, hop=512) — hardcoded to avoid
-        # importing torch here.
-        secs = total_frames / 86
+        # Frame rate by codec (avoid importing torch/codec in the slim
+        # orchestrator): DAC 44.1kHz hop=512 -> 86 Hz; SpectroStream 48k -> 25 Hz.
+        fr = 25 if os.environ.get("NANO_CODEC", "dac").lower() in ("spectrostream", "ss") else 86
+        secs = total_frames / fr
         print(f"total audio cached:  {secs/60:.1f} min ({secs/3600:.2f} hours)")
 
 

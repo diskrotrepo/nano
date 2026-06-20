@@ -9,19 +9,53 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Literal
 
 import librosa
+import numpy as np
 import torch
 from tqdm import tqdm
 
-from model.codec import DACodec
+from model.codec import DACodec, get_codec
 
 
 TokenizeStatus = Literal["done", "skipped_existing", "skipped_short", "failed"]
+
+# Pre-encode loudness normalization target (EBU R128 LUFS). -14 LUFS is the common
+# streaming reference (Spotify/YouTube); normalizing here homogenizes the corpus's
+# wildly varying source levels so the codec tokens have consistent statistics.
+# Env-overridable; the same value must be used across the whole corpus.
+_LOUDNORM_LUFS = float(os.environ.get("NANO_LOUDNORM_LUFS", "-14.0"))
+
+# Conservative source-quality gate (checked on the RAW pre-normalization signal,
+# where level is meaningful — after loudness-norm everything is ~-14 LUFS). Tuned
+# to drop only genuinely broken files: near-silent (would train silence) and
+# EGREGIOUSLY clipped (a large fraction pinned at digital full-scale = a corrupt /
+# destroyed encode, NOT a merely-loud master). Low-bitrate is intentionally KEPT.
+_SILENCE_RMS_DBFS = float(os.environ.get("NANO_SILENCE_RMS_DBFS", "-50.0"))
+_CLIP_FRACTION = float(os.environ.get("NANO_CLIP_FRACTION", "0.20"))
+
+
+class QualitySkip(Exception):
+    """Raised by _load_audio when the conservative quality gate rejects a file
+    (near-silent / egregiously clipped). Carries the reason string."""
+
+
+def _audio_quality_reason(y: np.ndarray, sr: int) -> str | None:
+    """'silent' / 'clipped' / None for a RAW [C,samples] or [samples] waveform."""
+    if y.size == 0:
+        return "silent"
+    mono = y.mean(axis=0) if y.ndim == 2 else y
+    rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64))))
+    if rms <= 0.0 or 20.0 * np.log10(rms + 1e-12) < _SILENCE_RMS_DBFS:
+        return "silent"
+    if float(np.mean(np.abs(mono) >= 0.9995)) > _CLIP_FRACTION:
+        return "clipped"
+    return None
 
 
 @dataclass
@@ -31,10 +65,53 @@ class TokenizeResult:
     error: str | None = None
 
 
-def _load_audio(mp3_path: Path, sample_rate: int) -> torch.Tensor:
-    """CPU-side audio load + resample. Safe to call from a background thread."""
-    y, _ = librosa.load(str(mp3_path), sr=sample_rate, mono=True)
-    return torch.from_numpy(y).unsqueeze(0)
+def _normalize_loudness(y: np.ndarray, sr: int) -> np.ndarray:
+    """Loudness-normalize a [C, samples] or [samples] float32 waveform to
+    _LOUDNORM_LUFS (EBU R128 via pyloudnorm; peak-to--1dBFS fallback if pyloudnorm
+    is absent or the measure is non-finite), then guard against clipping. Silent
+    input is returned unchanged. Mono-summed measurement so L/R are scaled by the
+    same gain (stereo image preserved)."""
+    peak0 = float(np.abs(y).max()) if y.size else 0.0
+    if peak0 <= 0.0:
+        return y
+    try:
+        import pyloudnorm as pyln
+
+        meter = pyln.Meter(sr)
+        mono = y.mean(axis=0) if y.ndim == 2 else y
+        loud = meter.integrated_loudness(np.ascontiguousarray(mono))
+        if np.isfinite(loud):
+            y = y * (10.0 ** ((_LOUDNORM_LUFS - loud) / 20.0))
+        else:
+            y = y * (10.0 ** (-1.0 / 20.0) / peak0)
+    except Exception:
+        y = y * (10.0 ** (-1.0 / 20.0) / peak0)  # peak-normalize to -1 dBFS
+    peak = float(np.abs(y).max())
+    if peak > 1.0:
+        y = y / peak  # never clip
+    return np.ascontiguousarray(y, dtype=np.float32)
+
+
+def _load_audio(
+    mp3_path: Path, sample_rate: int, n_channels: int = 1, normalize: bool = True,
+) -> torch.Tensor:
+    """CPU-side audio load + resample + loudness-normalize. Safe in a thread.
+
+    Returns ``[n_channels, samples]`` float32: mono -> [1, N]; stereo -> [2, N]
+    (a mono source is duplicated to L=R, so it round-trips to a stable centered
+    image)."""
+    y, _ = librosa.load(str(mp3_path), sr=sample_rate, mono=(n_channels == 1))
+    if n_channels == 2 and y.ndim == 1:
+        y = np.stack([y, y], axis=0)  # mono source -> L=R
+    # Conservative quality gate on the RAW signal (level is meaningful pre-norm).
+    reason = _audio_quality_reason(y, sample_rate)
+    if reason is not None:
+        raise QualitySkip(reason)
+    if normalize:
+        y = _normalize_loudness(y, sample_rate)
+    if y.ndim == 1:
+        y = y[None, :]  # [1, samples]
+    return torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
 
 
 def _save_tokens(tokens: torch.Tensor, out_path: Path) -> int:
@@ -56,7 +133,12 @@ def tokenize_one_file(
     if out_path.exists():
         return TokenizeResult(status="skipped_existing")
     try:
-        tokens = codec.encode(mp3_path)
+        # Route through _load_audio so loudness-norm + stereo handling + the
+        # quality gate apply on the single-file path too (encode() given a path
+        # would skip them).
+        tokens = codec.encode(_load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS))
+    except QualitySkip as e:
+        return TokenizeResult(status="skipped_short", error=f"quality:{e}")
     except Exception as e:
         return TokenizeResult(status="failed", error=str(e))
     if tokens.shape[1] < min_frames:
@@ -92,8 +174,10 @@ def tokenize_files_streaming(
         if out_path.exists():
             return item, None, "skipped_existing", None
         try:
-            audio = _load_audio(mp3_path, codec.SAMPLE_RATE)
+            audio = _load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS)
             return item, audio, "ready", None
+        except QualitySkip as e:
+            return item, None, "quality_skip", str(e)
         except Exception as e:
             return item, None, "failed_load", str(e)
 
@@ -138,6 +222,10 @@ def tokenize_files_streaming(
             if status == "skipped_existing":
                 yield TokenizeResult(status="skipped_existing")
                 continue
+            if status == "quality_skip":
+                # Near-silent / egregiously-clipped source — skip (don't tokenize).
+                yield TokenizeResult(status="skipped_short", error=f"quality:{err}")
+                continue
             if status == "failed_load":
                 yield TokenizeResult(status="failed", error=err)
                 continue
@@ -171,7 +259,7 @@ def tokenize_corpus(
     if not mp3s:
         raise SystemExit(f"No mp3s found in {corpus_dir}")
 
-    codec = DACodec(device=device)
+    codec = get_codec(device=device)  # NANO_CODEC: dac (default) or spectrostream
     min_frames = int(min_seconds * codec.FRAME_RATE_HZ)
 
     print(f"found {len(mp3s)} mp3s | device: {device}")

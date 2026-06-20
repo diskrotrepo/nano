@@ -18,7 +18,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from model.codec import DACodec
+from model.codec import DACodec, get_codec
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
 from server.prompt_sweetener import PromptSweetener
@@ -128,7 +128,14 @@ class InferenceEngine:
             else "mps" if torch.backends.mps.is_available()
             else "cpu"
         )
-        self.codec = DACodec(device=self.device)
+        # NANO_CODEC selects the codec: "dac" (default, mono) or "spectrostream"
+        # (v9, joint stereo). decode() then returns [samples] (mono) or [2,samples].
+        self.codec = get_codec(device=self.device)
+        self.n_channels = getattr(self.codec, "N_CHANNELS", 1)
+        if self.n_channels == 2:
+            # CC-BY-4.0: SpectroStream weights are Google Magenta RealTime.
+            print("[inference] SpectroStream codec (stereo) — audio decode uses "
+                  "SpectroStream (CC-BY-4.0, Google Magenta RealTime)", flush=True)
         self.text_encoder: CLAPTextEncoder | None = None
         self.sweetener: PromptSweetener | None = None  # lazy — only built on first use
         self._demucs = None  # (model, apply_fn) — lazy, only built on first /stem call
@@ -527,8 +534,7 @@ class InferenceEngine:
             f.write(full_audio_bytes)
             in_path = f.name
         try:
-            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
-            full_wav = torch.from_numpy(y).unsqueeze(0)
+            full_wav = self._load_wav(in_path)        # [C, samples] (C matches codec)
             full_tokens = self.codec.encode(full_wav)
         finally:
             os.unlink(in_path)
@@ -766,8 +772,7 @@ class InferenceEngine:
             f.write(audio_bytes)
             in_path = f.name
         try:
-            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
-            wav = torch.from_numpy(y).unsqueeze(0)
+            wav = self._load_wav(in_path)             # [C, samples] (C matches codec)
             codes = self.codec.encode(wav)
         finally:
             os.unlink(in_path)
@@ -854,7 +859,10 @@ class InferenceEngine:
             # CLAP's loader never has to decode mp3.
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 tmp = f.name
-                sf.write(tmp, wav.squeeze().contiguous().cpu().numpy(), self.codec.SAMPLE_RATE)
+                # CLAP is mono — downmix a stereo render before scoring.
+                clap_wav = (wav.mean(dim=0) if wav.dim() == 2 and wav.shape[0] > 1
+                            else wav.squeeze())
+                sf.write(tmp, clap_wav.contiguous().cpu().numpy(), self.codec.SAMPLE_RATE)
             try:
                 clap = self.text_encoder.audio_text_similarity(tmp, text)
             finally:
@@ -942,6 +950,18 @@ class InferenceEngine:
             results.append((body, mime))
         return results
 
+    def _load_wav(self, path: str) -> torch.Tensor:
+        """Load an uploaded clip to ``[C, samples]`` matching the codec's channel
+        count (mono for DAC, stereo for SpectroStream; a mono source is duplicated
+        to L=R) so prompt-encode and the kept-prefix stitch stay channel-consistent
+        with the decoded output."""
+        y, _ = librosa.load(path, sr=self.codec.SAMPLE_RATE, mono=(self.n_channels == 1))
+        if self.n_channels == 2 and y.ndim == 1:
+            y = np.stack([y, y], axis=0)  # mono source -> L=R
+        if y.ndim == 1:
+            y = y[None, :]
+        return torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
+
     def _decode_chunk(
         self, all_new: torch.Tensor, f0: int, f1: int, ctx: int, hop: int
     ) -> np.ndarray:
@@ -956,9 +976,14 @@ class InferenceEngine:
         """
         start = max(0, f0 - ctx)
         window = all_new[:, start:f1]              # [K, w] long, cpu
-        wav = self.codec.decode(window)            # [samples] float, cpu
+        wav = self.codec.decode(window)            # [samples] (mono) or [2,samples]
         drop = (f0 - start) * hop
-        return wav[drop:].contiguous().numpy().astype("float32")
+        if wav.dim() == 1:
+            return wav[drop:].contiguous().numpy().astype("float32")  # mono [kept]
+        # stereo [2, samples] -> interleaved [kept*2] f32 (L0,R0,L1,R1,...) so the
+        # raw-PCM ffmpeg pipe in _stream_mp3 reads it with -ac 2.
+        kept = wav[:, drop:].transpose(0, 1).contiguous()  # [kept, 2]
+        return kept.reshape(-1).numpy().astype("float32")
 
     def _stream_mp3(self, producer_fn, *, meta, on_complete, cancel=None):
         """Run ONE persistent ffmpeg (raw f32 mono PCM -> mp3), yielding mp3 bytes
@@ -971,12 +996,13 @@ class InferenceEngine:
         producer is cancelled, ffmpeg killed, and nothing is saved. Shared by the
         generate / extend / cover stream paths."""
         sr = self.codec.SAMPLE_RATE
+        n_ch = getattr(self, "n_channels", 1)  # mono unless a stereo codec is loaded
         if cancel is None:
             cancel = threading.Event()
         try:
             proc = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0",
+                 "-f", "f32le", "-ar", str(sr), "-ac", str(n_ch), "-i", "pipe:0",
                  "-codec:a", "libmp3lame", "-b:a", "192k",
                  "-f", "mp3", "-id3v2_version", "0", "pipe:1"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1037,7 +1063,11 @@ class InferenceEngine:
                 pass
 
         if completed and pcm_parts and on_complete is not None:
-            full = torch.from_numpy(np.concatenate(pcm_parts))[None]  # [1, samples]
+            flat = np.concatenate(pcm_parts)  # interleaved f32
+            if n_ch == 2:
+                full = torch.from_numpy(flat.reshape(-1, 2).T.copy())  # [2, samples]
+            else:
+                full = torch.from_numpy(flat)[None]  # [1, samples]
             body, mime = _encode_audio(full, sr, meta)
             on_complete(body, mime)
 
@@ -1154,8 +1184,7 @@ class InferenceEngine:
             f.write(full_audio_bytes)
             in_path = f.name
         try:
-            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
-            full_wav = torch.from_numpy(y).unsqueeze(0)
+            full_wav = self._load_wav(in_path)        # [C, samples] (C matches codec)
             full_tokens = self.codec.encode(full_wav)
         finally:
             os.unlink(in_path)
@@ -1346,13 +1375,20 @@ def _crossfade_concat(
 def _encode_audio(
     wav: torch.Tensor, sr: int, metadata: dict[str, str] | None = None
 ) -> tuple[bytes, str]:
-    """Encode [1, samples] mono float audio to mp3 (via subprocess ffmpeg) or fall back to wav.
+    """Encode mono [1,samples] OR stereo [2,samples] float audio to mp3 (via
+    subprocess ffmpeg) or fall back to wav. ffmpeg/libmp3lame preserve the channel
+    count from the written WAV, so no -ac is needed.
 
     Any `metadata` dict is written into the mp3 as ID3v2 TXXX (user-defined) frames
     — keys are namespaced `nano_*`, none of which collide with standard frames, so
     ffmpeg's id3v2 muxer emits each as a TXXX frame. The wav fallback carries no
     metadata (only reached when ffmpeg is unavailable)."""
-    audio = wav.squeeze().contiguous().cpu().numpy()  # [samples]
+    arr = wav.detach().contiguous().cpu().numpy()
+    # soundfile wants channels-LAST: mono -> [samples]; stereo [2,samples] -> [samples,2].
+    if arr.ndim == 2:
+        audio = arr[0] if arr.shape[0] == 1 else arr.T
+    else:
+        audio = arr
 
     wav_buf = io.BytesIO()
     sf.write(wav_buf, audio, sr, format="WAV", subtype="PCM_16")

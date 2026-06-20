@@ -49,28 +49,32 @@ def load_phoneme_shards(phonemes_dir: str | Path) -> dict[str, list[list[int]]]:
     return merged
 
 
-def _load_lyric_words(lyrics_path: str | Path) -> dict[str, list[str]]:
-    """{name: clean word list} for every song with usable transcribed words.
+def _load_lyric_words(lyrics_path: str | Path) -> dict[str, tuple[list[str], str | None]]:
+    """{name: (clean word list, detected language)} for every song with usable
+    transcribed words.
 
     Mirrors ``dataset._load_lyrics``'s cleaning exactly (same
     ``transcribe_lyrics.is_valid_word`` predicate), so the stored group count
     always equals the word count the train-time loader sees — the staleness
-    contract. Deliberately does NOT import diskrot.dataset: that module pulls in
-    model.codec (librosa/dac), which the slim phonemize image doesn't carry."""
+    contract. The language (transcribe stores it) is carried so each song is
+    phonemized in ITS language (v9 multilingual) — byte-identical to the dataset's
+    live fallback, which passes the same per-song language. Deliberately does NOT
+    import diskrot.dataset: that module pulls in model.codec (librosa/dac), which
+    the slim phonemize image doesn't carry."""
     from diskrot.transcribe_lyrics import is_valid_word, load_lyrics_shards
 
     lp = Path(lyrics_path)
     if not lp.exists():
         return {}
     raw = load_lyrics_shards(lp) if lp.is_dir() else json.loads(lp.read_text())
-    out: dict[str, list[str]] = {}
+    out: dict[str, tuple[list[str], str | None]] = {}
     for name, val in raw.items():
         if not isinstance(val, dict):
             continue
         words = val.get("words")
         clean = [w["word"] for w in words if is_valid_word(w)] if isinstance(words, list) else []
         if clean:
-            out[name] = clean
+            out[name] = (clean, val.get("language"))
     return out
 
 
@@ -90,11 +94,11 @@ def _phonemize_bucket(args: tuple[int, str, dict[str, list[str]]]) -> tuple[int,
     if path.exists():
         existing = json.loads(path.read_text())
     n_new = 0
-    for name, words in songs.items():
+    for name, (words, language) in songs.items():
         prior = existing.get(name)
         if prior is not None and len(prior) == len(words):
             continue  # resume-by-skip (word-count match = not stale)
-        existing[name] = text_to_word_phoneme_groups(words)
+        existing[name] = text_to_word_phoneme_groups(words, language=language)
         n_new += 1
     if n_new:
         _atomic_write_json(path, existing)

@@ -345,7 +345,7 @@ async def generate_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     score_clap: bool = Form(False),
     model: str = Form(""),
 ) -> Response:
@@ -439,7 +439,7 @@ class BatchRequest(BaseModel):
     per_cb_top_k: str = "120,90,70,50,36,26,18,12,8"
     per_cb_top_p: str = ""
     cfg_scale: float = 7.0
-    lyric_cfg_scale: float = 0.0
+    lyric_cfg_scale: float = 8.0
     sweeten: bool = True
     model: str = ""
 
@@ -575,7 +575,7 @@ def generate_stream_endpoint(
     bpm: float = 0.0,
     negative_prompt: str = "",
     sweeten: bool = True,
-    lyric_cfg_scale: float = 0.0,
+    lyric_cfg_scale: float = 8.0,
     req_id: str = "",
     model: str = "",
 ) -> StreamingResponse:
@@ -618,7 +618,7 @@ def generate_stream_post_endpoint(
     bpm: float = Form(0.0),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     req_id: str = Form(""),
     model: str = Form(""),
 ) -> StreamingResponse:
@@ -676,7 +676,7 @@ async def extend_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     model: str = Form(""),
 ) -> Response:
     """Continue a clip forward from a point in time. Returns [original 0→T | new].
@@ -739,7 +739,7 @@ async def cover_endpoint(
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     model: str = Form(""),
 ) -> Response:
     """Cover a hummed/uploaded melody in the prompt's timbre.
@@ -799,7 +799,7 @@ async def extend_stream_endpoint(
     bpm: float = Form(0.0),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     req_id: str = Form(""),
     model: str = Form(""),
 ) -> StreamingResponse:
@@ -855,7 +855,7 @@ async def cover_stream_endpoint(
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     req_id: str = Form(""),
     model: str = Form(""),
 ) -> StreamingResponse:

@@ -29,21 +29,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # --- Phoneme vocabulary -------------------------------------------------------
-# ARPABET phones as emitted by g2p_en's CMUdict path, vowels carrying lexical
-# stress (0/1/2). Copied from g2p_en 2.1.0's canonical ``G2p().phonemes`` minus
-# its 4 internal seq2seq specials; frozen here so the id mapping never moves.
-_ARPABET: tuple[str, ...] = (
-    "AA0", "AA1", "AA2", "AE0", "AE1", "AE2", "AH0", "AH1", "AH2",
-    "AO0", "AO1", "AO2", "AW0", "AW1", "AW2", "AY0", "AY1", "AY2",
-    "B", "CH", "D", "DH",
-    "EH0", "EH1", "EH2", "ER0", "ER1", "ER2", "EY0", "EY1", "EY2",
-    "F", "G", "HH",
-    "IH0", "IH1", "IH2", "IY0", "IY1", "IY2",
-    "JH", "K", "L", "M", "N", "NG",
-    "OW0", "OW1", "OW2", "OY0", "OY1", "OY2",
-    "P", "R", "S", "SH", "T", "TH",
-    "UH0", "UH1", "UH2", "UW", "UW0", "UW1", "UW2",
-    "V", "W", "Y", "Z", "ZH",
+# v9 multilingual: IPA codepoints as emitted by espeak-ng (--ipa), tokenized at
+# the Unicode-CODEPOINT level (one id per IPA char; combining diacritics ride as
+# their own ids). Char-level is robust and bounded (no phone-segmentation
+# ambiguity) and degrades gracefully — any codepoint outside this frozen set maps
+# to UNK_PHONEME. This replaces the English-only g2p_en/ARPABET path so the model
+# can sing many languages (a <lang_*> marker rides the stream; see _LANG_TOKENS).
+# FROZEN: the order is the id mapping, so it must never move. A coverage spike
+# (scripts/ipa_coverage_spike.py) confirms this covers ~all phones espeak emits
+# over the corpus BEFORE the re-phonemize bakes it into the checkpoint. Adding/
+# removing any entry changes PHONEME_VOCAB_SIZE and is checkpoint-incompatible.
+_IPA: tuple[str, ...] = (
+    # vowels
+    "i", "y", "ɨ", "ʉ", "ɯ", "u", "ɪ", "ʏ", "ʊ", "e", "ø", "ɘ", "ɵ", "ɤ", "o",
+    "ə", "ɛ", "œ", "ɜ", "ɞ", "ʌ", "ɔ", "æ", "ɐ", "a", "ɶ", "ɑ", "ɒ", "ɚ", "ɝ",
+    # pulmonic consonants
+    "p", "b", "t", "d", "ʈ", "ɖ", "c", "ɟ", "k", "ɡ", "g", "q", "ɢ", "ʔ",
+    "m", "ɱ", "n", "ɳ", "ɲ", "ŋ", "ɴ",
+    "ʙ", "r", "ʀ", "ⱱ", "ɾ", "ɽ",
+    "ɸ", "β", "f", "v", "θ", "ð", "s", "z", "ʃ", "ʒ", "ʂ", "ʐ", "ç", "ʝ",
+    "x", "ɣ", "χ", "ʁ", "ħ", "ʕ", "h", "ɦ",
+    "ɬ", "ɮ", "ʋ", "ɹ", "ɻ", "j", "ɰ", "l", "ɭ", "ʎ", "ʟ",
+    # affricate/coarticulated + non-pulmonic + other
+    "ʦ", "ʣ", "ʧ", "ʤ", "ɕ", "ʑ", "ɺ", "w", "ʍ", "ɥ", "ʜ", "ʢ", "ʡ",
+    "ɓ", "ɗ", "ʄ", "ɠ", "ʛ", "ʘ", "ǀ", "ǃ", "ǂ", "ǁ",
+    # suprasegmentals + length + boundaries espeak emits inline
+    "ˈ", "ˌ", "ː", "ˑ", "|", "‖", "‿", "ʼ",
+    # spacing-modifier diacritics (aspiration, secondary articulation, …)
+    "ʰ", "ʷ", "ʲ", "ˠ", "ˤ", "ⁿ", "ˡ", "ʱ",
+    # combining diacritics (nasalization, voicing, syllabicity, dental, …)
+    "̃", "̥", "̬", "̩", "̯", "̪", "̟",
+    "̠", "̈", "̴", "̰", "̚", "̹", "̜",
+    "̝", "̞", "̘", "̙", "̺", "̻", "͡",
+    # tone letters
+    "˥", "˦", "˧", "˨", "˩", "↗", "↘",
 )
 
 # Special tokens occupy the low ids; everything downstream keys off these names.
@@ -150,19 +169,39 @@ UNKNOWN_VOCALS_LABEL = "unknown_vocals"
 VOCAL_LABELS: tuple[str, ...] = (UNKNOWN_VOCALS_LABEL, "vocals", "instrumental")
 _VOCAL_TOKENS: tuple[str, ...] = tuple(f"<{label}>" for label in VOCAL_LABELS)
 
+# Language markers (v9 multilingual) — ride the SAME phoneme stream, same
+# rationale: the detected language (transcribe stores ``language`` per song) is a
+# per-song attribute the decoder cross-attends to, so the model can be TOLD/learn
+# which language to sing, and it CFG-drops with the lyric stream. The IPA phones
+# are shared across languages, so this marker is what disambiguates e.g. French vs
+# English vowels. A generous frozen set of common languages (ISO 639-1, matching
+# Whisper's codes / espeak-ng's coverage); ``<unknown_lang>`` is the fallback so
+# every stream carries a valid language slot. Placed between the vocal markers and
+# _IPA so an IPA edit can't renumber them. Adding/removing any changes
+# PHONEME_VOCAB_SIZE and is checkpoint-incompatible — hence a generous set now.
+UNKNOWN_LANG_LABEL = "unknown_lang"
+LANGUAGE_LABELS: tuple[str, ...] = (
+    UNKNOWN_LANG_LABEL,
+    "en", "es", "fr", "de", "it", "pt", "nl", "sv", "no", "da", "fi", "pl",
+    "ru", "uk", "cs", "tr", "el", "ro", "hu", "ar", "he", "fa", "hi", "ur",
+    "bn", "ta", "th", "vi", "id", "ms", "tl", "zh", "ja", "ko", "yue",
+)
+_LANG_TOKENS: tuple[str, ...] = tuple(f"<lang_{label}>" if label != UNKNOWN_LANG_LABEL
+                                      else f"<{label}>" for label in LANGUAGE_LABELS)
+
 # Frozen vocab: specials first (so PAD==0), then structure markers, then gender
 # markers, then tempo markers, then key markers, then vocal-presence markers,
-# then ARPABET.
+# then language markers, then IPA phones (v9 multilingual).
 PHONEME_VOCAB: tuple[str, ...] = (
     PAD_PHONEME, BOS_PHONEME, WORD_BOUNDARY_PHONEME, UNK_PHONEME,
-) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _TEMPO_TOKENS + _KEY_TOKENS + _VOCAL_TOKENS + _ARPABET
+) + _STRUCTURE_TOKENS + _GENDER_TOKENS + _TEMPO_TOKENS + _KEY_TOKENS + _VOCAL_TOKENS + _LANG_TOKENS + _IPA
 
 PHONEME_TO_ID: dict[str, int] = {p: i for i, p in enumerate(PHONEME_VOCAB)}
 PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
 BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
 WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
 UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
-PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # 129 (4 specials + 9 structure + 3 gender + 15 tempo + 25 key + 3 vocal + 70 ARPABET)
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # v9: 4 specials + 9 structure + 3 gender + 15 tempo + 25 key + 3 vocal + 36 lang + 157 IPA = 252 (checkpoint-incompatible vs v8's 129)
 
 # Structure label <-> phoneme id, the single source of truth shared by the dataset
 # (train-time injection) and inference (bracket parsing) so the two agree exactly.
@@ -418,66 +457,141 @@ def is_vocal_label(label: str | None) -> bool:
     return _normalize_label(label) in _RECOGNIZED_VOCAL_KEYS
 
 
-# Punctuation g2p_en passes through verbatim that we fold into a word boundary
-# rather than dropping (keeps phrase structure the decoder can align to).
+# Language label <-> phoneme id (v9 multilingual), parallel to the mappings above.
+# Shared by the dataset (the `language` transcribe detected per song) and inference
+# (the [french] / [lang:fr] bracket) so the prefix id agrees exactly. Accepts ISO
+# 639-1 codes AND common full names.
+LANG_TOKEN_TO_ID: dict[str, int] = {
+    label: PHONEME_TO_ID[token] for label, token in zip(LANGUAGE_LABELS, _LANG_TOKENS)
+}
+ID_TO_LANG: dict[int, str] = {i: label for label, i in LANG_TOKEN_TO_ID.items()}
+UNKNOWN_LANG_ID: int = LANG_TOKEN_TO_ID[UNKNOWN_LANG_LABEL]
+LANG_IDS: frozenset[int] = frozenset(LANG_TOKEN_TO_ID.values())
+
+_LANG_ALIASES: dict[str, str] = {
+    "english": "en", "spanish": "es", "french": "fr", "german": "de",
+    "italian": "it", "portuguese": "pt", "dutch": "nl", "swedish": "sv",
+    "norwegian": "no", "danish": "da", "finnish": "fi", "polish": "pl",
+    "russian": "ru", "ukrainian": "uk", "czech": "cs", "turkish": "tr",
+    "greek": "el", "romanian": "ro", "hungarian": "hu", "arabic": "ar",
+    "hebrew": "he", "persian": "fa", "farsi": "fa", "hindi": "hi",
+    "urdu": "ur", "bengali": "bn", "tamil": "ta", "thai": "th",
+    "vietnamese": "vi", "indonesian": "id", "malay": "ms", "tagalog": "tl",
+    "filipino": "tl", "chinese": "zh", "mandarin": "zh", "cantonese": "yue",
+    "japanese": "ja", "korean": "ko",
+}
+_RECOGNIZED_LANG_KEYS: frozenset[str] = frozenset(LANG_TOKEN_TO_ID) | frozenset(_LANG_ALIASES)
+
+
+def _lang_key(label: str) -> str:
+    """Normalize a language label to its ISO code: strip a ``lang:``/``language:``
+    prefix and fold full-name aliases (``french`` -> ``fr``)."""
+    key = _normalize_label(label)
+    for pre in ("lang:", "language:"):
+        if key.startswith(pre):
+            key = key[len(pre):].strip()
+    return _LANG_ALIASES.get(key, key)
+
+
+def parse_lang_label(label: str | None) -> str | None:
+    """The ISO code a language label resolves to (for the espeak voice), or None."""
+    if not label:
+        return None
+    key = _lang_key(label)
+    return key if key in LANG_TOKEN_TO_ID and key != UNKNOWN_LANG_LABEL else None
+
+
+def lang_label_to_id(label: str | None) -> int:
+    """Map a language code/name to its marker id, falling back to <unknown_lang>."""
+    if not label:
+        return UNKNOWN_LANG_ID
+    return LANG_TOKEN_TO_ID.get(_lang_key(label), UNKNOWN_LANG_ID)
+
+
+def is_lang_label(label: str | None) -> bool:
+    """True if ``label`` names a language (ISO code, alias, or ``lang:xx``) — for
+    the bracket parser."""
+    if not label:
+        return False
+    return _lang_key(label) in LANG_TOKEN_TO_ID and _lang_key(label) != UNKNOWN_LANG_LABEL
+
+
+# Boundary chars (whitespace + sentence punctuation) folded to a single
+# WORD_BOUNDARY rather than emitted (keeps phrase structure the decoder aligns to).
 _BOUNDARY_PUNCT = frozenset({",", ".", "!", "?", ";", ":", "-", "...", " "})
 
-_G2P = None  # lazily constructed per process (G2p() loads nltk data + a model)
+# v9 multilingual phonemizer: espeak-ng via the `phonemizer` lib, char-level IPA.
+# Lazy per-voice backend (loads the espeak-ng shared lib); the module imports fine
+# without phonemizer/espeak-ng installed (same discipline as the old lazy g2p_en),
+# so only the phonemize CALLS require it. Whisper detects a 2-letter language code
+# per song (transcribe stores it); most map straight to an espeak voice, the few
+# that differ are remapped, and anything unavailable falls back to en-us.
+_ESPEAK_VOICE = {
+    "en": "en-us", "pt": "pt-br", "zh": "cmn", "yue": "yue",
+}
+_ESPEAK: dict = {}     # voice -> EspeakBackend
+_SEPS: dict = {}       # lazily-built phonemizer Separators (need the import)
 
 
-def _get_g2p():
-    """Lazily build a process-local g2p_en.G2p (expensive: nltk + numpy model)."""
-    global _G2P
-    if _G2P is None:
-        from g2p_en import G2p
+def _get_seps():
+    if not _SEPS:
+        from phonemizer.separator import Separator
+        _SEPS["phone"] = Separator(word=" ", syllable="", phone="")
+        _SEPS["word"] = Separator(word="\x00", syllable="", phone="")
+    return _SEPS["phone"], _SEPS["word"]
 
-        _G2P = G2p()
-    return _G2P
+
+def _get_espeak(language: str | None):
+    """Lazily build a process-local espeak-ng backend for ``language`` (a Whisper
+    code like 'en'/'fr'/'zh'). Falls back to en-us if the voice is unavailable."""
+    from phonemizer.backend import EspeakBackend
+
+    voice = _ESPEAK_VOICE.get((language or "en").lower(), (language or "en").lower())
+    if voice not in _ESPEAK:
+        try:
+            _ESPEAK[voice] = EspeakBackend(
+                voice, with_stress=True, language_switch="remove-flags")
+        except Exception:
+            if "en-us" not in _ESPEAK:
+                _ESPEAK["en-us"] = EspeakBackend(
+                    "en-us", with_stress=True, language_switch="remove-flags")
+            _ESPEAK[voice] = _ESPEAK["en-us"]
+    return _ESPEAK[voice]
+
+
+def _ipa_char_ids(ipa: str) -> list[int]:
+    """Char-level IPA -> ids (no boundaries): known codepoint -> id, else UNK."""
+    return [PHONEME_TO_ID.get(ch, UNK_PHONEME_ID) for ch in ipa
+            if not (ch.isspace() or ch in _BOUNDARY_PUNCT)]
 
 
 def text_to_phoneme_ids(
-    text: str, max_len: int | None = None, add_bos: bool = True,
+    text: str, language: str = "en", max_len: int | None = None, add_bos: bool = True,
 ) -> list[int]:
     """Convert a lyric string to phoneme ids using the frozen vocab.
 
-    g2p_en emits ARPABET phones, ``' '`` between words, and raw punctuation;
-    we map phones via PHONEME_TO_ID, fold spaces/sentence punctuation to a single
-    WORD_BOUNDARY token, and drop anything else (rare g2p artifacts). UNK_PHONEME
-    is reserved for future use but never emitted — silently dropping an artifact
-    keeps the id stream identical on both the train and inference paths.
-    Deterministic for a given g2p_en version + nltk data — the contract train and
-    inference both rely on. ``max_len`` truncates (after the optional BOS).
-    """
+    espeak-ng emits IPA for ``language``; we tokenize it at the Unicode-codepoint
+    level (known IPA char -> its id, whitespace/sentence punct -> a single
+    WORD_BOUNDARY, unknown codepoint -> UNK_PHONEME). Deterministic for a given
+    espeak-ng version — the contract train and inference both rely on. ``max_len``
+    truncates (after the optional BOS)."""
     if not text or not text.strip():
         return []
-    g2p = _get_g2p()
     try:
-        syms = list(g2p(text))
+        phone_sep, _ = _get_seps()
+        ipa = _get_espeak(language).phonemize([text], separator=phone_sep, strip=True)[0]
     except Exception:
-        # g2p_en expands digit runs via inflect, which raises NumOutOfRangeError
-        # on absurd numbers (real Whisper-transcript garbage). Retry per word so
-        # a single bad token drops only itself — deterministically, on both the
-        # train and inference paths.
-        syms = []
-        for w in text.split():
-            try:
-                syms.extend(g2p(w))
-            except Exception:
-                continue
-            syms.append(" ")
+        return [BOS_PHONEME_ID] if add_bos else []
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
     prev_boundary = True  # suppress a leading boundary token
-    for sym in syms:
-        pid = PHONEME_TO_ID.get(sym)
-        if pid is not None:
-            ids.append(pid)
-            prev_boundary = False
-        elif sym in _BOUNDARY_PUNCT:
-            if not prev_boundary:  # collapse runs of space/punct
+    for ch in ipa:
+        if ch.isspace() or ch in _BOUNDARY_PUNCT:
+            if not prev_boundary:
                 ids.append(WORD_BOUNDARY_ID)
                 prev_boundary = True
-        # else: unknown artifact — dropped (UNK_PHONEME reserved, never emitted)
-    # Trim a trailing boundary.
+            continue
+        ids.append(PHONEME_TO_ID.get(ch, UNK_PHONEME_ID))
+        prev_boundary = False
     if ids and ids[-1] == WORD_BOUNDARY_ID:
         ids.pop()
     if max_len is not None and len(ids) > max_len:
@@ -485,45 +599,33 @@ def text_to_phoneme_ids(
     return ids
 
 
-def text_to_word_phoneme_groups(words: list[str]) -> list[list[int]]:
-    """Phonemize a word list, returning one phoneme-id group per input word.
+def text_to_word_phoneme_groups(words: list[str], language: str = "en") -> list[list[int]]:
+    """Phonemize a word list (in ``language``), one phoneme-id group per word.
 
-    Runs g2p ONCE on the joined phrase (so cross-word context / POS is preserved)
-    and splits the phone stream on g2p's word-boundary spaces. This lets the
-    dataset phonemize a song's lyrics once and then slice the groups by word index
-    for any crop window, instead of re-running g2p per segment. If the split count
-    doesn't line up with the words (stray punctuation), falls back to per-word g2p
-    so the 1:1 word→group alignment the caller relies on always holds.
-    """
+    Phonemizes the joined phrase ONCE (cross-word context preserved) with a NUL
+    word separator and splits on it, so the dataset phonemizes a song's lyrics once
+    and slices groups by word index for any crop. If the split count doesn't line
+    up with the words, falls back to per-word phonemize so the 1:1 word->group
+    alignment the caller relies on always holds."""
     if not words:
         return []
-    g2p = _get_g2p()
+    backend = _get_espeak(language)
+    _, word_sep = _get_seps()
     try:
-        groups: list[list[int]] = [[]]
-        for sym in g2p(" ".join(words)):
-            if sym == " ":
-                groups.append([])
-                continue
-            pid = PHONEME_TO_ID.get(sym)
-            if pid is not None:
-                groups[-1].append(pid)
-            # non-space punctuation / artifacts: dropped (don't split the word; UNK
-            # is reserved, never emitted — keeps train/inference id streams identical)
-        if len(groups) == len(words):
-            return groups
+        out = backend.phonemize([" ".join(words)], separator=word_sep, strip=True)[0]
+        ipa_words = out.split("\x00")
+        if len(ipa_words) == len(words):
+            return [_ipa_char_ids(w) for w in ipa_words]
     except Exception:
-        # g2p_en's inflect number expansion raises on absurd digit runs (Whisper
-        # garbage) — fall through to per-word, where the bad word yields [].
         pass
-    # Alignment drift — phonemize each word independently (loses some context but
-    # guarantees the per-word grouping the dataset needs).
-    return [_word_phoneme_ids(g2p, w) for w in words]
+    return [_word_phoneme_ids(backend, w) for w in words]
 
 
-def _word_phoneme_ids(g2p, word: str) -> list[int]:
-    """Phonemize one word; a word g2p can't handle yields an empty group."""
+def _word_phoneme_ids(backend, word: str) -> list[int]:
+    """Phonemize one word; a word espeak can't handle yields an empty group."""
     try:
-        return [PHONEME_TO_ID[s] for s in g2p(word) if s in PHONEME_TO_ID]
+        phone_sep, _ = _get_seps()
+        return _ipa_char_ids(backend.phonemize([word], separator=phone_sep, strip=True)[0])
     except Exception:
         return []
 
@@ -628,8 +730,10 @@ def text_with_markers_to_phoneme_ids(
     tempo_id = UNKNOWN_TEMPO_ID
     key_id = UNKNOWN_KEY_ID
     vocal_id = UNKNOWN_VOCALS_ID
+    lang_id = UNKNOWN_LANG_ID
     section_id = NO_SECTION_ID
-    gender_set = tempo_set = key_set = vocal_set = section_set = False
+    lang_code: str | None = None  # the espeak voice for word phonemization
+    gender_set = tempo_set = key_set = vocal_set = lang_set = section_set = False
     while events and events[0][0] == "marker":
         label = events[0][1]
         if is_gender_label(label) and not gender_set:
@@ -640,8 +744,12 @@ def text_with_markers_to_phoneme_ids(
             key_id, key_set = key_label_to_id(label), True
         elif is_vocal_label(label) and not vocal_set:
             vocal_id, vocal_set = vocal_label_to_id(label), True
+        elif is_lang_label(label) and not lang_set:
+            lang_id, lang_set = lang_label_to_id(label), True
+            lang_code = parse_lang_label(label)
         elif not section_set and not is_gender_label(label) and not is_tempo_label(label) \
-                and not is_key_label(label) and not is_vocal_label(label):
+                and not is_key_label(label) and not is_vocal_label(label) \
+                and not is_lang_label(label):
             section_id, section_set = structure_label_to_id(label), True
         else:
             break
@@ -652,20 +760,21 @@ def text_with_markers_to_phoneme_ids(
         # left at <unknown_vocals> would be out-of-distribution; an explicit
         # [instrumental] (contradictory but allowed) still overrides.
         vocal_id = VOCAL_TOKEN_TO_ID["vocals"]
-    # Compact 5-marker header (no internal word-boundary):
-    # BOS <gender> <tempo> <key> <vocals> <section>.
-    append_unit(ids, [gender_id, tempo_id, key_id, vocal_id, section_id])
+    # Compact 6-marker header (no internal word-boundary):
+    # BOS <gender> <tempo> <key> <vocals> <lang> <section>.
+    append_unit(ids, [gender_id, tempo_id, key_id, vocal_id, lang_id, section_id])
 
+    lang = lang_code or "en"  # default voice when no [lang] given
     for kind, val in events:
         if kind == "marker":
-            if (is_gender_label(val) or is_tempo_label(val)
-                    or is_key_label(val) or is_vocal_label(val)):
-                continue  # gender/tempo/key/vocals are prefix-only; ignore a stray inline marker
+            if (is_gender_label(val) or is_tempo_label(val) or is_key_label(val)
+                    or is_vocal_label(val) or is_lang_label(val)):
+                continue  # gender/tempo/key/vocals/lang are prefix-only; ignore inline
             if not append_unit_capped(ids, [structure_label_to_id(val)], max_len):
                 break
         else:
             stop = False
-            for group in text_to_word_phoneme_groups(val.split()):
+            for group in text_to_word_phoneme_groups(val.split(), language=lang):
                 if not append_unit_capped(ids, group, max_len):
                     stop = True
                     break

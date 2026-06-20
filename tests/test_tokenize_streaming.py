@@ -26,6 +26,7 @@ class FakeCodec:
     SAMPLE_RATE = 44100
     FRAME_RATE_HZ = 86
     N_CODEBOOKS = 9
+    N_CHANNELS = 1
 
     def __init__(self, frames_override: list[int] | None = None, raise_on_encode: bool = False):
         # frames_override: explicit T per file in call order (used to force
@@ -75,15 +76,15 @@ def _make_audio_files(tmp_path: Path, n: int, samples_each: int = 2048) -> list[
 @pytest.fixture
 def patched_load_audio(monkeypatch):
     """Bypass librosa: return a deterministic mono tensor for any path."""
-    def _fake_load(mp3_path, sample_rate):
-        return torch.zeros((1, 2048), dtype=torch.float32)
+    def _fake_load(mp3_path, sample_rate, n_channels=1, normalize=True):
+        return torch.zeros((n_channels, 2048), dtype=torch.float32)
     monkeypatch.setattr(tokmod, "_load_audio", _fake_load)
     return _fake_load
 
 
 # ----- tokenize_one_file -----
 
-def test_one_file_done(tmp_path):
+def test_one_file_done(tmp_path, patched_load_audio):
     codec = FakeCodec()
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -94,7 +95,7 @@ def test_one_file_done(tmp_path):
     assert out.exists()
 
 
-def test_one_file_skipped_existing(tmp_path):
+def test_one_file_skipped_existing(tmp_path, patched_load_audio):
     codec = FakeCodec()
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -104,7 +105,7 @@ def test_one_file_skipped_existing(tmp_path):
     assert result.status == "skipped_existing"
 
 
-def test_one_file_short_not_persisted(tmp_path):
+def test_one_file_short_not_persisted(tmp_path, patched_load_audio):
     codec = FakeCodec(frames_override=[50])
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -115,7 +116,7 @@ def test_one_file_short_not_persisted(tmp_path):
     assert not out.exists()
 
 
-def test_one_file_codec_failure(tmp_path):
+def test_one_file_codec_failure(tmp_path, patched_load_audio):
     codec = FakeCodec(raise_on_encode=True)
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -215,10 +216,10 @@ def test_streaming_load_failure_isolated(tmp_path, monkeypatch):
     items = [(p, tmp_path / (p.stem + ".pt")) for p in mp3s]
     bad_path = mp3s[1]
 
-    def _selective_load(mp3_path, sample_rate):
+    def _selective_load(mp3_path, sample_rate, n_channels=1, normalize=True):
         if mp3_path == bad_path:
             raise IOError("corrupt mp3")
-        return torch.zeros((1, 2048), dtype=torch.float32)
+        return torch.zeros((n_channels, 2048), dtype=torch.float32)
     monkeypatch.setattr(tokmod, "_load_audio", _selective_load)
 
     results = list(tokenize_files_streaming(codec, items, min_frames=1, batch_size=3))

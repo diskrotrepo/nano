@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from model.codec import DACodec
+from model.codec import DACodec, codec_constants
 from model.delay_pattern import build_train_inputs
 from model.fim import fim_reorder_batch
 from model.lora import (
@@ -60,6 +60,15 @@ class TrainConfig:
     eval_batches: int = 26
 
     segment_seconds: float = 30.0
+    # Full-song training: keep songs shorter than the clip and pad+mask their tail
+    # (every song trains on its full length, nothing dropped) instead of filtering
+    # them out. v9 sets this True via DEFAULTS; off = legacy drop-short behavior.
+    pad_short_songs: bool = False
+    # EMA of model weights: maintain an exponential moving average, select+save
+    # best.pt on the EMA's (smoother) val loss. Fixes noisy live-val best-
+    # selection (v8_sing4). Adds ~2x param memory (fp32 shadow). Skipped in LoRA.
+    use_ema: bool = False
+    ema_decay: float = 0.999
     val_ratio: float = 0.12
     patience: int = 20  # evals without val loss improvement before stopping (0 = disabled)
     tags_path: str | None = None  # path to tags.json for text conditioning
@@ -302,6 +311,8 @@ def _build_ckpt_dict(
     prev_val_loss: float | None,
     lora_payload: dict | None = None,
     init_from: str | None = None,
+    model_state: dict | None = None,
+    ema_state: dict | None = None,
 ) -> dict:
     """Build the checkpoint dict used by both the best-checkpoint and
     step-checkpoint save sites. Single source of truth for the on-disk
@@ -331,7 +342,13 @@ def _build_ckpt_dict(
     if lora_payload is not None:
         ckpt["lora"] = lora_payload
     else:
-        ckpt["model"] = _unwrapped_state_dict(model)
+        # model_state override lets best.pt store the EMA-smoothed weights as the
+        # served "model" (the EMA snapshot is the better-for-inference one).
+        ckpt["model"] = model_state if model_state is not None else _unwrapped_state_dict(model)
+    # EMA shadow saved separately so resume continues the average (latest/step
+    # ckpts carry both the live "model" for resume AND "ema" for continuation).
+    if ema_state is not None:
+        ckpt["ema"] = ema_state
     if init_from:
         ckpt["init_from"] = init_from
     if text_encoder is not None:
@@ -698,6 +715,73 @@ def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     return inner
 
 
+class ModelEMA:
+    """Exponential moving average of the model's float params (fp32 shadow).
+
+    Tracks the UNWRAPPED params (no DDP/compile prefixes); they're identical
+    across DDP ranks (DDP syncs grads), so updating rank-locally is correct.
+    ``copy_to``/``restore`` swap the EMA weights into the live model in-place for
+    an eval pass (no DDP collectives touch params during eval, so it's safe),
+    then put the live weights back so training continues. ``served_state`` builds
+    a full state_dict (EMA floats + live non-float buffers) for best.pt — the
+    EMA snapshot is the smoother, better-for-inference one, and selecting/saving
+    on it fixes the noisy live-val best-selection that bit v8_sing4.
+
+    Memory: a full fp32 copy of params (~2x the bf16 params, ~8 GB at 2 B). Watch
+    it against the K=24 + full-song budget; disable via cfg.use_ema if tight."""
+
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = float(decay)
+        self.shadow = {
+            k: v.detach().float().clone()
+            for k, v in _unwrap(model).state_dict().items()
+            if v.is_floating_point()
+        }
+        self._backup: dict | None = None
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        d = self.decay
+        for k, v in _unwrap(model).state_dict().items():
+            s = self.shadow.get(k)
+            if s is not None:
+                s.mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module) -> None:
+        sd = _unwrap(model).state_dict()
+        self._backup = {k: sd[k].detach().clone() for k in self.shadow}
+        for k, s in self.shadow.items():
+            sd[k].copy_(s.to(sd[k].dtype))
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        if self._backup is None:
+            return
+        sd = _unwrap(model).state_dict()
+        for k, v in self._backup.items():
+            sd[k].copy_(v)
+        self._backup = None
+
+    def served_state(self, model: torch.nn.Module) -> dict:
+        """Full state_dict: EMA-smoothed floats + the live model's other entries
+        (non-float buffers), each in the live dtype — a drop-in served checkpoint."""
+        out = {}
+        for k, v in _unwrapped_state_dict(model).items():
+            s = self.shadow.get(k)
+            out[k] = s.to(v.dtype).clone() if s is not None else v.clone()
+        return out
+
+    def state_dict(self) -> dict:
+        return {k: v.clone() for k, v in self.shadow.items()}
+
+    @torch.no_grad()
+    def load_state_dict(self, sd: dict) -> None:
+        for k, s in self.shadow.items():
+            if k in sd:
+                s.copy_(sd[k].to(s.device).float())
+
+
 def _unwrapped_state_dict(model: torch.nn.Module) -> dict:
     """Return state_dict without any wrapper prefixes (compile/DDP)."""
     return _unwrap(model).state_dict()
@@ -832,7 +916,9 @@ def train_run(
             "against a frozen teacher. Pick one."
         )
 
-    segment_frames = int(cfg.segment_seconds * DACodec.FRAME_RATE_HZ)
+    # Active codec's frame rate (NANO_CODEC): DAC=86 Hz, SpectroStream=25 Hz.
+    _frame_rate_hz = codec_constants()["frame_rate_hz"]
+    segment_frames = int(cfg.segment_seconds * _frame_rate_hz)
     if main:
         print(f"segment_frames={segment_frames} (delayed seq len = {segment_frames + cfg.model.n_codebooks - 2})")
         if use_ddp:
@@ -844,20 +930,28 @@ def train_run(
             print("using preloaded mmap bundle (skipping per-rank disk load)",
                   flush=True)
         train_ds = TokenDataset.from_mmap(
-            shared_bundle, "train", segment_frames, cfg.model.max_lyric_len)
+            shared_bundle, "train", segment_frames, cfg.model.max_lyric_len,
+            n_codebooks=cfg.model.n_codebooks,
+            pad_short=cfg.pad_short_songs, pad_id=cfg.model.pad_id)
         val_ds = TokenDataset.from_mmap(
-            shared_bundle, "val", segment_frames, cfg.model.max_lyric_len)
+            shared_bundle, "val", segment_frames, cfg.model.max_lyric_len,
+            n_codebooks=cfg.model.n_codebooks,
+            pad_short=cfg.pad_short_songs, pad_id=cfg.model.pad_id)
     else:
         train_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="train",
                                 val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
                                 lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
                                 keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
-                                max_lyric_len=cfg.model.max_lyric_len)
+                                max_lyric_len=cfg.model.max_lyric_len,
+                                n_codebooks=cfg.model.n_codebooks,
+                                pad_short=cfg.pad_short_songs, pad_id=cfg.model.pad_id)
         val_ds = TokenDataset(cfg.cache_dir, segment_frames=segment_frames, split="val",
                               val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
                               lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
                               keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
-                              max_lyric_len=cfg.model.max_lyric_len)
+                              max_lyric_len=cfg.model.max_lyric_len,
+                              n_codebooks=cfg.model.n_codebooks,
+                              pad_short=cfg.pad_short_songs, pad_id=cfg.model.pad_id)
 
     # Steer training crops toward sung regions so most <vocals> crops actually
     # carry phonemes (uniform crops often land on a vocal song's instrumental
@@ -1110,6 +1204,22 @@ def train_run(
         best_val_step = restored["best_val_step"]
         evals_without_improvement = restored["evals_without_improvement"]
         prev_val_loss = restored["prev_val_loss"]
+
+    # EMA shadow (skipped in LoRA: the adapter-only schema has no full "model").
+    # Built AFTER weights are loaded (resume/init) so it starts from the right
+    # snapshot, and BEFORE the loop. On resume, continue the saved average.
+    ema = None
+    if cfg.use_ema and _lora_payload() is None:
+        ema = ModelEMA(model, cfg.ema_decay)
+        if plan.mode == "resume" and plan.ckpt is not None and "ema" in plan.ckpt:
+            ema.load_state_dict(plan.ckpt["ema"])
+            if main:
+                print(f"resumed EMA shadow (decay={cfg.ema_decay})", flush=True)
+        elif main:
+            print(f"EMA enabled (decay={cfg.ema_decay}) — best.pt saves EMA weights",
+                  flush=True)
+
+    if plan.mode == "resume":
         plan.ckpt = None  # free the CPU copy
         if main:
             print(f"resumed from {Path(cfg.ckpt_dir) / 'latest.pt'} at step {step}")
@@ -1248,6 +1358,8 @@ def train_run(
         max_gnorm = gnorm if max_gnorm is None else torch.maximum(max_gnorm, gnorm)
         scaler.step(optim)
         scaler.update()
+        if ema is not None:
+            ema.update(model)  # smooth the weights right after the optimizer step
 
         running = loss.detach() if running is None else running + loss.detach()
         running_count += 1
@@ -1302,8 +1414,16 @@ def train_run(
             # All ranks evaluate their shard; we average loss + per-codebook
             # losses across ranks so every rank takes the same early-stop
             # decision (otherwise DDP deadlocks at the next collective).
+            # With EMA on, evaluate (and thus select/early-stop on) the EMA
+            # weights — swap them into the live model for the no-grad eval pass,
+            # then restore so training continues on the live weights. All ranks
+            # swap identically and eval does no param collectives, so it's safe.
+            if ema is not None:
+                ema.copy_to(model)
             val_loss, val_per_cb = _evaluate(model, val_loader, cfg, cfg.eval_batches,
                                             text_encoder=text_encoder, tag_cache=tag_cache)
+            if ema is not None:
+                ema.restore(model)
             if use_ddp:
                 vl = torch.tensor([val_loss], device=cfg.device, dtype=torch.float32)
                 _all_reduce_mean(vl)
@@ -1353,6 +1473,9 @@ def train_run(
                 evals_without_improvement = 0
                 if main:
                     best_path = Path(cfg.ckpt_dir) / "best.pt"
+                    # best.pt stores the EMA-smoothed weights as the served "model"
+                    # (that's what the EMA val just measured as best); served_state
+                    # = EMA floats + live non-float buffers, in the live dtypes.
                     ckpt_data = _build_ckpt_dict(
                         model=model, optim=optim, text_encoder=ckpt_text_encoder,
                         cfg_model_dict=cfg.model.__dict__,
@@ -1362,6 +1485,7 @@ def train_run(
                         prev_val_loss=prev_val_loss,
                         lora_payload=_lora_payload(),
                         init_from=cfg.init_from or plan.base_ckpt_path,
+                        model_state=ema.served_state(model) if ema is not None else None,
                     )
                     torch.save(ckpt_data, best_path)
                     print(f"  checkup at step {step:>6}  score {val_loss:.4f}  "
@@ -1387,6 +1511,9 @@ def train_run(
 
         if step % cfg.ckpt_every == 0 or step == cfg.steps:
             if main:
+                # step/latest save the LIVE model + optim (for resume) plus the EMA
+                # shadow (so resume continues the average). best.pt above is the
+                # EMA-as-served snapshot.
                 ckpt = _build_ckpt_dict(
                     model=model, optim=optim, text_encoder=ckpt_text_encoder,
                     cfg_model_dict=cfg.model.__dict__,
@@ -1396,6 +1523,7 @@ def train_run(
                     prev_val_loss=prev_val_loss,
                     lora_payload=_lora_payload(),
                     init_from=cfg.init_from or plan.base_ckpt_path,
+                    ema_state=ema.state_dict() if ema is not None else None,
                 )
                 p = Path(cfg.ckpt_dir) / f"step_{step:07d}.pt"
                 torch.save(ckpt, p)

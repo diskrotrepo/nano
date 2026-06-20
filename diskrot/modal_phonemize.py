@@ -25,23 +25,14 @@ app = modal.App("nano-phonemize")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    # v9 multilingual: espeak-ng is the phonemizer backend (system shared lib +
+    # the `phonemizer` Python wrapper), replacing the English-only g2p_en/nltk.
+    .apt_install("espeak-ng", "libespeak-ng1")
     .pip_install(
         "torch>=2.4",  # model.lyric_encoder import chain
         "numpy>=1.26",
-        "g2p_en>=2.1",
-        "nltk>=3.8",
+        "phonemizer>=3.2",
         "tqdm>=4.66",  # diskrot.transcribe_lyrics import chain (shard helpers)
-    )
-    .run_commands(
-        # g2p_en needs these nltk corpora; bake them into the image so the
-        # worker processes don't race to download them at runtime (a 16-way
-        # concurrent nltk.download() corrupts the zip -> BadZipFile). Both
-        # tagger names are required: g2p_en's import guard probes the OLD
-        # 'averaged_perceptron_tagger', while nltk>=3.9's pos_tag loads the
-        # '_eng' variant at call time.
-        "python -c \"import nltk; nltk.download('averaged_perceptron_tagger'); "
-        "nltk.download('averaged_perceptron_tagger_eng'); "
-        "nltk.download('cmudict')\"",
     )
     .add_local_python_source("diskrot", "model")
 )

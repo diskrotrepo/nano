@@ -95,11 +95,12 @@ def test_getitem_shape_and_dtype(synth_tokens_dir):
     # empty/fully-padded sequence, which would NaN the lyric cross-attention).
     from model.lyric_encoder import (
         BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
-        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
+        UNKNOWN_LANG_ID, UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
     )
+    # v9 6-marker header: BOS <gender> <tempo> <key> <vocals> <lang> <section>.
     assert lyric_ids.tolist() == [
         BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID,
+        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, UNKNOWN_LANG_ID, NO_SECTION_ID,
     ]
 
 
@@ -287,13 +288,14 @@ def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
     transcribed)."""
     from model.lyric_encoder import (
         BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
-        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID, VOCAL_TOKEN_TO_ID,
+        UNKNOWN_LANG_ID, UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID, VOCAL_TOKEN_TO_ID,
     )
 
+    # v9 6-marker header (lyrics here carry no language -> <unknown_lang>).
     prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-              UNKNOWN_KEY_ID, VOCAL_TOKEN_TO_ID["vocals"], NO_SECTION_ID]
+              UNKNOWN_KEY_ID, VOCAL_TOKEN_TO_ID["vocals"], UNKNOWN_LANG_ID, NO_SECTION_ID]
     unknown_prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-                      UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID]
+                      UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, UNKNOWN_LANG_ID, NO_SECTION_ID]
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({

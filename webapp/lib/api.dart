@@ -70,7 +70,9 @@ class GenParams {
   static const int defaultTopK = 120;
   static const double defaultTopP = 0.95;
   static const double defaultCfgScale = 7.0;
-  static const double defaultLyricCfgScale = 3.0;
+  // bumped 3->8: at this checkpoint vocals only show up under strong lyric
+  // guidance (words are still hallucinated — a data/training issue, not a knob).
+  static const double defaultLyricCfgScale = 8.0;
   static const double defaultMelodyCfgScale = 0.0;
 
   // sampling (all modes)

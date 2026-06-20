@@ -40,6 +40,9 @@ BLOCKING_OK = {
     "modal_test_transcribe.py", # diagnostic probe, inline output
     "modal_wave_cleanup.py",    # quick per-wave inode reclaim; dry-run reports inline
     "modal_shard_stores.py",    # one-time JSON->shards migration, seconds, inline
+    "modal_spectrostream_spike.py",  # v9 codec spike — interactive A/B, inline report
+    "modal_duration_audit.py",       # quick read-only duration histogram, inline
+    "modal_ipa_coverage.py",         # v9 IPA-coverage spike — read-only, inline report
 }
 
 MODAL_RUN_RE = re.compile(

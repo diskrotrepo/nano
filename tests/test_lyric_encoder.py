@@ -52,15 +52,21 @@ from model.lyric_encoder import N_TEMPO_BUCKETS
 
 
 def _g2p_available() -> bool:
+    # v9: the phonemizer is espeak-ng via the `phonemizer` lib. Probe it directly
+    # (text_to_phoneme_ids swallows a missing-backend error and returns [BOS], so
+    # it can't be used to detect availability). Tests skip when espeak-ng isn't
+    # installed (local dev); they run on the Modal phonemize image.
     try:
-        text_to_phoneme_ids("test")
+        from phonemizer.backend import EspeakBackend
+
+        EspeakBackend("en-us")  # constructs only if the espeak-ng shared lib is present
         return True
     except Exception:
         return False
 
 
 g2p_required = pytest.mark.skipif(
-    not _g2p_available(), reason="g2p_en / nltk data not installed"
+    not _g2p_available(), reason="phonemizer / espeak-ng not installed",
 )
 
 
@@ -75,9 +81,10 @@ def test_vocab_specials_at_low_ids():
 def test_vocab_size_and_uniqueness():
     assert PHONEME_VOCAB_SIZE == len(PHONEME_VOCAB)
     assert len(set(PHONEME_VOCAB)) == PHONEME_VOCAB_SIZE  # no dup ids
-    # 4 specials + 9 structure + 3 gender + 15 tempo (1 unknown + 14 buckets)
-    # + 25 key (1 unknown + 24 keys) + 3 vocal + 70 ARPABET
-    assert PHONEME_VOCAB_SIZE == 129
+    # v9 multilingual: 4 specials + 9 structure + 3 gender + 15 tempo
+    # (1 unknown + 14 buckets) + 25 key (1 unknown + 24 keys) + 3 vocal
+    # + 36 lang (1 unknown + 35 langs) + 157 IPA codepoints
+    assert PHONEME_VOCAB_SIZE == 252
 
 
 # --- structure markers -------------------------------------------------------

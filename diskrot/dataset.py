@@ -21,7 +21,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from model.codec import DACodec
+from model.codec import DACodec, codec_constants
+
+# Frame rate of the active codec's tokens (NANO_CODEC): DAC=86 Hz, SpectroStream=25
+# Hz. Drives the seconds<->frames math in crop biasing + structure markers, so it
+# MUST match the codec the corpus was tokenized with.
+_FRAME_RATE_HZ = codec_constants()["frame_rate_hz"]
 
 
 def _load_tags(tags_path: str | Path | None, verbose: bool = True) -> dict[str, str]:
@@ -243,11 +248,14 @@ def _build_mmap_split_index(
     segment_frames: int,
     val_ratio: float,
     seed: int,
+    pad_short: bool = False,
 ) -> tuple[list[tuple[int, int, str, int]], list[tuple[int, int, str, int]], dict]:
     """Build (train_entries, val_entries, shard_metas) over a packed/ dir.
 
     ``entries`` is a list of (shard_id, local_idx, name, n_frames). Songs too
-    short for ``segment_frames`` are filtered out. Train/val split is a stable
+    short for ``segment_frames`` are filtered out UNLESS ``pad_short`` (then they
+    are kept and the dataset pads+masks the tail — the v9 full-song path, so every
+    song trains on its full length). Train/val split is a stable
     per-song hash of the name (+ seed), so adding songs/waves never moves an
     existing song between splits (see the split block below).
 
@@ -262,8 +270,12 @@ def _build_mmap_split_index(
     for shard_id, local_idx, name, n_frames in iter_all_names(packed_dir):
         if shard_id not in shard_metas:
             shard_metas[shard_id] = load_shard_meta(packed_dir, shard_id)
-        # +2 mirrors _load_one: leave headroom for the random crop offset.
-        if n_frames < segment_frames + 2:
+        # +2 mirrors _load_one: leave headroom for the random crop offset. With
+        # pad_short, keep every song (>=1 frame) — songs shorter than the clip are
+        # padded+masked in __getitem__ rather than dropped.
+        if not pad_short and n_frames < segment_frames + 2:
+            continue
+        if pad_short and n_frames < 1:
             continue
         all_entries.append((shard_id, local_idx, name, n_frames))
 
@@ -305,6 +317,7 @@ def load_mmap_bundle(
     structure_path: str | Path | None = None,
     keys_path: str | Path | None = None,
     phonemes_path: str | Path | None = None,
+    pad_short: bool = False,
 ) -> dict:
     """Parent-process bundle for the v2 sharded mmap path.
 
@@ -316,7 +329,7 @@ def load_mmap_bundle(
     packed_dir = Path(packed_dir)
     t0 = time.time()
     train_entries, val_entries, shard_metas = _build_mmap_split_index(
-        packed_dir, segment_frames, val_ratio, seed,
+        packed_dir, segment_frames, val_ratio, seed, pad_short=pad_short,
     )
     # Melody is available iff the pack wrote the parallel chroma sidecars (index
     # flag). The dataset then co-crops chroma with the SAME crop window.
@@ -367,6 +380,9 @@ class TokenDataset(Dataset):
         keys_path: str | Path | None = None,
         phonemes_path: str | Path | None = None,
         max_lyric_len: int = 256,
+        n_codebooks: int | None = None,
+        pad_short: bool = False,
+        pad_id: int = 1024,
     ):
         from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
 
@@ -389,9 +405,12 @@ class TokenDataset(Dataset):
             structure_path=structure_path,
             keys_path=keys_path,
             phonemes_path=phonemes_path,
+            pad_short=pad_short,
         )
         # Delegate to from_mmap and steal its state into self.
-        ds = TokenDataset.from_mmap(bundle, split, segment_frames, max_lyric_len)
+        ds = TokenDataset.from_mmap(
+            bundle, split, segment_frames, max_lyric_len, n_codebooks,
+            pad_short=pad_short, pad_id=pad_id)
         self.__dict__.update(ds.__dict__)
 
     @classmethod
@@ -401,6 +420,9 @@ class TokenDataset(Dataset):
         split: str,
         segment_frames: int,
         max_lyric_len: int = 256,
+        n_codebooks: int | None = None,
+        pad_short: bool = False,
+        pad_id: int = 1024,
     ) -> "TokenDataset":
         """Wire up a TokenDataset over the sharded mmap bundle.
 
@@ -413,6 +435,14 @@ class TokenDataset(Dataset):
         ds = cls.__new__(cls)
         ds.segment_frames = segment_frames
         ds.max_lyric_len = max_lyric_len
+        # Model's codebook count (RVQ prefix of the stored depth); None = use all
+        # stored codebooks. See __getitem__ for the slice.
+        ds.n_codebooks = n_codebooks
+        # Full-song padding: keep songs shorter than segment_frames and pad their
+        # crop to segment_frames with pad_id (tokens, masked in loss via
+        # ignore_index) / zeros (melody). Off = legacy drop-short behavior.
+        ds.pad_short = pad_short
+        ds.pad_id = pad_id
         ds._packed_dir = bundle["packed_dir"]
         ds._mmap_entries = bundle[f"{split}_entries"]
         ds._shard_metas = bundle["shard_metas"]
@@ -542,12 +572,15 @@ class TokenDataset(Dataset):
         from model.lyric_encoder import (
             BOS_PHONEME_ID, VOCAL_TOKEN_TO_ID, UNKNOWN_VOCALS_ID, append_unit,
             append_unit_capped, bpm_to_id, gender_label_to_id, key_label_to_id,
-            structure_label_to_id, text_to_word_phoneme_groups,
+            lang_label_to_id, structure_label_to_id, text_to_word_phoneme_groups,
         )
 
         segs = self._structure.get(name)
         entry = self._lyrics.get(name)
         gender = entry.get("gender") if isinstance(entry, dict) else None
+        # v9: detected language (transcribe stores it) -> <lang_*> header marker +
+        # the language the lyrics are phonemized in. None -> <unknown_lang> / en.
+        language = entry.get("language") if isinstance(entry, dict) else None
         bpm = self._bpm.get(name)
         if entry:
             vocal_id = VOCAL_TOKEN_TO_ID["vocals"]
@@ -555,14 +588,15 @@ class TokenDataset(Dataset):
             vocal_id = VOCAL_TOKEN_TO_ID["instrumental"]
         else:
             vocal_id = UNKNOWN_VOCALS_ID
-        # Compact 5-marker header (no internal word-boundary):
-        # BOS <gender> <tempo> <key> <vocals> <section>.
+        # Compact 6-marker header (no internal word-boundary):
+        # BOS <gender> <tempo> <key> <vocals> <lang> <section>.
         ids = [BOS_PHONEME_ID]
         append_unit(ids, [
             gender_label_to_id(gender),
             bpm_to_id(bpm),
             key_label_to_id(self._keys.get(name)),
             vocal_id,
+            lang_label_to_id(language),
             structure_label_to_id(_active_label_at(segs, start_sec)),
         ])
 
@@ -579,7 +613,8 @@ class TokenDataset(Dataset):
                 groups = [flat[offs[i]:offs[i + 1]].tolist()
                           for i in range(len(offs) - 1)]
             else:
-                groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
+                groups = text_to_word_phoneme_groups(
+                    [w["word"] for w in entry["words"]], language=language)
             self._word_phones[name] = groups
             if len(self._word_phones) > self._word_phones_cap:
                 self._word_phones.popitem(last=False)  # evict least-recently-used
@@ -623,13 +658,13 @@ class TokenDataset(Dataset):
             words = entry.get("words") if isinstance(entry, dict) else None
             if words:
                 w = random.choice(words)
-                seg_sec = self.segment_frames / DACodec.FRAME_RATE_HZ
+                seg_sec = self.segment_frames / _FRAME_RATE_HZ
                 # start_sec range that keeps word w fully inside the crop window,
                 # clamped to the valid range; drawn uniformly within it.
                 lo = max(0.0, float(w["end"]) - seg_sec)
-                hi = min(max_start / DACodec.FRAME_RATE_HZ, float(w["start"]))
+                hi = min(max_start / _FRAME_RATE_HZ, float(w["start"]))
                 if lo <= hi:
-                    start = int(round(random.uniform(lo, hi) * DACodec.FRAME_RATE_HZ))
+                    start = int(round(random.uniform(lo, hi) * _FRAME_RATE_HZ))
                     return max(0, min(start, max_start))
         return random.randint(0, max_start)
 
@@ -637,16 +672,28 @@ class TokenDataset(Dataset):
         t = self._get(idx)  # [K, T_full] int16 — torch.Tensor or np.memmap view
         T = t.shape[1]
         start = self._choose_crop_start(idx, T)
-        crop = t[:, start:start + self.segment_frames]
+        # Slice stored codebooks -> the model's n_codebooks (RVQ prefix). The corpus
+        # may be packed at a deeper STORED depth (e.g. SpectroStream 32) than the
+        # model trains on (e.g. 24); slicing the mmap view here drops the unused
+        # codebooks before collate. ``n_codebooks=None`` -> all stored (DAC, or a
+        # model that uses the full stored depth). t[:None] == t[:] in Python.
+        crop = t[:self.n_codebooks, start:start + self.segment_frames]
         if not isinstance(crop, torch.Tensor):
             # mmap path: materialize the ~46 KB int16 crop (30s case) so the
             # collate doesn't carry a memmap view across the worker boundary.
             crop = torch.from_numpy(np.ascontiguousarray(crop))
         tokens = crop
+        # Full-song padding: a song shorter than the clip yields a short crop; pad
+        # the time axis up to segment_frames with pad_id so it stacks with full-
+        # length crops. The padded targets are pad_id -> ignored by the loss
+        # (ignore_index=pad_id), so the model is never graded on the filler tail.
+        pad_n = self.segment_frames - tokens.shape[1]
+        if self.pad_short and pad_n > 0:
+            tokens = torch.nn.functional.pad(tokens, (0, pad_n), value=self.pad_id)
         tags = self._tags.get(self.names[idx], "")
         # time-aligned lyric phoneme ids for this segment
-        start_sec = start / DACodec.FRAME_RATE_HZ
-        end_sec = (start + self.segment_frames) / DACodec.FRAME_RATE_HZ
+        start_sec = start / _FRAME_RATE_HZ
+        end_sec = (start + self.segment_frames) / _FRAME_RATE_HZ
         lyric_ids = self._get_segment_lyric_ids(self.names[idx], start_sec, end_sec)
         # Co-crop the chroma with the IDENTICAL [start, start+segment_frames] window
         # so the melody lines up with the tokens frame-for-frame. -> [seg, 12] float.
@@ -654,4 +701,10 @@ class TokenDataset(Dataset):
         if self._has_melody:
             mel = np.ascontiguousarray(self._get_mel(idx)[:, start:start + self.segment_frames])
             melody = torch.from_numpy(mel).to(torch.float32).transpose(0, 1).contiguous()
+            # Co-pad the chroma to segment_frames with zero (silent) frames so it
+            # lines up with the padded tokens; zero chroma is in-distribution (the
+            # packer zero-fills missing melody) and the MelodyEncoder handles it.
+            if self.pad_short and melody.shape[0] < self.segment_frames:
+                melody = torch.nn.functional.pad(
+                    melody, (0, 0, 0, self.segment_frames - melody.shape[0]))
         return tokens, tags, torch.tensor(lyric_ids, dtype=torch.long), melody

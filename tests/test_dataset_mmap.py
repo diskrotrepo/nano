@@ -44,11 +44,12 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     # header (see lyric_encoder)
     from model.lyric_encoder import (
         BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
-        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
+        UNKNOWN_LANG_ID, UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
     )
+    # v9 6-marker header: BOS <gender> <tempo> <key> <vocals> <lang> <section>.
     assert lyric_ids.tolist() == [
         BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID,
+        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, UNKNOWN_LANG_ID, NO_SECTION_ID,
     ]
 
 

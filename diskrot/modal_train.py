@@ -146,9 +146,23 @@ DEFAULTS = {
     "n_heads": 16,                 # head_dim = 128 (even, RoPE-safe; 2048 % 16 == 0)
     "d_ff": 8192,
     "dropout": 0.05,
-    "max_seq_len": 8192,           # RoPE table covers ~95s at 86 Hz (60s seg = 5168 frames, fits)
+    # v9: the model predicts K=24 SpectroStream RVQ codebooks (joint stereo, vocab
+    # 1024 — same as DAC, so only the count changes). The corpus is tokenized at a
+    # STORED depth of 32 (env NANO_SS_DEPTH), and the dataset slices [:24]; bump this
+    # to <=32 to retune K with no re-tokenize. A DAC run would override to 9.
+    "n_codebooks": 24,
+    "max_seq_len": 8192,           # at 25 Hz (SpectroStream) covers ~5.4 min; a full
+                                   # song fits (210s = 5250 frames + K-1 delay tail)
     "use_gradient_checkpointing": True,
-    "segment_seconds": 60.0,       # 60s = 5160 frames; native ~1-min single-shot
+    # v9 full-song: 180s clips. At 25 Hz that's 4500 frames (< v8's 60s@86Hz =
+    # 5160), so per-step cost is comparable. pad_short_songs keeps every song
+    # (median ~190s) by padding+masking the tail, so nothing is dropped.
+    "segment_seconds": 180.0,
+    "pad_short_songs": True,
+    # EMA weights: select + save best.pt on the EMA's smoother val loss (fixes the
+    # noisy best-selection that flatlined v8_sing4). ~2x param memory (fp32 shadow).
+    "use_ema": True,
+    "ema_decay": 0.999,
     "batch_size": 32,              # global; per-rank = 4 on 8 ranks. Halved from 64
                                    # because 60s doubles the sequence — per-rank token
                                    # load (4×5160) is identical to the old 30s 8×2580
@@ -182,7 +196,7 @@ DEFAULTS = {
     # biased toward sung regions (dataset.bias_vocal_crops) + max_lyric_len 512.
     # Bumped from v8_sing3 (abandoned at ~1% / step 4k) so a bare relaunch starts
     # clean rather than resuming the old dir; override with --ckpt-subdir.
-    "ckpt_subdir": "v8_sing4",
+    "ckpt_subdir": "v9_stereo",
     # Lyric (phoneme) conditioning — a ~100M bidirectional encoder feeding a
     # per-block lyric cross-attention. Enabled together with tag conditioning.
     "lyric_enc_layers": 3,
@@ -219,6 +233,9 @@ def _build_cfg_kwargs(
     steps: int, batch_size: int, lr: float, warmup_steps: int,
     patience: int, eval_batches: int, ckpt_subdir: str, text_conditioned: bool,
     segment_seconds: float = 10.0,
+    pad_short_songs: bool = DEFAULTS["pad_short_songs"],
+    use_ema: bool = DEFAULTS["use_ema"],
+    ema_decay: float = DEFAULTS["ema_decay"],
     fim_prob: float = DEFAULTS["fim_prob"],
     wandb_project: str | None = None, wandb_run_name: str | None = None,
     init_from: str = "",
@@ -267,6 +284,9 @@ def _build_cfg_kwargs(
         phonemes_path=phonemes_path,
         text_conditioned=text_conditioned,
         segment_seconds=segment_seconds,
+        pad_short_songs=pad_short_songs,
+        use_ema=use_ema,
+        ema_decay=ema_decay,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
         init_from=f"/ckpts/{init_from}" if init_from else None,
@@ -286,6 +306,7 @@ def _build_cfg_kwargs(
 def _build_model_cfg(
     d_model: int, n_layers: int, n_heads: int, d_ff: int, dropout: float,
     text_conditioned: bool,
+    n_codebooks: int = DEFAULTS["n_codebooks"],
     max_seq_len: int = DEFAULTS["max_seq_len"],
     use_gradient_checkpointing: bool = True,
     lyric_enc_layers: int = DEFAULTS["lyric_enc_layers"],
@@ -309,6 +330,7 @@ def _build_model_cfg(
         use_lyric_conditioning=text_conditioned,
         use_melody_conditioning=text_conditioned,
         use_fim=use_fim,
+        n_codebooks=n_codebooks,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
         d_ff=d_ff, dropout=dropout,
         max_seq_len=max_seq_len,
@@ -664,9 +686,9 @@ def train_remote_multi(
     from pathlib import Path as _Path
 
     from diskrot.dataset import load_mmap_bundle
-    from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
+    from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME, load_shard_index
     from diskrot.train import TrainConfig
-    from model.codec import DACodec
+    from model.codec import codec_constants
 
     _setup_mp_sharing()
 
@@ -694,11 +716,24 @@ def train_remote_multi(
     _defaults = TrainConfig()
     # cfg_kwargs already carries the resolved segment_seconds; use it (not the
     # TrainConfig default) so the bundle covers the right crop window.
-    segment_frames = int(cfg_kwargs["segment_seconds"] * DACodec.FRAME_RATE_HZ)
+    # Active codec's frame rate (NANO_CODEC): DAC=86 Hz, SpectroStream=25 Hz.
+    segment_frames = int(cfg_kwargs["segment_seconds"] * codec_constants()["frame_rate_hz"])
     packed_dir = _Path(cfg_kwargs["cache_dir"]) / PACKED_DIR
     if not (packed_dir / SHARD_INDEX_NAME).exists():
         raise FileNotFoundError(
             f"No sharded packed layout at {packed_dir} — run diskrot.pack_cache first"
+        )
+    # Guard: the pack's STORED codebook depth must be >= the model's n_codebooks
+    # (the dataset slices stored -> model K). A mismatch is almost always a
+    # NANO_CODEC / --data-subdir mistake (e.g. a 24-cb model pointed at the old
+    # 9-cb DAC pack, or a stored depth < the chosen K). Fail fast with a clear msg.
+    _stored_k = int(load_shard_index(packed_dir)["n_codebooks"])
+    _model_k = int(cfg_kwargs.get("n_codebooks") or DEFAULTS["n_codebooks"])
+    if _stored_k < _model_k:
+        raise ValueError(
+            f"packed corpus at {packed_dir} stores {_stored_k} codebooks but the "
+            f"model wants n_codebooks={_model_k}. Re-tokenize deeper (NANO_SS_DEPTH) "
+            f"or lower DEFAULTS['n_codebooks'] / --data-subdir to the right pack."
         )
     print(f"[parent] sharded layout detected at {packed_dir} — using mmap bundle "
           f"(segment_frames={segment_frames})", flush=True)
@@ -712,6 +747,7 @@ def train_remote_multi(
         structure_path=cfg_kwargs["structure_path"],
         keys_path=cfg_kwargs["keys_path"],
         phonemes_path=cfg_kwargs["phonemes_path"],
+        pad_short=cfg_kwargs.get("pad_short_songs", False),
     )
     tag_cache: dict = {}
     if text_conditioned and shared_bundle["tags"]:

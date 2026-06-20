@@ -106,6 +106,15 @@ class GPTConfig:
     use_melody_conditioning: bool = False
     melody_n_bins: int = 12
     melody_enc_layers: int = 2
+    # Generative stem conditioning (the /addstem path) — a token-domain axis: a
+    # StemEncoder embeds a SOURCE stem's full codec tokens [B,K,T] (+ a stem-type
+    # id) and the decoder ADDS the result per-frame at the cb0 anchor, exactly like
+    # melody but full-fidelity (token-domain, not a lossy feature). Lets the model
+    # generate a full mix built around a given stem. Off by default (checkpoint-
+    # incompatible new submodule); enabled in a fresh v9 start with the stem cache.
+    use_stem_conditioning: bool = False
+    stem_enc_layers: int = 2
+    n_stem_types: int = 4  # drums/bass/vocals/other (model/stem_encoder.STEM_TYPES)
     # Fill-in-the-middle (infill). When enabled, training reorders a fraction of
     # crops into the canonical FIM layout `prefix <SUF> suffix <MID> middle` (a
     # frame-domain reorder before the delay pattern — attention and the delay
@@ -411,6 +420,19 @@ class NanoAudioGPT(nn.Module):
                 d_model=cfg.d_model,
                 n_bins=cfg.melody_n_bins,
                 n_layers=cfg.melody_enc_layers,
+                dropout=cfg.dropout,
+            )
+        # StemEncoder also lives INSIDE the model (same rationale): token-domain,
+        # added per-frame like melody. See _stem_add for the additive injection.
+        if cfg.use_stem_conditioning:
+            from .stem_encoder import StemEncoder
+
+            self.stem_encoder = StemEncoder(
+                d_model=cfg.d_model,
+                n_codebooks=cfg.n_codebooks,
+                vocab_with_pad=cfg.vocab_with_pad,
+                n_layers=cfg.stem_enc_layers,
+                n_stem_types=cfg.n_stem_types,
                 dropout=cfg.dropout,
             )
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
