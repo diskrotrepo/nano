@@ -35,6 +35,14 @@ MAX_CHARS = 3000          # the chunked-CLAP tag path's design target
 
 DEFAULT_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 
+# Stamped into each tags.json entry (``{"description": ..., "captioner": MARKER}``)
+# so a re-caption pass can skip entries already at this format and only redo
+# legacy/short ones. Bump the suffix if the caption format changes (new prompt,
+# new model) and you want a --redo to redo everything. NOTE: diskrot/modal_auto_tag.py
+# duplicates this literal (its slim orchestrator image can't import this module) —
+# keep the two in sync.
+CAPTIONER_MARKER = "audio_llm_v1"
+
 _CAPTION_INSTRUCTION = (
     "You are an expert music annotator. The audio contains one or more excerpts "
     "from the SAME track, in order. Write ONE rich, information-dense description "

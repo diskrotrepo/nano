@@ -26,6 +26,16 @@ def _captioner_kind() -> str:
     return os.environ.get("NANO_CAPTIONER", "audio_llm").strip().lower()
 
 
+def _marker(kind: str) -> str:
+    """The ``captioner`` stamp for this kind — lets --redo skip already-upgraded
+    entries and only re-caption legacy ones (resumable)."""
+    if kind == "bart":
+        return "bart_v1"
+    from model.audio_llm_captioner import CAPTIONER_MARKER
+
+    return CAPTIONER_MARKER
+
+
 def _load_audio_clip(path: str | Path, sr: int, duration: int) -> np.ndarray:
     """Legacy BART path: a single representative 10-second crop (25 % in)."""
     n_samples = sr * duration
@@ -67,12 +77,15 @@ def caption_corpus(
 ) -> None:
     """Caption MP3s in *corpus_dir* and write tags.json.
 
-    ``redo=True`` re-captions every song (e.g. to replace short legacy captions
-    with the new long format); otherwise songs already in tags.json are skipped.
+    ``redo=True`` re-captions only songs whose existing caption is NOT the current
+    format — identified by the ``captioner`` marker, so legacy/short entries are
+    upgraded while already-current ones are skipped (a killed --redo resumes). A
+    bare run skips every song already in tags.json.
     """
     corpus_dir = Path(corpus_dir)
     out_path = Path(out_path)
     kind = _captioner_kind()
+    marker = _marker(kind)
 
     mp3s = sorted(corpus_dir.glob("*.mp3"))
     if not mp3s:
@@ -98,8 +111,11 @@ def caption_corpus(
     pbar = tqdm(mp3s, desc="captioning", unit="file")
     for mp3 in pbar:
         key = mp3.stem
-        if key in existing and not redo:
-            tags[key] = existing[key]
+        cur = existing.get(key)
+        is_current = isinstance(cur, dict) and cur.get("captioner") == marker
+        # skip if it exists AND (we're not redoing, OR it's already current)
+        if cur is not None and not (redo and not is_current):
+            tags[key] = cur
             n_skipped += 1
             pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
             continue
@@ -111,7 +127,7 @@ def caption_corpus(
             pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
             continue
 
-        tags[key] = {"description": description}
+        tags[key] = {"description": description, "captioner": marker}
         n_done += 1
         pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
 

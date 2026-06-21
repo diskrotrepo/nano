@@ -9,8 +9,8 @@ tokens volume. Set ``NANO_CAPTIONER=bart`` (+ the matching image) for the legacy
 single-window LP-MusicCaps captioner.
 
 Run (spawns and returns immediately; --detach keeps the app alive):
-    modal run --detach diskrot/modal_auto_tag.py            # caption pending songs
-    modal run --detach diskrot/modal_auto_tag.py --redo     # re-caption ALL (long format)
+    modal run --detach diskrot/modal_auto_tag.py            # caption missing songs
+    modal run --detach diskrot/modal_auto_tag.py --redo     # + upgrade legacy short captions (resumable)
     modal run --detach diskrot/modal_auto_tag.py --limit 50 # calibrate the image/cost first
 
 Watch:
@@ -33,6 +33,19 @@ app = modal.App("nano-auto-tag")
 
 
 _CAPTION_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
+
+# Stamped into each tags.json entry so a re-caption pass can tell a current
+# (long, audio-LLM) caption from a legacy one and skip the ones already upgraded
+# — the same "treat entries missing the marker as pending" trick the v9 README's
+# --redo-missing-language transcribe pass uses. MUST match
+# model.audio_llm_captioner.CAPTIONER_MARKER (duplicated as a literal because the
+# slim orchestrator image can't import that numpy-heavy module).
+CAPTIONER_MARKER = "audio_llm_v1"
+
+
+def _is_current(entry) -> bool:
+    """True iff *entry* was produced by the current captioner (skip on --redo)."""
+    return isinstance(entry, dict) and entry.get("captioner") == CAPTIONER_MARKER
 
 
 def _prefetch_captioner():
@@ -100,7 +113,8 @@ class Captioner:
             try:
                 windows = load_song_windows(str(path))
                 description = self.model.caption(windows)
-                out.append((stem, {"description": description}, None))
+                out.append((stem, {"description": description,
+                                   "captioner": CAPTIONER_MARKER}, None))
             except Exception as e:
                 out.append((stem, None, str(e)[:200]))
         return out
@@ -124,22 +138,33 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
     tags.json with periodic flushes. Spawned from the local entrypoint so
     the user can launch and walk away. ``wave_id`` scopes the input glob to
     /corpus/waves/wave_<id>; tags.json keys stay the song stem either way.
-    ``redo=True`` re-captions EVERY song (upgrade legacy short captions to the
-    long format) instead of only those missing from tags.json."""
+    ``redo=True`` ALSO re-captions songs whose existing caption is NOT the current
+    format (legacy/short ones, identified by the ``captioner`` marker) — but skips
+    those already upgraded, so a killed --redo resumes instead of restarting. A
+    bare run still only captions songs missing from tags.json entirely."""
     mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     tags_path = Path("/tokens/tags.json")
     existing: dict = {}
     if tags_path.exists():
         existing = json.loads(tags_path.read_text())
 
-    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
-               if redo or mp3.stem not in existing]
+    def _pending(mp3) -> bool:
+        if mp3.stem not in existing:
+            return True
+        return redo and not _is_current(existing[mp3.stem])
+
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s if _pending(mp3)]
+    n_legacy = sum(1 for mp3 in mp3s
+                   if mp3.stem in existing and not _is_current(existing[mp3.stem]))
     if redo:
-        print(f"REDO: re-captioning ALL {len(pending):,} of {len(mp3s):,} songs "
-              f"(overwriting existing captions)", flush=True)
+        print(f"REDO (upgrade to {CAPTIONER_MARKER}): {len(pending):,} of "
+              f"{len(mp3s):,} songs need (re)captioning — "
+              f"{n_legacy:,} legacy/short + {len(pending) - n_legacy:,} missing; "
+              f"already-current entries are skipped (resumable)", flush=True)
     elif existing:
         print(f"RESUMING: {len(existing):,} of {len(mp3s):,} already captioned, "
-              f"{len(pending):,} still pending", flush=True)
+              f"{len(pending):,} still pending ({n_legacy:,} legacy entries kept — "
+              f"pass --redo to upgrade them)", flush=True)
     else:
         print(f"fresh run: {len(mp3s):,} mp3s, 0 already captioned, "
               f"{len(pending):,} pending", flush=True)
