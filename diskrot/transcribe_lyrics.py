@@ -81,15 +81,31 @@ def _load_demucs(device: str):
     return model, apply_model
 
 
+def _ffmpeg_load_stereo(path: str | Path, sr: int = 44100) -> np.ndarray:
+    """Decode any ffmpeg-readable audio to ``[2, samples]`` float32 at ``sr`` via
+    ffmpeg (mirrors diskrot.melody._load_audio_file but stereo). ffmpeg decodes
+    MP3 natively, tolerates junk/ID3 headers, and is QUIET — avoiding librosa's
+    libsndfile→audioread/libmpg123 fallback (the "PySoundFile failed" + deprecation
+    warnings + libmpg123 'broken MP3' stderr storm), and recovering some marginally
+    broken files libmpg123 gives up on. Falls back to librosa if ffmpeg isn't on PATH."""
+    import subprocess
+
+    cmd = ["ffmpeg", "-nostdin", "-v", "quiet", "-i", str(path),
+           "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "2", "-ar", str(sr), "-"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+        buf = np.frombuffer(proc.stdout, dtype=np.float32)
+        return buf.reshape(-1, 2).T.copy() if buf.size else np.zeros((2, 0), np.float32)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        import librosa  # ffmpeg missing / hard-failed — fall back (noisy but works)
+        y, _ = librosa.load(str(path), sr=sr, mono=False)
+        return np.stack([y, y]) if y.ndim == 1 else y
+
+
 def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str) -> np.ndarray:
     """Isolate vocals from an audio file using Demucs. Returns mono float32 numpy array at 44100Hz."""
-    import librosa
-
-    # librosa handles MP3 via soundfile/ffmpeg — no torchcodec dependency
-    audio, _ = librosa.load(str(audio_path), sr=44100, mono=False)
-    if audio.ndim == 1:
-        audio = np.stack([audio, audio])  # mono to stereo
-    wav = torch.from_numpy(audio)  # [2, T]
+    audio = _ffmpeg_load_stereo(audio_path, 44100)  # [2, T]
+    wav = torch.from_numpy(np.ascontiguousarray(audio))  # [2, T]
     wav = wav.unsqueeze(0).to(device)  # [1, 2, T]
 
     with torch.no_grad():

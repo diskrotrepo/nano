@@ -155,6 +155,13 @@ LOCK_PATH = "/tokens/lyrics/.orchestrator.lock"
 LOCK_STALE_SEC = 24 * 60 * 60
 
 
+def _needs_lang_redo(entry) -> bool:
+    """A forced-English (pre-auto-detect) entry: has transcribed words but no
+    ``language`` field. ``--redo-missing-language`` re-transcribes exactly these
+    (auto-detect overwrites them with the correct language + un-garbled words)."""
+    return isinstance(entry, dict) and bool(entry.get("words")) and not entry.get("language")
+
+
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
@@ -162,10 +169,12 @@ LOCK_STALE_SEC = 24 * 60 * 60
     # that's >1 GB of JSON — Modal's 300s default timeout is not enough.
     timeout=30 * 60,
 )
-def list_pending(wave_id: str = "") -> list[str]:
+def list_pending(wave_id: str = "", redo_missing_language: bool = False) -> list[str]:
     """Return mp3 names (relative to /corpus) not yet in the sharded lyrics dir.
     ``wave_id`` scopes the glob to /corpus/waves/wave_<id>; lyrics shards key on
-    the song stem either way."""
+    the song stem either way. With ``redo_missing_language``, entries that exist
+    but lack a ``language`` field (the legacy forced-English transcribe) are ALSO
+    pending — a targeted re-do that a plain resume would skip."""
     from diskrot.transcribe_lyrics import load_lyrics_shards
 
     # The orchestrator now calls this repeatedly (sweep loop) — a warm-reused
@@ -174,8 +183,13 @@ def list_pending(wave_id: str = "") -> list[str]:
     mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     existing = load_lyrics_shards(LYRICS_DIR)
     pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
-               if mp3.stem not in existing]
-    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, {len(pending)} pending")
+               if mp3.stem not in existing
+               or (redo_missing_language and _needs_lang_redo(existing.get(mp3.stem)))]
+    n_redo = sum(1 for mp3 in mp3s if mp3.stem in existing
+                 and redo_missing_language and _needs_lang_redo(existing.get(mp3.stem)))
+    extra = f" (incl. {n_redo} language-redo)" if redo_missing_language else ""
+    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, "
+          f"{len(pending)} pending{extra}")
     return pending
 
 
@@ -308,9 +322,11 @@ def _release_lock() -> None:
     # the file just stays pending.)
     nonpreemptible=True,
 )
-def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = ""):
+def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
+                redo_missing_language: bool = False):
     """Dispatch transcription and merge results into the sharded lyrics dir.
-    ``wave_id`` scopes the pass to /corpus/waves/wave_<id>.
+    ``wave_id`` scopes the pass to /corpus/waves/wave_<id>. ``redo_missing_language``
+    additionally re-transcribes legacy entries that lack a ``language`` field.
 
     Runs the ``.map()`` collect/flush loop *remotely* (not in local_entrypoint)
     so ``--detach`` truly survives terminal close — the previous version ran
@@ -348,7 +364,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
         sweep = 0
         while True:
             sweep += 1
-            pending = list_pending.remote(wave_id=wave_id)
+            pending = list_pending.remote(
+                wave_id=wave_id, redo_missing_language=redo_missing_language)
             if not pending:
                 print("Nothing to transcribe — all files already transcribed")
                 return
@@ -424,15 +441,19 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = ""):
+def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
+         redo_missing_language: bool = False):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are
     required: ``.spawn()`` so the entrypoint exits without blocking, and
     ``--detach`` so the app isn't auto-stopped when the entrypoint completes).
     --wave-id N scopes transcription to /corpus/waves/wave_N.
+    --redo-missing-language re-transcribes legacy entries lacking a ``language``
+    field (the forced-English 128k) — auto-detect overwrites them.
     """
-    call = orchestrate.spawn(flush_every, chunk_size, wave_id=wave_id)
+    call = orchestrate.spawn(flush_every, chunk_size, wave_id=wave_id,
+                             redo_missing_language=redo_missing_language)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")
