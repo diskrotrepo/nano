@@ -17,9 +17,35 @@ Cloudflare R2 / any S3-compatible store; omit it for real AWS S3.
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import modal
+
+
+class _DropHeartbeatNoise(logging.Filter):
+    """Drop Modal's per-attempt heartbeat-retry WARNING from container logs.
+
+    On a transient control-plane blip Modal's runtime logs
+    "Modal Client → Modal Worker Heartbeat attempt failed (...)" every few
+    seconds (modal-client logger, WARNING). On the long fan-out data-prep runs
+    that's a flood that buries the real progress lines, making a healthy run
+    look stuck. The rarer escalation — "heartbeat attempts have been failing
+    for over N minutes ... container will eventually be marked unhealthy" — is
+    the one that actually means a container is dying, so it is kept.
+
+    Installed at import time (every fan-out entrypoint imports this module), so
+    it attaches in each worker container before the heartbeat loop spams. NOTE:
+    the separate "Volume mounted at ... using N% of available inodes" warning is
+    injected server-side by Modal's worker runtime, NOT a client log record, so
+    it can't be filtered here — clear it by reducing volume inode usage.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Heartbeat attempt failed" not in record.getMessage()
+
+
+logging.getLogger("modal-client").addFilter(_DropHeartbeatNoise())
 
 
 def corpus_mount(read_only: bool = True):

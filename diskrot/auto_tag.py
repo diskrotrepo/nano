@@ -1,14 +1,19 @@
-"""Caption a music corpus using LP-MusicCaps.
+"""Caption a music corpus into natural-language descriptions (tags.json).
 
-Generates natural-language descriptions from audio (e.g. "an upbeat indie rock
-track with jangly guitars and male vocals") and saves them as tags.json.
+By default uses an audio-LLM (Qwen2-Audio — [model/audio_llm_captioner.py]) over
+the WHOLE song to produce a rich, multi-facet description (genre/mood, drums, bass,
+instruments, vocals, production, arc), which the chunked-CLAP tag path conditions
+on in full. Set ``NANO_CAPTIONER=bart`` to fall back to the legacy single-window
+LP-MusicCaps captioner ([model/captioner.py], one ~40-word sentence).
 
 Usage:
     python -m diskrot.auto_tag --corpus /path/to/mp3s --out tags.json
+    NANO_CAPTIONER=bart python -m diskrot.auto_tag --corpus ... --out ...
 """
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import librosa
@@ -16,16 +21,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from model.captioner import DURATION, N_SAMPLES, SAMPLE_RATE, load_captioner
+
+def _captioner_kind() -> str:
+    return os.environ.get("NANO_CAPTIONER", "audio_llm").strip().lower()
 
 
-def _load_audio_clip(path: str | Path, sr: int = SAMPLE_RATE,
-                     duration: int = DURATION) -> np.ndarray:
-    """Load audio, take a representative 10-second crop, return float32 array.
-
-    Crops from 25 % into the track to avoid intros/outros.  Songs shorter than
-    *duration* are zero-padded.
-    """
+def _load_audio_clip(path: str | Path, sr: int, duration: int) -> np.ndarray:
+    """Legacy BART path: a single representative 10-second crop (25 % in)."""
     n_samples = sr * duration
     audio, _ = librosa.load(path, sr=sr, mono=True)
     if audio.shape[-1] > n_samples:
@@ -39,6 +41,20 @@ def _load_audio_clip(path: str | Path, sr: int = SAMPLE_RATE,
     return audio.astype(np.float32)
 
 
+def _caption_one(model, kind: str, mp3: Path, device: str) -> str:
+    """Caption a single song with whichever captioner is active."""
+    if kind == "bart":
+        from model.captioner import DURATION, SAMPLE_RATE
+
+        audio = _load_audio_clip(mp3, SAMPLE_RATE, DURATION)
+        audio_t = torch.from_numpy(audio).unsqueeze(0).to(device)
+        return model.generate(audio_t, num_beams=5)[0]
+    # audio-LLM (whole-song windows)
+    from model.audio_llm_captioner import load_song_windows
+
+    return model.caption(load_song_windows(str(mp3)))
+
+
 def caption_corpus(
     corpus_dir: str | Path,
     out_path: str | Path,
@@ -47,10 +63,16 @@ def caption_corpus(
     flush_every: int = 25,
     ckpt_path: str | None = None,
     limit: int | None = None,
+    redo: bool = False,
 ) -> None:
-    """Caption MP3s in *corpus_dir* and write tags.json."""
+    """Caption MP3s in *corpus_dir* and write tags.json.
+
+    ``redo=True`` re-captions every song (e.g. to replace short legacy captions
+    with the new long format); otherwise songs already in tags.json are skipped.
+    """
     corpus_dir = Path(corpus_dir)
     out_path = Path(out_path)
+    kind = _captioner_kind()
 
     mp3s = sorted(corpus_dir.glob("*.mp3"))
     if not mp3s:
@@ -58,9 +80,13 @@ def caption_corpus(
     if limit is not None:
         mp3s = mp3s[:limit]
 
-    print(f"found {len(mp3s)} mp3s | device: {device}")
-    print("loading LP-MusicCaps captioner...")
-    model = load_captioner(device=device, ckpt_path=ckpt_path)
+    print(f"found {len(mp3s)} mp3s | captioner: {kind} | device: {device}")
+    if kind == "bart":
+        from model.captioner import load_captioner
+        model = load_captioner(device=device, ckpt_path=ckpt_path)
+    else:
+        from model.audio_llm_captioner import load_captioner
+        model = load_captioner(device=device)
 
     tags: dict[str, dict] = {}
     existing: dict[str, dict] = {}
@@ -72,16 +98,13 @@ def caption_corpus(
     pbar = tqdm(mp3s, desc="captioning", unit="file")
     for mp3 in pbar:
         key = mp3.stem
-        if key in existing:
+        if key in existing and not redo:
             tags[key] = existing[key]
             n_skipped += 1
             pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
             continue
         try:
-            audio = _load_audio_clip(mp3)
-            audio_t = torch.from_numpy(audio).unsqueeze(0).to(device)
-            captions = model.generate(audio_t, num_beams=5)
-            description = captions[0]
+            description = _caption_one(model, kind, mp3, device)
         except Exception as e:
             tqdm.write(f"FAILED {mp3.name}: {e}")
             n_failed += 1
@@ -112,7 +135,9 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default="./tags.json")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--limit", type=int, default=None, help="Max files to caption")
+    p.add_argument("--redo", action="store_true",
+                   help="Re-caption songs already in tags.json (e.g. upgrade to the long format)")
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    caption_corpus(args.corpus, args.out, device=device, limit=args.limit)
+    caption_corpus(args.corpus, args.out, device=device, limit=args.limit, redo=args.redo)

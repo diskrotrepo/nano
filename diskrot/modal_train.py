@@ -351,6 +351,7 @@ def _ddp_worker(
     shared_bundle: dict | None = None,
     tag_cache_stacked=None,
     tag_cache_keys: list | None = None,
+    chunk_index: dict | None = None,
 ) -> None:
     """One DDP rank. Runs in a subprocess launched by mp.spawn.
 
@@ -373,6 +374,8 @@ def _ddp_worker(
         precomputed_tag_cache = {
             k: tag_cache_stacked[i] for i, k in enumerate(tag_cache_keys)
         }
+    # chunk_index (description -> [chunk_str]) crosses the spawn as a plain string
+    # dict (no tensors -> no FD pressure), like shared_bundle["tags"].
 
     text_conditioned = cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(text_conditioned=text_conditioned, **model_kwargs)
@@ -392,6 +395,7 @@ def _ddp_worker(
         ckpt_callback=callback,
         shared_bundle=shared_bundle,
         precomputed_tag_cache=precomputed_tag_cache,
+        precomputed_chunk_index=chunk_index,
     )
 
 
@@ -750,9 +754,25 @@ def train_remote_multi(
         pad_short=cfg_kwargs.get("pad_short_songs", False),
     )
     tag_cache: dict = {}
+    chunk_index: dict = {}
     if text_conditioned and shared_bundle["tags"]:
-        unique_tags = sorted(set(shared_bundle["tags"].values()))
-        tag_cache = _precompute_clap_cache(unique_tags, d_model, n_gpus=n_gpus)
+        # Chunk every description into <=77-token windows (a long caption is
+        # split so CLAP can encode the WHOLE thing as a sequence instead of its
+        # truncated single pooled vector), then encode the unique CHUNKS. A bare
+        # gpt2 tokenizer here chunks byte-identically to msclap's (same model),
+        # so workers/inference agree without loading CLAP in the parent.
+        from transformers import AutoTokenizer
+
+        from model.text_encoder import chunk_text_ids
+
+        unique_descs = sorted(set(shared_bundle["tags"].values()))
+        _tok = AutoTokenizer.from_pretrained("gpt2")
+        chunk_index = {d: chunk_text_ids(_tok, d) for d in unique_descs}
+        unique_chunks = sorted({c for chunks in chunk_index.values() for c in chunks})
+        n_tag_chunks = max((len(c) for c in chunk_index.values()), default=1)
+        print(f"[clap-parent] {len(unique_descs)} descriptions -> {len(unique_chunks)} "
+              f"unique chunks (max {n_tag_chunks} chunks/description)", flush=True)
+        tag_cache = _precompute_clap_cache(unique_chunks, d_model, n_gpus=n_gpus)
 
     # Hand the CLAP cache to the ranks as ONE stacked tensor + key list rather
     # than a dict of N separate tensors. mp.spawn shares each torch tensor via
@@ -779,7 +799,7 @@ def train_remote_multi(
         mp.spawn(
             _ddp_worker,
             args=(n_gpus, cfg_kwargs, model_kwargs, shared_bundle,
-                  tag_cache_stacked, tag_cache_keys),
+                  tag_cache_stacked, tag_cache_keys, chunk_index),
             nprocs=n_gpus, join=True,
         )
     finally:

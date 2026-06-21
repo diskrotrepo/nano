@@ -149,15 +149,6 @@ def _save_output(body: bytes, mime: str, mode: str, prompt: str) -> None:
     _save_named(body, _output_name(mode, prompt, ext))
 
 
-def _combine_text_lyrics(text: str, lyrics: str) -> str | None:
-    """Combine tags and lyrics into a single conditioning string."""
-    text = text.strip()
-    lyrics = lyrics.strip()
-    if text and lyrics:
-        return f"{text}. {lyrics}"
-    return text or lyrics or None
-
-
 def _norm_gender(gender: str) -> str | None:
     """Normalize the optional vocal-gender selector to "male"/"female"/None.
 
@@ -371,7 +362,6 @@ async def generate_endpoint(
     assert engine is not None
     style_bytes = (await style_audio.read()) if style_audio else None
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     try:
         result = engine.generate_audio(
             seconds=seconds,
@@ -379,7 +369,8 @@ async def generate_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            text=combined,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
@@ -489,7 +480,8 @@ def generate_batch_endpoint(req: BatchRequest) -> dict:
         neg = _pick(item.negative_prompt, req.negative_prompt)
         sweetened = _sweet(prompt)
         gen_requests.append({
-            "text": _combine_text_lyrics(sweetened, lyrics),
+            "text": sweetened or None,
+            "lyrics": (lyrics or "").strip() or None,
             "negative_text": neg.strip() or None,
             "gender": _norm_gender(gender),
             "bpm": bpm or None,
@@ -535,7 +527,6 @@ def _generate_stream_response(
     if seconds <= 0:
         raise HTTPException(400, "seconds must be > 0")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     name = _output_name("generate", prompt, "mp3", uid=req_id or None)
 
     stream = engine.generate_audio_stream(
@@ -544,7 +535,8 @@ def _generate_stream_response(
         top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
         top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
         cfg_scale=cfg_scale,
-        text=combined,
+        text=prompt or None,
+        lyrics=(lyrics or "").strip() or None,
         negative_text=negative_prompt.strip() or None,
         lyric_cfg_scale=lyric_cfg_scale or None,
         gender=_norm_gender(gender),
@@ -697,7 +689,6 @@ async def extend_endpoint(
         raise HTTPException(400, "empty audio upload")
     style_bytes = (await style_audio.read()) if style_audio else None
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     try:
         body, mime = engine.extend_audio(
             data,
@@ -708,7 +699,8 @@ async def extend_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            text=combined,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
@@ -759,7 +751,6 @@ async def cover_endpoint(
     if not data:
         raise HTTPException(400, "empty melody_audio upload")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     try:
         body, mime = engine.cover_audio(
             data,
@@ -767,7 +758,8 @@ async def cover_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            text=combined,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
             negative_text=negative_prompt.strip() or None,
             melody_cfg_scale=melody_cfg_scale or None,
             lyric_cfg_scale=lyric_cfg_scale or None,
@@ -812,7 +804,6 @@ async def extend_stream_endpoint(
     if not data:
         raise HTTPException(400, "empty audio upload")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     name = _output_name("extend", prompt, "mp3", uid=req_id or None)
     stream = engine.extend_audio_stream(
         data,
@@ -823,7 +814,8 @@ async def extend_stream_endpoint(
         top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
         top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
         cfg_scale=cfg_scale,
-        text=combined,
+        text=prompt or None,
+        lyrics=(lyrics or "").strip() or None,
         negative_text=negative_prompt.strip() or None,
         lyric_cfg_scale=lyric_cfg_scale or None,
         gender=_norm_gender(gender),
@@ -867,7 +859,6 @@ async def cover_stream_endpoint(
     if not data:
         raise HTTPException(400, "empty melody_audio upload")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     name = _output_name("cover", prompt, "mp3", uid=req_id or None)
     stream = engine.cover_audio_stream(
         data,
@@ -875,7 +866,8 @@ async def cover_stream_endpoint(
         top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
         top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
         cfg_scale=cfg_scale,
-        text=combined,
+        text=prompt or None,
+        lyrics=(lyrics or "").strip() or None,
         negative_text=negative_prompt.strip() or None,
         melody_cfg_scale=melody_cfg_scale or None,
         lyric_cfg_scale=lyric_cfg_scale or None,

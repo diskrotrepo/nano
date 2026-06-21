@@ -18,7 +18,7 @@ different thing, and each can be left blank.
 
 | Axis | Field(s) | What it steers | How it's encoded |
 |---|---|---|---|
-| **Tags** | `prompt` | The *vibe* — genre, instrumentation, mood, production | A natural-language caption → frozen CLAP → one pooled vector |
+| **Tags** | `prompt` | The *vibe* — genre, instrumentation, mood, production | A natural-language caption → split into ≤77-token chunks → frozen CLAP → a *sequence* of pooled vectors the decoder cross-attends to |
 | **Lyrics + markers** | `lyrics` (+ `gender`/`bpm`) | The *words to sing* and per-song attributes (gender, tempo, key, vocals, section) | A phoneme sequence the decoder cross-attends to |
 | **Melody** | `melody_audio` (`/cover`) | The *contour* — the tune to follow | A time-aligned chromagram added per-frame |
 
@@ -29,16 +29,23 @@ optional `lyric_cfg_scale` / `melody_cfg_scale`) pushes adherence on each axis o
 
 ## Tags: write a caption, not keywords
 
-CLAP was trained on **LP-MusicCaps prose captions** (~40-word descriptive sentences),
-so a terse keyword list conditions *weakly*. Write — or let the sweetener write — a
-short paragraph describing the instruments, the groove, the mood, and the production.
+CLAP was trained on **LP-MusicCaps prose captions**, so a terse keyword list conditions
+*weakly*. Write — or let the sweetener write — a paragraph describing the instruments,
+the groove, the mood, and the production. **Long descriptions are fine now:** the prompt
+is split into ≤77-token chunks and each pooled by CLAP, so the decoder reads the *whole*
+caption (up to ~3000 chars) rather than a truncated single vector. A multi-sentence,
+free-form, or even multilingual description works — there's no internal-`". "` gotcha
+anymore (tags and lyrics are separate fields). For the richest conditioning, give one
+theme per sentence (genre/mood · drums · bass · instruments · vocals · production · arc),
+so each chunk pools a distinct facet.
 
 **Sweeten is ON by default.** It rewrites a terse `prompt` into caption style with a
 small local model before it ever reaches CLAP, so `prompt: "lofi beat to study to"`
 becomes something like *"A mellow lofi hip hop instrumental with a jazzy electric piano,
-warm bass, soft boom-bap drums and vinyl crackle; relaxed and nostalgic."* You usually
-**want this on** — keep it on unless you've hand-written a full caption and want it sent
-verbatim (`sweeten: false`).
+warm bass, soft boom-bap drums and vinyl crackle. It sounds relaxed and nostalgic."* You
+usually **want this on** for terse prompts — but a long / already-detailed prompt
+(>~60 words) is passed through **verbatim** (sweetening would only discard your detail),
+and you can force verbatim any time with `sweeten: false`.
 
 The register to aim for (real captions from the training set):
 
@@ -376,7 +383,7 @@ prompt:        warm analog synth pads, steady groove, smooth transition
 | Weak adherence to the prompt | Keep `sweeten` **on**; raise `cfg_scale` a notch. Terse keyword prompts condition weakly. |
 | Wanted no vocals, got singing | Add `[instrumental]` to `lyrics`. `[inst]` is a *section*, not "no vocals". |
 | Key marker ignored | `[m]`/`[f]` are **gender**. Use `[c major]`, `[f minor]`, etc. for keys. |
-| Lyrics box content leaked into the tags / vibe | With `sweeten: false`, a `". "` inside a hand-written `prompt` splits the rest into the lyrics slot. Keep sweeten on (it collapses internal `". "` → `"; "`), or avoid `". "` in raw tag prompts. |
+| Tags / lyrics cross-contaminating | Fixed — tags (`prompt`) and lyrics (`lyrics`) are separate fields now (no `". "` join/split), so a multi-sentence prose `prompt` stays entirely in the tags slot. |
 | Gender/tempo marker mid-song does nothing | Those are **prefix-only** — move them to the start of `lyrics`. Only section markers work inline. |
 | `/cover` or `/infill` returns HTTP 400 | The served checkpoint wasn't trained for that axis (`use_melody_conditioning` / `use_fim`). |
 

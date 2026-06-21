@@ -1,13 +1,17 @@
-"""Modal entrypoint for captioning the corpus with LP-MusicCaps, fanned out
-across many containers.
+"""Modal entrypoint for captioning the corpus, fanned out across many containers.
 
-Each container loads the captioning model once in ``@modal.enter()``, then
-processes a batch of MP3 files.  The orchestrator lists files missing from
-``tags.json``, dispatches batches via ``.map()``, and periodically flushes
-results back into ``tags.json`` on the tokens volume.
+Each container loads the audio-LLM captioner (Qwen2-Audio,
+[model/audio_llm_captioner.py]) once in ``@modal.enter()``, then captions a batch
+of MP3 files over the WHOLE song into rich multi-facet descriptions (the chunked-
+CLAP tag path conditions on them in full). The orchestrator lists pending files,
+dispatches batches via ``.map()``, and periodically flushes ``tags.json`` on the
+tokens volume. Set ``NANO_CAPTIONER=bart`` (+ the matching image) for the legacy
+single-window LP-MusicCaps captioner.
 
 Run (spawns and returns immediately; --detach keeps the app alive):
-    modal run --detach diskrot/modal_auto_tag.py
+    modal run --detach diskrot/modal_auto_tag.py            # caption pending songs
+    modal run --detach diskrot/modal_auto_tag.py --redo     # re-caption ALL (long format)
+    modal run --detach diskrot/modal_auto_tag.py --limit 50 # calibrate the image/cost first
 
 Watch:
     modal app logs nano-auto-tag -f
@@ -28,16 +32,16 @@ from diskrot.modal_common import corpus_mount, wave_subdir
 app = modal.App("nano-auto-tag")
 
 
+_CAPTION_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
+
+
 def _prefetch_captioner():
-    """Bake BART + LP-MusicCaps weights into the image layer."""
-    from transformers import BartConfig, BartTokenizer
-    BartConfig.from_pretrained("facebook/bart-base")
-    BartTokenizer.from_pretrained("facebook/bart-base")
-    from huggingface_hub import hf_hub_download
-    hf_hub_download(repo_id="seungheondoh/lp-music-caps", filename="transfer.pth")
+    """Bake the audio-LLM weights into the image layer (snapshot, no instantiate)."""
+    from huggingface_hub import snapshot_download
+    snapshot_download(_CAPTION_MODEL)
 
 
-# Heavy image for the GPU workers (captioner + torch).
+# Heavy image for the GPU workers (audio-LLM captioner + torch).
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
@@ -48,7 +52,8 @@ image = (
         "numpy>=1.26",
         "tqdm>=4.66",
         "soundfile>=0.12",
-        "transformers>=4.35",
+        "transformers>=4.48",  # Qwen2-Audio
+        "accelerate>=0.30",
         "huggingface_hub",
     )
     .run_function(_prefetch_captioner, secrets=[modal.Secret.from_name("huggingface-secret")])
@@ -68,7 +73,7 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 @app.cls(
     image=image,
-    gpu="L4",
+    gpu="A100",  # Qwen2-Audio-7B in fp16 (~15 GB) — too big for the L4
     timeout=60 * 60 * 4,
     max_containers=50,
     volumes={"/corpus": corpus_vol},
@@ -77,38 +82,25 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 class Captioner:
     @modal.enter()
     def load_model(self):
-        from model.captioner import load_captioner
+        from model.audio_llm_captioner import load_captioner
         self.model = load_captioner("cuda")
 
     @modal.method()
     def caption_batch(
         self, names: list[str]
     ) -> list[tuple[str, dict | None, str | None]]:
-        """Returns one (stem, tags_or_None, error_or_None) per input."""
-        import librosa
-        import numpy as np
-        import torch
-        from model.captioner import DURATION, N_SAMPLES, SAMPLE_RATE
+        """Returns one (stem, tags_or_None, error_or_None) per input. Captions the
+        WHOLE song (several windows) into a rich multi-facet description."""
+        from model.audio_llm_captioner import load_song_windows
 
         out: list[tuple[str, dict | None, str | None]] = []
         for name in names:
             path = Path("/corpus") / name
             stem = path.stem
             try:
-                audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
-                n_samples = SAMPLE_RATE * DURATION
-                if audio.shape[-1] > n_samples:
-                    offset = int(audio.shape[-1] * 0.25)
-                    offset = min(offset, audio.shape[-1] - n_samples)
-                    audio = audio[offset:offset + n_samples]
-                if audio.shape[-1] < n_samples:
-                    pad = np.zeros(n_samples, dtype=np.float32)
-                    pad[:audio.shape[-1]] = audio
-                    audio = pad
-                audio_t = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0).cuda()
-                captions = self.model.generate(audio_t, num_beams=5)
-                tags = {"description": captions[0]}
-                out.append((stem, tags, None))
+                windows = load_song_windows(str(path))
+                description = self.model.caption(windows)
+                out.append((stem, {"description": description}, None))
             except Exception as e:
                 out.append((stem, None, str(e)[:200]))
         return out
@@ -126,11 +118,14 @@ class Captioner:
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
-def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "") -> None:
+def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
+                 redo: bool = False) -> None:
     """Full pass: list pending, fan out across Captioner containers, merge into
     tags.json with periodic flushes. Spawned from the local entrypoint so
     the user can launch and walk away. ``wave_id`` scopes the input glob to
-    /corpus/waves/wave_<id>; tags.json keys stay the song stem either way."""
+    /corpus/waves/wave_<id>; tags.json keys stay the song stem either way.
+    ``redo=True`` re-captions EVERY song (upgrade legacy short captions to the
+    long format) instead of only those missing from tags.json."""
     mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     tags_path = Path("/tokens/tags.json")
     existing: dict = {}
@@ -138,8 +133,11 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "") -
         existing = json.loads(tags_path.read_text())
 
     pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
-               if mp3.stem not in existing]
-    if existing:
+               if redo or mp3.stem not in existing]
+    if redo:
+        print(f"REDO: re-captioning ALL {len(pending):,} of {len(mp3s):,} songs "
+              f"(overwriting existing captions)", flush=True)
+    elif existing:
         print(f"RESUMING: {len(existing):,} of {len(mp3s):,} already captioned, "
               f"{len(pending):,} still pending", flush=True)
     else:
@@ -219,15 +217,19 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "") -
 
 
 @app.local_entrypoint()
-def main(batch_size: int = 16, flush_every_batches: int = 4, wave_id: str = ""):
+def main(batch_size: int = 8, flush_every_batches: int = 4, wave_id: str = "",
+         redo: bool = False):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.
-    # --wave-id N scopes captioning to /corpus/waves/wave_N.
+    # --wave-id N scopes captioning to /corpus/waves/wave_N; --redo re-captions all.
+    # batch_size default 8 (down from 16): the audio-LLM caption is far slower
+    # per song than the BART one, so smaller batches keep flushes frequent.
     fc = run_auto_tag.spawn(
         batch_size=batch_size,
         flush_every_batches=flush_every_batches,
         wave_id=wave_id,
+        redo=redo,
     )
     print(f"auto-tag launched (detached) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "

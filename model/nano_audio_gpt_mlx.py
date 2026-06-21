@@ -454,6 +454,7 @@ class MLXNanoAudioGPT(mnn.Module):
         caches: list[_LayerCache] | None = None,
         start_pos: int = 0,
         text_emb: mx.array | None = None,
+        text_kv_mask: mx.array | None = None,
         lyric_emb: mx.array | None = None,
         lyric_kv_mask: mx.array | None = None,
         melody_emb: mx.array | None = None,
@@ -474,7 +475,9 @@ class MLXNanoAudioGPT(mnn.Module):
             cache = caches[i] if caches is not None else None
             x = x + self._self_attn(block.attn, block.ln1(x), cos, sin, cache)
             if block.has_cross_attn and text_emb is not None:
-                x = x + self._cross_attn(block.cross_attn, block.ln_cross(x), text_emb)
+                x = x + self._cross_attn(
+                    block.cross_attn, block.ln_cross(x), text_emb, mask=text_kv_mask
+                )
             if block.has_lyric_attn and lyric_emb is not None:
                 x = x + self._cross_attn(
                     block.lyric_attn, block.ln_lyric(x), lyric_emb, mask=lyric_kv_mask
@@ -493,13 +496,14 @@ class MLXNanoAudioGPT(mnn.Module):
         self,
         tokens: mx.array,
         text_emb: mx.array | None = None,
+        text_kv_mask: mx.array | None = None,
         lyric_emb: mx.array | None = None,
         lyric_kv_mask: mx.array | None = None,
         melody_emb: mx.array | None = None,
     ) -> mx.array:
         """Full causal forward with no KV cache — used by parity tests."""
         return self(
-            tokens, caches=None, start_pos=0, text_emb=text_emb,
+            tokens, caches=None, start_pos=0, text_emb=text_emb, text_kv_mask=text_kv_mask,
             lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask, melody_emb=melody_emb,
         )
 
@@ -569,6 +573,8 @@ class MLXNanoAudioGPT(mnn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
+        text_kv_mask_neg: torch.Tensor | None = None,
         lyric_ids: torch.Tensor | None = None,
         lyric_mask: torch.Tensor | None = None,
         lyric_ids_neg: torch.Tensor | None = None,
@@ -618,6 +624,19 @@ class MLXNanoAudioGPT(mnn.Module):
         cond = None if text_emb is None else _t2m(text_emb, self._dtype)
         neg = None if text_emb_neg is None else _t2m(text_emb_neg, self._dtype)
 
+        def _mask_t2m(m):
+            # Convert an incoming torch additive cross-attn mask to mx, replacing
+            # any -inf with the finite NEG_INF the mlx SDPA wants (an all-masked
+            # flash block with -inf NaNs; cf. the lyric mask). For B=1 inference
+            # the incoming tag mask is all-zeros (no padding), so this is a no-op.
+            if m is None:
+                return None
+            a = _t2m(m, self._dtype)
+            return mx.where(mx.isinf(a), mx.array(NEG_INF, dtype=a.dtype), a)
+
+        tkv_pos = _mask_t2m(text_kv_mask)
+        tkv_neg = _mask_t2m(text_kv_mask_neg)
+
         def _ids_to_mx(ids):
             return mx.array(ids.detach().to(torch.int64).cpu().numpy().astype(np.int32))
 
@@ -658,12 +677,14 @@ class MLXNanoAudioGPT(mnn.Module):
         # torch generate): logits = stages[0] + Σ scales[i]*(stages[i+1]-stages[i]).
         # Nesting order tags → lyrics → melody; axes without their own scale fold
         # into the cfg (tags) step.
-        full = {"text": cond, "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
+        full = {"text": cond, "tkv": tkv_pos,
+                "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
         if not use_cfg:
             stages = [full]
             scales: list[float] = []
         else:
-            off = {"text": neg, "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
+            off = {"text": neg, "tkv": tkv_neg,
+                   "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
             tags_on = dict(full)
             if composed_lyric:
                 tags_on["lemb"], tags_on["lkv"] = lyric_neg, lyric_kv_neg
@@ -699,19 +720,34 @@ class MLXNanoAudioGPT(mnn.Module):
         D = cfg.d_model
 
         def _stack_text():
-            reals = [s["text"] for s in stages if s["text"] is not None]
-            if not reals:
-                return None
-            # Text cross-attn takes NO padding mask, so a zero "off" row must match
-            # the real text length to contribute nothing (V=0 → 0) without diluting
-            # the softmax. Real text is the pooled CLAP vector — length 1 in
-            # production (style-audio blends still pool to 1), so there is only ever
-            # one real length; null rows pad to it.
-            Lt = reals[0].shape[1]
-            zero = mx.zeros((B, Lt, D), dtype=self._dtype)
-            return mx.concatenate(
-                [s["text"] if s["text"] is not None else zero for s in stages], axis=0
-            )
+            # Chunked tags make each stage's text a [B, N, D] sequence whose N can
+            # differ across stages (positive vs CFG baseline), so — exactly like
+            # _stack_lyric — pad to a common N_max and carry an additive mask that
+            # -inf's the pad of REAL stages (no softmax dilution) while null/off
+            # rows stay zero with an all-attend mask (V=0 -> contributes 0). A
+            # single-vector tag (N=1) reduces to the old uniform-length case.
+            if all(s["text"] is None for s in stages):
+                return None, None
+            Nmax = max(s["text"].shape[1] for s in stages if s["text"] is not None)
+            embs, masks = [], []
+            for s in stages:
+                if s["text"] is None:
+                    embs.append(mx.zeros((B, Nmax, D), dtype=self._dtype))
+                    masks.append(mx.zeros((B, 1, 1, Nmax), dtype=self._dtype))
+                    continue
+                emb = s["text"]
+                msk = s["tkv"]
+                N = emb.shape[1]
+                if msk is None:
+                    msk = mx.zeros((B, 1, 1, N), dtype=self._dtype)
+                if N < Nmax:
+                    emb = mx.concatenate(
+                        [emb, mx.zeros((B, Nmax - N, D), dtype=emb.dtype)], axis=1)
+                    msk = mx.concatenate(
+                        [msk, mx.full((B, 1, 1, Nmax - N), NEG_INF, dtype=msk.dtype)], axis=-1)
+                embs.append(emb)
+                masks.append(msk)
+            return mx.concatenate(embs, axis=0), mx.concatenate(masks, axis=0)
 
         def _stack_melody():
             if not self.has_melody:
@@ -740,7 +776,7 @@ class MLXNanoAudioGPT(mnn.Module):
                 masks.append(msk)
             return mx.concatenate(embs, axis=0), mx.concatenate(masks, axis=0)
 
-        text_b = _stack_text()
+        text_b, tkv_b = _stack_text()
         mel_b = _stack_melody()
         lemb_b, lkv_b = _stack_lyric()
         caches_b = self._new_caches(S * B, T_delay)
@@ -749,7 +785,8 @@ class MLXNanoAudioGPT(mnn.Module):
             inp_b = mx.tile(inp, (S, 1, 1)) if S > 1 else inp
             return self(
                 inp_b, caches=caches_b, start_pos=start,
-                text_emb=text_b, lyric_emb=lemb_b, lyric_kv_mask=lkv_b, melody_emb=mel_b,
+                text_emb=text_b, text_kv_mask=tkv_b,
+                lyric_emb=lemb_b, lyric_kv_mask=lkv_b, melody_emb=mel_b,
             )
 
         def _combine(logits_b):
@@ -810,6 +847,8 @@ class MLXNanoAudioGPT(mnn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
+        text_kv_mask_neg: torch.Tensor | None = None,
         lyric_ids: torch.Tensor | None = None,
         lyric_mask: torch.Tensor | None = None,
         lyric_ids_neg: torch.Tensor | None = None,
@@ -827,6 +866,7 @@ class MLXNanoAudioGPT(mnn.Module):
             prompt, num_new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=text_emb, cfg_scale=cfg_scale, text_emb_neg=text_emb_neg,
+            text_kv_mask=text_kv_mask, text_kv_mask_neg=text_kv_mask_neg,
             lyric_ids=lyric_ids, lyric_mask=lyric_mask,
             lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
             lyric_cfg_scale=lyric_cfg_scale,

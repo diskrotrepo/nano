@@ -12,12 +12,11 @@ training data using a small local Qwen2.5-Instruct model, strengthening
 conditioning without retraining anything. It is opt-in (server `sweeten` flag)
 and lazy-loaded — the Qwen weights are only fetched/loaded on first use.
 
-Delimiter safety: the server joins tags + lyrics as "tags. lyrics" and the
-inference engine splits on the FIRST ". " to recover the two cross-attention
-positions. A multi-sentence caption is full of ". ", which would mis-split and
-dump half the caption into the lyrics slot. sweeten() therefore replaces internal
-". " with "; " so the output is delimiter-safe while still reading as prose to
-CLAP.
+Tags and lyrics now travel as SEPARATE request fields (no "tags. lyrics" join,
+no ". " split), and tags are chunked across CLAP, so a multi-sentence caption is
+safe as natural prose — there's nothing to collapse. An already-long / detailed
+prompt is passed through verbatim: it is caption-style on its own, and rewriting
+it to ~40 words would throw away exactly the detail the user wrote.
 """
 from __future__ import annotations
 
@@ -104,16 +103,20 @@ class PromptSweetener:
 
     @staticmethod
     def _sanitize(text: str) -> str:
-        text = text.strip().strip('"').strip("'").strip()
+        text = text.strip()
+        # Strip only a matched WRAPPING quote pair (Qwen sometimes wraps the whole
+        # caption in quotes); leave embedded/edge quotes intact (e.g. a caption
+        # ending in a quoted phrase).
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+            text = text[1:-1].strip()
         text = re.sub(r"\s+", " ", text)
-        # Delimiter safety: the server splits tags/lyrics on the FIRST ". ".
-        # Collapse internal sentence boundaries to "; " so the whole caption
-        # stays in the tags slot. A trailing "." is fine (no following space).
-        text = text.replace(". ", "; ")
-        # Clamp to ~50 words (CLAP truncates at 77 tokens anyway).
+        # No ". " collapse: tags/lyrics are separate fields now, so a multi-
+        # sentence caption is safe as natural prose and chunked CLAP reads it all.
+        # Cap at ~60 words as a runaway guard for the rewriter (a sweetened
+        # caption targets ~40 words).
         words = text.split()
-        if len(words) > 50:
-            text = " ".join(words[:50])
+        if len(words) > 60:
+            text = " ".join(words[:60])
         return text.strip()
 
     @torch.no_grad()
@@ -122,6 +125,11 @@ class PromptSweetener:
         any failure — sweetening must never break a generation."""
         raw = (raw or "").strip()
         if not raw:
+            return raw
+        # An already-long / detailed prompt is caption-style on its own. Rewriting
+        # it into ~40 words would discard the detail the user wrote (and chunked
+        # CLAP can condition on all of it), so pass it through verbatim.
+        if len(raw.split()) > 60:
             return raw
         try:
             self._ensure_model()

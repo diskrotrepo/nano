@@ -332,28 +332,28 @@ class InferenceEngine:
     def _build_conditioning(
         self,
         text: str | None = None,
+        lyrics: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
         gender: str | None = None,
         bpm: float | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Build conditioning from text (tags + lyrics), style audio, or both.
+        """Build conditioning from tags (``text``), lyrics, style audio, or a mix.
 
-        text may contain tags and lyrics separated by ". " (combined by the
-        server). Tags go through the pooled CLAP encoder; lyrics are phonemized
-        (g2p) into a token sequence for the LyricEncoder cross-attention — they no
-        longer go through CLAP. Style audio (when given) blends into the tag
-        embedding. ``gender`` ("male"/"female") and ``bpm`` (a tempo in BPM) ride
-        the lyric stream as leading markers — see below. Returns ``(tag_emb [1,1,D]
-        | None, lyric_ids [1,L] | None, lyric_mask [1,L] | None)``.
+        Tags and lyrics travel as SEPARATE fields — there is no ". " splitting, so
+        a long prose / multi-sentence tag description is never shattered into the
+        lyrics slot. ``text`` is the tag description: it's split into <=77-token
+        chunks and each chunk pooled by CLAP, so the decoder cross-attends to the
+        WHOLE description (``encode_chunked``) instead of one truncated vector.
+        ``lyrics`` is phonemized (g2p) for the LyricEncoder cross-attention. Style
+        audio (when given) is appended as an extra CLAP position. ``gender`` /
+        ``bpm`` ride the lyric stream as leading markers (see below). Returns
+        ``(tag_emb [1,N,D] | None, lyric_ids [1,L] | None, lyric_mask [1,L] |
+        None)``. The tag cross-attn mask is None for a single item (no padding —
+        the model attends to all N); batching builds it in ``_stack_conditioning``.
         """
-        # Split tags from lyrics (server joins them as "tags. lyrics")
-        tags_str = ""
-        lyrics_str = ""
-        if text and text.strip():
-            parts = text.split(". ", 1)
-            tags_str = parts[0]
-            lyrics_str = parts[1] if len(parts) > 1 else ""
+        tags_str = (text or "").strip()
+        lyrics_str = (lyrics or "").strip()
 
         # A selected vocal gender / tempo rides the lyric stream as a leading
         # [male]/[female] / [NNNbpm] bracket — the same dense header markers the
@@ -372,11 +372,12 @@ class InferenceEngine:
         if bpm is not None and bpm > 0:
             lyrics_str = f"[{bpm:g}bpm] {lyrics_str}".rstrip()
 
-        # --- Tags (pooled CLAP, position 0) + optional style-audio blend ---
+        # --- Tags (chunked CLAP sequence) + optional style-audio blend ---
         tag_emb = None
         if self.text_encoder is not None:
             if tags_str:
-                tag_emb = self.text_encoder.encode([tags_str]).to(self.device)  # [1,1,D]
+                tag_emb, _ = self.text_encoder.encode_chunked([tags_str])
+                tag_emb = tag_emb.to(self.device)  # [1,N,D]
             if style_audio_bytes:
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     f.write(style_audio_bytes)
@@ -385,8 +386,11 @@ class InferenceEngine:
                     audio_emb = self.text_encoder.encode_audio([style_path]).to(self.device)
                 finally:
                     os.unlink(style_path)
-                tag_emb = audio_emb if tag_emb is None else (
-                    tag_emb * (1 - style_weight) + audio_emb * style_weight
+                # Style ref shares CLAP's joint text/audio space, so it's just one
+                # more cross-attn position: scale the tag chunks by (1-w), append
+                # the style vector scaled by w. (Style-only -> the style vector.)
+                tag_emb = audio_emb if tag_emb is None else torch.cat(
+                    [tag_emb * (1 - style_weight), audio_emb * style_weight], dim=1
                 )
             if tag_emb is not None:
                 tag_emb = tag_emb.to(self._cond_dtype())
@@ -414,19 +418,23 @@ class InferenceEngine:
     def _stack_conditioning(
         self,
         per_item: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]],
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Stack a list of per-item ``_build_conditioning`` results into one batch.
 
-        Input is ``B`` tuples of ``(tag_emb [1,1,D] | None, lyric_ids [1,L] | None,
-        lyric_mask [1,L] | None)``; output is the batched
-        ``(tag_emb [B,1,D] | None, lyric_ids [B,Lmax] | None, lyric_mask [B,Lmax] |
-        None)`` the model's batch-general decode loop consumes.
+        Input is ``B`` tuples of ``(tag_emb [1,N_i,D] | None, lyric_ids [1,L] |
+        None, lyric_mask [1,L] | None)``; output is the batched
+        ``(tag_emb [B,Nmax,D] | None, tag_kv_mask [B,1,1,Nmax] | None, lyric_ids
+        [B,Lmax] | None, lyric_mask [B,Lmax] | None)`` the model's batch-general
+        decode loop consumes.
 
         Two NaN/equivalence subtleties make this non-trivial:
-        - **Tags:** a row without tags gets a ZERO embedding, which (with qk-norm,
-          ``RMSNorm(0)==0``) is *exactly* "skip text conditioning" for that row —
-          so a mixed present/absent batch is well-defined. If no row has tags the
-          whole axis is ``None`` (the model skips it entirely).
+        - **Tags:** each item is now a chunked SEQUENCE whose length N_i differs
+          (different description lengths), so they're padded to ``Nmax`` and an
+          additive mask -inf's the pad of each row (no softmax dilution). A row
+          without tags is a single un-masked ZERO chunk, which (bias-free
+          cross-attn) is *exactly* "skip text conditioning" for that row — so a
+          mixed present/absent batch is well-defined and never fully masked. If no
+          row has tags the whole axis is ``None`` (the model skips it entirely).
         - **Lyrics:** ``encode_lyrics`` masks padded positions with ``-inf``, and a
           *fully* padded row would NaN the cross-attn softmax. So when the batch has
           any lyrics, rows without their own stream are given the minimal BOS+header
@@ -438,11 +446,21 @@ class InferenceEngine:
         lyr = [l for (_, l, _) in per_item]
 
         if all(t is None for t in tags):
-            tag_emb = None
+            tag_emb = tag_kv_mask = None
         else:
             ref = next(t for t in tags if t is not None)
-            zero = torch.zeros(1, 1, ref.shape[-1], dtype=ref.dtype, device=ref.device)
-            tag_emb = torch.cat([t if t is not None else zero for t in tags], dim=0)
+            D = ref.shape[-1]
+            n_max = max((t.shape[1] if t is not None else 1) for t in tags)
+            tag_emb = torch.zeros(B, n_max, D, dtype=ref.dtype, device=ref.device)
+            keep = torch.zeros(B, n_max, dtype=torch.bool, device=ref.device)
+            for i, t in enumerate(tags):
+                if t is None:
+                    keep[i, 0] = True  # un-masked zero chunk == "no tags"
+                    continue
+                n = t.shape[1]
+                tag_emb[i, :n] = t[0]
+                keep[i, :n] = True
+            tag_kv_mask = CLAPTextEncoder.additive_kv_mask(keep, tag_emb.dtype)
 
         if all(l is None for l in lyr):
             lyric_ids = lyric_mask = None
@@ -467,7 +485,7 @@ class InferenceEngine:
             for i, r in enumerate(rows):
                 lyric_ids[i, : r.shape[0]] = r
             lyric_mask = lyric_ids != PAD_PHONEME_ID
-        return tag_emb, lyric_ids, lyric_mask
+        return tag_emb, tag_kv_mask, lyric_ids, lyric_mask
 
     def _build_melody(self, melody_audio_bytes: bytes) -> "torch.Tensor":
         """Chroma for the uploaded hum -> melody tensor [1, T, 12] on device.
@@ -511,6 +529,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
@@ -564,7 +583,9 @@ class InferenceEngine:
             raise ValueError("Overlap window is already at model context limit; reduce overlap_seconds.")
 
         prompt_dev = prompt_tokens.to(self.device)
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics, style_audio_bytes=style_audio_bytes,
+            style_weight=style_weight, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt_dev, num_new_frames=new_frames,
@@ -612,6 +633,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         melody_cfg_scale: float | None = None,
         lyric_cfg_scale: float | None = None,
@@ -642,7 +664,8 @@ class InferenceEngine:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt=None, num_new_frames=new_frames,
@@ -788,6 +811,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
@@ -822,7 +846,9 @@ class InferenceEngine:
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics, style_audio_bytes=style_audio_bytes,
+            style_weight=style_weight, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt=seed_tokens, num_new_frames=new_frames,
@@ -911,12 +937,13 @@ class InferenceEngine:
             raise ValueError("Requested duration exceeds model context limit.")
 
         pos = [
-            self._build_conditioning(r.get("text"), gender=r.get("gender"), bpm=r.get("bpm"))
+            self._build_conditioning(r.get("text"), lyrics=r.get("lyrics"),
+                                     gender=r.get("gender"), bpm=r.get("bpm"))
             for r in requests
         ]
         neg = [self._build_conditioning(r.get("negative_text")) for r in requests]
-        cond_emb, cond_lids, cond_lmask = self._stack_conditioning(pos)
-        neg_emb, neg_lids, neg_lmask = self._stack_conditioning(neg)
+        cond_emb, cond_tkv, cond_lids, cond_lmask = self._stack_conditioning(pos)
+        neg_emb, neg_tkv, neg_lids, neg_lmask = self._stack_conditioning(neg)
 
         prompt, _ = self.model._resolve_prompt(None, batch_size=B)  # [B, K, 1]
         has_cond = any(
@@ -926,6 +953,7 @@ class InferenceEngine:
             prompt=prompt, num_new_frames=new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=cond_emb, text_emb_neg=neg_emb,
+            text_kv_mask=cond_tkv, text_kv_mask_neg=neg_tkv,
             lyric_ids=cond_lids, lyric_mask=cond_lmask,
             lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
             cfg_scale=cfg_scale if has_cond else 1.0,
@@ -1117,6 +1145,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         lyric_cfg_scale: float | None = None,
         gender: str | None = None,
@@ -1137,7 +1166,7 @@ class InferenceEngine:
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         prompt, _ = self.model._resolve_prompt(None)  # random seed frame [1, K, 1]
         meta = self._gen_metadata(
@@ -1168,6 +1197,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         lyric_cfg_scale: float | None = None,
         gender: str | None = None,
@@ -1215,7 +1245,7 @@ class InferenceEngine:
         prefix_pcm = full_wav[:, :keep_samples].squeeze(0).contiguous().numpy().astype("float32")
 
         prompt, _ = self.model._resolve_prompt(prompt_tokens.to(self.device))
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         meta = self._gen_metadata(
             "extend", text=text, negative_text=negative_text,
@@ -1243,6 +1273,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         melody_cfg_scale: float | None = None,
         lyric_cfg_scale: float | None = None,
@@ -1268,7 +1299,7 @@ class InferenceEngine:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         prompt, _ = self.model._resolve_prompt(None)  # seed frame; chroma drives contour
         meta = self._gen_metadata(

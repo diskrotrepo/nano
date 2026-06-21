@@ -71,7 +71,9 @@ def test_generate_batch_items_inherit_shared(monkeypatch):
     ))
     reqs = cap["requests"]
     assert reqs[0]["text"].startswith("alpha")          # per-item prompt wins
-    assert "shared" in reqs[1]["text"] and "la la" in reqs[1]["text"]  # inherits shared prompt + own lyrics
+    # tags and lyrics are SEPARATE fields now (no ". " join): the inherited
+    # shared prompt lands in text, the item's own lyrics in lyrics.
+    assert reqs[1]["text"] == "shared" and "la la" in reqs[1]["lyrics"]
 
 
 def test_generate_batch_too_large(monkeypatch):
@@ -84,7 +86,7 @@ def test_generate_batch_too_large(monkeypatch):
 
 def test_generate_stream_response_streams_bytes(monkeypatch):
     """The shared body behind GET+POST /generate_stream — bytes flow through and
-    long lyrics reach the engine combined with the tags."""
+    long lyrics reach the engine as their OWN field (not joined to the tags)."""
     cap = {}
     chunks = [b"ID3header", b"frame1", b"frame2"]
 
@@ -101,5 +103,6 @@ def test_generate_stream_response_streams_bytes(monkeypatch):
         lyric_cfg_scale=0.0, req_id="abc", model="",
     )
     assert resp.media_type == "audio/mpeg"
-    # long lyrics survived the (POST) body and reached the engine combined with tags.
-    assert "techno" in (cap.get("text") or "") and "word" in (cap.get("text") or "")
+    # tags and long lyrics reach the engine as SEPARATE args (no ". " join).
+    assert (cap.get("text") or "") == "techno"
+    assert "word" in (cap.get("lyrics") or "")

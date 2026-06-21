@@ -126,16 +126,36 @@ def _cond_stub():
 def test_stack_conditioning_tags_zero_fill():
     stub = _cond_stub()
     D = 8
-    e = torch.randn(1, 1, D)
+    e = torch.randn(1, 1, D)  # a single-chunk tag
     # all-None -> the whole axis is None (model skips text conditioning).
-    t, li, lm = stub._stack_conditioning([(None, None, None), (None, None, None)])
-    assert t is None and li is None and lm is None
-    # some tags -> [B,1,D]; the tag-less row is exactly zeros (== skip via RMSNorm(0)).
-    t, li, lm = stub._stack_conditioning([(e, None, None), (None, None, None)])
+    t, tkv, li, lm = stub._stack_conditioning([(None, None, None), (None, None, None)])
+    assert t is None and tkv is None and li is None and lm is None
+    # some tags -> [B,Nmax,D]; the tag-less row is a single un-masked ZERO chunk
+    # (== skip via the bias-free cross-attn), never a fully-masked row.
+    t, tkv, li, lm = stub._stack_conditioning([(e, None, None), (None, None, None)])
     assert t.shape == (2, 1, D)
     assert torch.equal(t[0], e[0])
     assert torch.count_nonzero(t[1]) == 0
+    assert tkv.shape == (2, 1, 1, 1)
+    assert torch.all(tkv == 0)  # both rows attend their single chunk (no padding)
     assert li is None and lm is None
+
+
+def test_stack_conditioning_chunked_tags_ragged_mask():
+    """Different-length chunked tags pad to Nmax with an additive -inf mask on the
+    pad of each row, while a tag-less row keeps one un-masked zero chunk."""
+    stub = _cond_stub()
+    D = 8
+    a = torch.randn(1, 3, D)  # 3 chunks
+    b = torch.randn(1, 1, D)  # 1 chunk
+    t, tkv, _, _ = stub._stack_conditioning([(a, None, None), (b, None, None), (None, None, None)])
+    assert t.shape == (3, 3, D)
+    assert tkv.shape == (3, 1, 1, 3)
+    # row 0: all 3 real (attend); row 1: 1 real + 2 padded (-inf); row 2: 1 zero chunk
+    assert torch.all(tkv[0] == 0)
+    assert torch.isinf(tkv[1, 0, 0, 1]) and torch.isinf(tkv[1, 0, 0, 2])
+    assert tkv[1, 0, 0, 0] == 0
+    assert (tkv[2] == 0).any()  # at least one un-masked key -> no fully-masked row
 
 
 def test_stack_conditioning_lyrics_no_fully_masked_row():
@@ -147,7 +167,7 @@ def test_stack_conditioning_lyrics_no_fully_masked_row():
     stub = _cond_stub()
     lids = torch.tensor([[5, 6, 7, 8]], dtype=torch.long)  # a row WITH lyrics
     lmask = lids != PAD_PHONEME_ID
-    t, li, lm = stub._stack_conditioning([(None, lids, lmask), (None, None, None)])
+    t, tkv, li, lm = stub._stack_conditioning([(None, lids, lmask), (None, None, None)])
     assert li.shape[0] == 2 and lm.shape == li.shape
     # every row keeps at least one valid (non-pad) token -> no fully-masked row.
     assert bool((lm.sum(dim=1) > 0).all())

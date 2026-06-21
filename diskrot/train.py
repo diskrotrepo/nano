@@ -787,24 +787,65 @@ def _unwrapped_state_dict(model: torch.nn.Module) -> dict:
     return _unwrap(model).state_dict()
 
 
+def _pad_tag_width(
+    emb: torch.Tensor, mask: torch.Tensor, n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad/truncate a chunked-tag (emb [B,N,D], additive mask [B,1,1,N]) to a
+    FIXED width n on the chunk axis. Padded positions are zero + -inf-masked, so
+    they contribute nothing but keep the regional-compiled block graph at one
+    static shape across steps."""
+    cur = emb.shape[1]
+    if cur == n:
+        return emb, mask
+    if cur > n:
+        return emb[:, :n], mask[..., :n]
+    pad_e = torch.zeros(emb.shape[0], n - cur, emb.shape[2],
+                        dtype=emb.dtype, device=emb.device)
+    pad_m = torch.full((mask.shape[0], 1, 1, n - cur), float("-inf"),
+                       dtype=mask.dtype, device=mask.device)
+    return torch.cat([emb, pad_e], dim=1), torch.cat([mask, pad_m], dim=-1)
+
+
 def _build_cond(
     text_encoder: CLAPTextEncoder, tags: list[str], device: str,
+    n_tag_chunks: int,
     tag_cache: dict[str, torch.Tensor] | None = None,
-) -> torch.Tensor | None:
-    """Encode tags as a pooled CLAP embedding -> [B, 1, D], or None if no tags.
+    chunk_index: dict[str, list[str]] | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Encode tags as a CHUNKED CLAP sequence -> (emb [B, n_tag_chunks, D],
+    additive cross-attn mask [B, 1, 1, n_tag_chunks]), or (None, None) if no tags.
 
-    Lyrics no longer flow through CLAP — they are conditioned via the phoneme
-    LyricEncoder + lyric cross-attention (see model/lyric_encoder.py). This builds
-    only the pooled TAG vector. If tag_cache is provided, looks up pre-computed
-    CLAP embeddings and applies the projection layer (avoids running CLAP).
-    """
+    A long description is split into <=77-token chunks, each pooled by frozen
+    CLAP, so the decoder cross-attends to n_tag_chunks positions instead of one
+    averaged vector. The width is FIXED to n_tag_chunks (the corpus's max chunk
+    count, 1 for a terse-tag corpus -> identical to the old single-vector path)
+    so the regional-compiled block graph never recompiles; rows with fewer chunks
+    pad with -inf-masked positions, and a tagless row keeps a single un-masked
+    zero chunk (== "no tags", so no cross-attn row is ever fully masked). Lyrics
+    no longer flow through CLAP (see model/lyric_encoder.py).
+
+    With tag_cache (+ chunk_index): looks up pre-computed per-CHUNK CLAP vectors
+    and applies the trainable projection (no CLAP run). Else encodes live."""
     if not any(t != "" for t in tags):
-        return None
+        return None, None
+    B = len(tags)
     if tag_cache is not None:
         zero = torch.zeros(text_encoder.CLAP_DIM, device=device)
-        raw = torch.stack([tag_cache.get(t, zero) for t in tags])  # [B, 1024]
-        return text_encoder.proj(raw).unsqueeze(1)                 # [B, 1, d_out]
-    return text_encoder.encode(tags).to(device)                    # [B, 1, D]
+        raw = torch.zeros(B, n_tag_chunks, text_encoder.CLAP_DIM, device=device)
+        keep = torch.zeros(B, n_tag_chunks, dtype=torch.bool, device=device)
+        for i, t in enumerate(tags):
+            chunks = chunk_index.get(t, []) if chunk_index is not None else []
+            if not chunks:
+                keep[i, 0] = True  # un-masked zero chunk == "no tags"
+                continue
+            for j, ch in enumerate(chunks[:n_tag_chunks]):
+                raw[i, j] = tag_cache.get(ch, zero)
+                keep[i, j] = True
+        emb = text_encoder.proj(raw)  # [B, n_tag_chunks, d_out]
+        return emb, CLAPTextEncoder.additive_kv_mask(keep, emb.dtype)
+    emb, mask = text_encoder.encode_chunked(tags, max_chunks=n_tag_chunks)
+    emb, mask = _pad_tag_width(emb, mask, n_tag_chunks)
+    return emb.to(device), mask.to(device)
 
 
 @torch.no_grad()
@@ -812,6 +853,8 @@ def _evaluate(
     model: NanoAudioGPT, loader: DataLoader, cfg: TrainConfig,
     n_batches: int, text_encoder: CLAPTextEncoder | None = None,
     tag_cache: dict[str, torch.Tensor] | None = None,
+    n_tag_chunks: int = 1,
+    chunk_index: dict[str, list[str]] | None = None,
 ) -> tuple[float, list[float]]:
     # Read pad_id from cfg (not model.cfg) so this works whether `model` is
     # the bare NanoAudioGPT, a DDP wrapper, or a torch.compile wrapper —
@@ -835,9 +878,11 @@ def _evaluate(
             batch = batch.to(cfg.device, non_blocking=True).long()
             inputs, targets = build_train_inputs(batch, pad_id)
 
-            text_emb = None
+            text_emb = text_kv_mask = None
             if text_encoder is not None:
-                text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
+                text_emb, text_kv_mask = _build_cond(
+                    text_encoder, list(tags), cfg.device, n_tag_chunks,
+                    tag_cache, chunk_index)
             l_ids = l_mask = None
             if use_lyrics:
                 l_ids = lyric_ids.to(cfg.device, non_blocking=True)
@@ -848,8 +893,8 @@ def _evaluate(
 
             # bf16 to match the train loop (see train_run's scaler comment).
             with torch.amp.autocast(cfg.device, dtype=torch.bfloat16, enabled=amp_enabled):
-                logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
-                               lyric_mask=l_mask, melody=mel)
+                logits = model(inputs, text_emb=text_emb, text_kv_mask=text_kv_mask,
+                               lyric_ids=l_ids, lyric_mask=l_mask, melody=mel)
                 _, per_cb = _loss_fn(logits, targets, pad_id)
             if per_cb_sums is None:
                 per_cb_sums = per_cb.clone()
@@ -868,15 +913,21 @@ def train_run(
     ckpt_callback=None,
     shared_bundle: dict | None = None,
     precomputed_tag_cache: dict[str, torch.Tensor] | None = None,
+    precomputed_chunk_index: dict[str, list[str]] | None = None,
 ) -> None:
     """Train per cfg. Optional preloaded inputs (used by the DDP path so each
     rank doesn't redundantly re-read off the volume / re-encode CLAP):
 
     - shared_bundle: result of ``dataset.load_mmap_bundle()`` — mmap-backed
       token index + tags + lyrics. When given, skips per-rank disk I/O.
-    - precomputed_tag_cache: dict[tag_str -> CPU [1024] tensor] of CLAP
-      embeddings encoded once in the parent. When given, skips the serial
-      CLAP-per-tag loop on every rank."""
+    - precomputed_tag_cache: dict[CHUNK_str -> CPU [1024] tensor] of CLAP
+      embeddings encoded once in the parent. Keyed per CHUNK (a long description
+      is split into <=77-token chunks — see CLAPTextEncoder.chunk_text), so the
+      cache dedupes shared chunks and stays a dict[str -> [1024]] (the FD-safe
+      IPC gather is unchanged). When given, skips the serial CLAP loop per rank.
+    - precomputed_chunk_index: dict[description -> list[chunk_str]] built in the
+      parent (where the tokenizer is loaded), so workers map a song's full
+      description to its cached chunk vectors without loading CLAP."""
     use_ddp = _setup_dist(cfg)
     main = _is_main(cfg)
     wandb = _init_wandb(cfg)
@@ -1019,7 +1070,9 @@ def train_run(
 
     # text conditioning
     text_encoder: CLAPTextEncoder | None = None
-    tag_cache: dict[str, torch.Tensor] = {}
+    tag_cache: dict[str, torch.Tensor] = {}    # CHUNK_str -> [1024]
+    chunk_index: dict[str, list[str]] = {}     # description -> [chunk_str, ...]
+    n_tag_chunks = 1  # fixed cross-attn width (corpus max; 1 for terse tags)
     use_text = cfg.model.use_text_conditioning and train_ds.has_tags
     if use_text:
         text_encoder = CLAPTextEncoder(d_out=cfg.model.d_model, device=cfg.device)
@@ -1040,33 +1093,50 @@ def train_run(
         if main:
             print(f"text conditioning enabled (cfg_dropout={cfg.cfg_dropout})")
         if precomputed_tag_cache is not None:
-            # DDP fast path: parent ran CLAP once and handed us CPU tensors.
-            # Move them to this rank's GPU so the in-step lookup is local.
-            for tag, emb in precomputed_tag_cache.items():
-                tag_cache[tag] = emb.to(cfg.device)
+            # DDP fast path: parent ran CLAP once on the unique CHUNKS and handed
+            # us CPU tensors + the description->chunks index. Move the chunk
+            # vectors to this rank's GPU so the in-step lookup is local.
+            for chunk, emb in precomputed_tag_cache.items():
+                tag_cache[chunk] = emb.to(cfg.device)
+            chunk_index = precomputed_chunk_index or {}
             if main:
-                print(f"loaded {len(tag_cache)} precomputed CLAP tag embeddings", flush=True)
+                print(f"loaded {len(tag_cache)} precomputed CLAP chunk embeddings "
+                      f"for {len(chunk_index)} descriptions", flush=True)
         else:
             # pre-compute CLAP embeddings for all tags (they're fixed per song).
-            # Every rank computes them so the in-step embedding lookup is local.
-            unique_tags = sorted(set(train_ds._tags.values()) | set(val_ds._tags.values()))
-            if unique_tags:
+            # Every rank chunks each description then encodes the unique CHUNKS,
+            # so the in-step embedding lookup is local. Chunking a long
+            # description into <=77-token windows lets the decoder cross-attend to
+            # the whole thing instead of CLAP's truncated single pooled vector.
+            unique_descs = sorted(set(train_ds._tags.values()) | set(val_ds._tags.values()))
+            text_encoder._ensure_clap()
+            for desc in unique_descs:
+                chunk_index[desc] = text_encoder.chunk_text(desc)
+            unique_chunks = sorted({c for chunks in chunk_index.values() for c in chunks})
+            if unique_chunks:
                 if main:
-                    print(f"pre-computing CLAP embeddings for {len(unique_tags)} unique tags...", flush=True)
-                text_encoder._ensure_clap()
+                    print(f"pre-computing CLAP embeddings for {len(unique_chunks)} unique "
+                          f"chunks ({len(unique_descs)} descriptions)...", flush=True)
                 t0_clap = time.time()
                 with torch.no_grad():
-                    for i, tag in enumerate(unique_tags):
-                        emb = text_encoder._clap.get_text_embeddings([tag])  # [1, 1024]
-                        tag_cache[tag] = emb.squeeze(0).to(cfg.device)       # [1024]
+                    for i, chunk in enumerate(unique_chunks):
+                        emb = text_encoder._clap.get_text_embeddings([chunk])  # [1, 1024]
+                        tag_cache[chunk] = emb.squeeze(0).to(cfg.device)        # [1024]
                         if main and (i + 1) % 500 == 0:
                             elapsed = time.time() - t0_clap
                             rate = (i + 1) / max(elapsed, 1e-6)
-                            eta = (len(unique_tags) - i - 1) / max(rate, 1e-6)
-                            print(f"  CLAP precompute: {i+1}/{len(unique_tags)} "
+                            eta = (len(unique_chunks) - i - 1) / max(rate, 1e-6)
+                            print(f"  CLAP precompute: {i+1}/{len(unique_chunks)} "
                                   f"({rate:.0f}/s, ETA {eta:.0f}s)", flush=True)
                 if main:
-                    print(f"cached {len(tag_cache)} tag embeddings", flush=True)
+                    print(f"cached {len(tag_cache)} chunk embeddings", flush=True)
+        # Fixed cross-attn width = the corpus's max chunk count (>=1). A terse-tag
+        # corpus yields 1 -> identical to the old single-vector path; the same on
+        # every rank (same data) so the regional-compiled graph matches.
+        n_tag_chunks = max((len(c) for c in chunk_index.values()), default=1)
+        n_tag_chunks = max(n_tag_chunks, 1)
+        if main:
+            print(f"tag cross-attn width n_tag_chunks={n_tag_chunks}", flush=True)
     elif cfg.model.use_text_conditioning and main:
         print("WARNING: use_text_conditioning=True but no tags found — training without text")
 
@@ -1280,24 +1350,33 @@ def train_run(
         # Inference's uncond branch still passes None — same math, no drift.
         B_in = inputs.shape[0]
         d_model = cfg.model.d_model
-        text_emb = None
+        text_emb = text_kv_mask = None
         text_emb_teacher = None  # teacher's tag projection (distillation only)
         if text_encoder is not None:
             # ONE rng draw (unchanged order/probability vs the non-distill path).
             # The teacher reuses this same keep decision and the same raw CLAP
-            # vector (only its projection differs) so both models see identical
-            # conditioning.
+            # chunk vectors (only its projection differs) so both models see
+            # identical conditioning.
             text_kept = _rng.random() >= cfg.cfg_dropout
             if text_kept:
-                text_emb = _build_cond(text_encoder, list(tags), cfg.device, tag_cache)
+                text_emb, text_kv_mask = _build_cond(
+                    text_encoder, list(tags), cfg.device, n_tag_chunks,
+                    tag_cache, chunk_index)
                 if teacher_text_enc is not None:
-                    text_emb_teacher = _build_cond(
-                        teacher_text_enc, list(tags), cfg.device, tag_cache)
+                    text_emb_teacher, _ = _build_cond(
+                        teacher_text_enc, list(tags), cfg.device, n_tag_chunks,
+                        tag_cache, chunk_index)
             else:
-                text_emb = torch.zeros((B_in, 1, d_model), device=cfg.device)
+                # Dropped: a ZEROS sequence at the FIXED width + an all-attend
+                # (all-zeros additive) mask. Zero K/V through the bias-free
+                # cross-attn is exactly zero output == uncond, and the static
+                # [B, n_tag_chunks, D] + [B,1,1,n_tag_chunks] shapes/types match
+                # the kept step, so there's still ONE compiled graph.
+                text_emb = torch.zeros((B_in, n_tag_chunks, d_model), device=cfg.device)
+                text_kv_mask = torch.zeros((B_in, 1, 1, n_tag_chunks), device=cfg.device)
                 if teacher_text_enc is not None:
                     text_emb_teacher = torch.zeros(
-                        (B_in, 1, teacher_cfg.d_model), device=cfg.device)
+                        (B_in, n_tag_chunks, teacher_cfg.d_model), device=cfg.device)
         # Lyrics and melody: the encoders ALWAYS run; a 0/1 keep tensor zeroes
         # the contribution on dropped steps (keep=0 is exactly the uncond
         # state: zero lyric cond / the melody null). One compiled graph per
@@ -1322,15 +1401,16 @@ def train_run(
             g["lr"] = _cosine_lr(step, cfg)
 
         with torch.amp.autocast(cfg.device, dtype=torch.bfloat16, enabled=amp_enabled):
-            logits = model(inputs, text_emb=text_emb, lyric_ids=l_ids,
-                           lyric_mask=l_mask, lyric_keep=lyric_keep,
+            logits = model(inputs, text_emb=text_emb, text_kv_mask=text_kv_mask,
+                           lyric_ids=l_ids, lyric_mask=l_mask, lyric_keep=lyric_keep,
                            melody=mel, melody_keep=melody_keep)
             if teacher is not None:
                 # Teacher forward: identical inputs + conditioning (lyric/melody
                 # ids and keep gates are model-agnostic; only the tag projection
-                # differs). No grad, no autograd graph stored.
+                # differs, but the tag mask is shared). No grad, no autograd graph.
                 with torch.no_grad():
-                    t_logits = teacher(inputs, text_emb=text_emb_teacher, lyric_ids=l_ids,
+                    t_logits = teacher(inputs, text_emb=text_emb_teacher,
+                                       text_kv_mask=text_kv_mask, lyric_ids=l_ids,
                                        lyric_mask=l_mask, lyric_keep=lyric_keep,
                                        melody=mel, melody_keep=melody_keep)
                 loss, ce_term, kd_term, per_cb = _distill_loss(
@@ -1421,7 +1501,8 @@ def train_run(
             if ema is not None:
                 ema.copy_to(model)
             val_loss, val_per_cb = _evaluate(model, val_loader, cfg, cfg.eval_batches,
-                                            text_encoder=text_encoder, tag_cache=tag_cache)
+                                            text_encoder=text_encoder, tag_cache=tag_cache,
+                                            n_tag_chunks=n_tag_chunks, chunk_index=chunk_index)
             if ema is not None:
                 ema.restore(model)
             if use_ddp:

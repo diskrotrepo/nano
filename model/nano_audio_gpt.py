@@ -291,6 +291,11 @@ class CrossAttention(nn.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        # The tag mask is built outside autocast (float32); cast to the (possibly
+        # bf16) query dtype so SDPA's flash/mem-efficient kernels accept it. A
+        # no-op for the lyric mask, which is already built in the compute dtype.
+        if kv_mask is not None and kv_mask.dtype != q.dtype:
+            kv_mask = kv_mask.to(q.dtype)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=kv_mask,
@@ -338,6 +343,7 @@ class Block(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         text_emb: torch.Tensor | None,
+        text_kv_mask: torch.Tensor | None,
         lyric_emb: torch.Tensor | None,
         lyric_kv_mask: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -345,7 +351,7 @@ class Block(nn.Module):
         attn_out, _ = self.attn(self.ln1(x), cos, sin, cache=None)
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
-            x = x + self.cross_attn(self.ln_cross(x), text_emb)
+            x = x + self.cross_attn(self.ln_cross(x), text_emb, kv_mask=text_kv_mask)
         if self.has_lyric_attn and lyric_emb is not None:
             x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
         x = x + self.mlp(self.ln2(x))
@@ -358,6 +364,7 @@ class Block(nn.Module):
         sin: torch.Tensor,
         cache: KVCache | None = None,
         text_emb: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
         lyric_emb: torch.Tensor | None = None,
         lyric_kv_mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
@@ -365,7 +372,8 @@ class Block(nn.Module):
     ) -> tuple[torch.Tensor, KVCache | None]:
         if cache is None and self.training and self.use_gradient_checkpointing:
             x = checkpoint(
-                self._body, x, cos, sin, text_emb, lyric_emb, lyric_kv_mask,
+                self._body, x, cos, sin, text_emb, text_kv_mask,
+                lyric_emb, lyric_kv_mask,
                 use_reentrant=False,
             )
             return x, None
@@ -375,7 +383,7 @@ class Block(nn.Module):
         )
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
-            x = x + self.cross_attn(self.ln_cross(x), text_emb)
+            x = x + self.cross_attn(self.ln_cross(x), text_emb, kv_mask=text_kv_mask)
         if self.has_lyric_attn and lyric_emb is not None:
             x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
         x = x + self.mlp(self.ln2(x))
@@ -559,6 +567,7 @@ class NanoAudioGPT(nn.Module):
         kv_caches: list[KVCache] | None = None,
         start_pos: int = 0,
         text_emb: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
         lyric_ids: torch.Tensor | None = None,
         lyric_mask: torch.Tensor | None = None,
         lyric_emb: torch.Tensor | None = None,
@@ -576,7 +585,12 @@ class NanoAudioGPT(nn.Module):
         kv_caches: when None, training path (returns logits only).
                    when a list, returns (logits, new_caches).
         start_pos: positional offset for the tokens (used with KV cache).
-        text_emb: [B, T_text, D] optional (pooled CLAP) tag conditioning.
+        text_emb: [B, T_text, D] optional CLAP tag conditioning. T_text is 1 for a
+            single pooled vector or N for a chunked long description (each chunk a
+            pooled CLAP vector — see CLAPTextEncoder.encode_chunked).
+        text_kv_mask: optional additive cross-attn mask [B, 1, 1, T_text] (0 keep,
+            -inf pad) for a ragged chunked tag batch. None = attend to all of
+            text_emb (the single-vector and B=1 paths).
         lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask. When given (and
             lyric conditioning is enabled), the lyric encoder runs INSIDE this
             forward — so DDP syncs its grads. Used on the training path.
@@ -642,7 +656,7 @@ class NanoAudioGPT(nn.Module):
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches else None
             x, new_cache = block(
-                x, cos, sin, cache=cache, text_emb=text_emb,
+                x, cos, sin, cache=cache, text_emb=text_emb, text_kv_mask=text_kv_mask,
                 lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask,
                 input_pos=input_pos, attn_mask=attn_mask,
             )
@@ -672,6 +686,8 @@ class NanoAudioGPT(nn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
+        text_kv_mask_neg: torch.Tensor | None = None,
         lyric_ids: torch.Tensor | None = None,
         lyric_mask: torch.Tensor | None = None,
         lyric_ids_neg: torch.Tensor | None = None,
@@ -683,7 +699,12 @@ class NanoAudioGPT(nn.Module):
         """Continue a prompt, or generate unconditionally when prompt is None.
 
         prompt: [K, T_prompt] or [B, K, T_prompt], or None for unconditional
-        text_emb: [B, 1, D] optional text conditioning (from CLAPTextEncoder)
+        text_emb: [B, T_text, D] optional tag conditioning (from CLAPTextEncoder).
+            T_text=1 for a single pooled vector, or N for a chunked long
+            description (encode_chunked).
+        text_kv_mask / text_kv_mask_neg: additive cross-attn masks [B,1,1,T_text]
+            for ragged chunked tags (the positive and CFG-baseline streams). None
+            when tags are a single vector or unpadded (B=1).
         melody: [B, num_new_frames, n_bins] chroma for the frames being generated.
             Encoded ONCE into a full delayed-length tensor (placed at the new-frame
             positions, learned-null elsewhere) and reused across decode steps. The
@@ -737,6 +758,7 @@ class NanoAudioGPT(nn.Module):
             prompt, num_new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=text_emb, cfg_scale=cfg_scale, text_emb_neg=text_emb_neg,
+            text_kv_mask=text_kv_mask, text_kv_mask_neg=text_kv_mask_neg,
             lyric_ids=lyric_ids, lyric_mask=lyric_mask,
             lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
             lyric_cfg_scale=lyric_cfg_scale,
@@ -787,6 +809,8 @@ class NanoAudioGPT(nn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
+        text_kv_mask_neg: torch.Tensor | None = None,
         lyric_ids: torch.Tensor | None = None,
         lyric_mask: torch.Tensor | None = None,
         lyric_ids_neg: torch.Tensor | None = None,
@@ -909,12 +933,14 @@ class NanoAudioGPT(nn.Module):
             #   logits = stages[0] + Σ scales[i] * (stages[i+1] - stages[i])
             # Each stage is a full conditioning state {text, lemb, lkv, mel} with
             # its own KV cache.
-            full = {"text": text_emb, "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
+            full = {"text": text_emb, "tkv": text_kv_mask,
+                    "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
             if not use_cfg:
                 stages = [full]
                 scales: list[float] = []
             else:
-                off = {"text": text_emb_neg, "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
+                off = {"text": text_emb_neg, "tkv": text_kv_mask_neg,
+                       "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
                 # The cfg (tags) step turns on everything that isn't separately
                 # composed; composed axes start off and are switched on later.
                 tags_on = dict(full)
@@ -955,7 +981,8 @@ class NanoAudioGPT(nn.Module):
                     try:
                         out, s["caches"] = fwd(
                             inp, kv_caches=s["caches"], start_pos=start,
-                            text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                            text_emb=s["text"], text_kv_mask=s["tkv"],
+                            lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
                             melody_emb=s["mel"],
                             input_pos=input_pos, attn_mask=attn_mask,
                         )
@@ -968,7 +995,8 @@ class NanoAudioGPT(nn.Module):
                               f"falling back to eager for the rest of this run")
                         out, s["caches"] = fwd(
                             inp, kv_caches=s["caches"], start_pos=start,
-                            text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
+                            text_emb=s["text"], text_kv_mask=s["tkv"],
+                            lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
                             melody_emb=s["mel"],
                             input_pos=input_pos, attn_mask=attn_mask,
                         )
