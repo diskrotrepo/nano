@@ -53,8 +53,9 @@ modal run scripts/lyrics_audit.py        # prints the report to the logs
 1. **Corpus + scale check** — packed (trainable) song count with a verdict vs
    the rails in [CLAUDE.md](../../../CLAUDE.md): below ~10k = noise
    (pipeline-validation only), ~50k = recommended floor for coherent output,
-   ~500k = the `nano-corpus` inode ceiling. More of the same data helps;
-   variety does not — don't read a genre skew as a problem to curate away.
+   ~500k = a soft reference scale (the corpus is in R2 — no inode ceiling). More
+   of the same data helps; variety does not — don't read a genre skew as a
+   problem to curate away.
 2. **Per-stream coverage of trainable songs** — tags / structure / keys /
    lyrics / phonemes / **melody**, each as `n / trainable (pct)`.
 3. **Melody source vs packed** — `.mel.npy` on nano-melody (real contour

@@ -43,12 +43,16 @@ import modal
 
 app = modal.App("nano-lyrics-audit")
 
-image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "numpy>=1.26", "py3langid>=0.3"
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("numpy>=1.26", "py3langid>=0.3")
+    .add_local_python_source("diskrot")  # for diskrot.modal_common.corpus_mount
 )
 
+from diskrot.modal_common import corpus_mount
+
 tokens_vol = modal.Volume.from_name("nano-tokens")
-corpus_vol = modal.Volume.from_name("nano-corpus")
+corpus_vol = corpus_mount()  # read-only R2 bucket
 # Source chromagrams live on their own volume (kept off nano-tokens for its
 # inode cap). Read-only here; create_if_missing so the audit still runs before
 # any melody pass has populated it.
@@ -113,11 +117,12 @@ def audit():
     FRAME_RATE_HZ = 86
     # Corpus health rails (see CLAUDE.md "Scale of training data"): below ~10k is
     # noise (pipeline-validation only), ~50k is the recommended floor for
-    # coherent output, ~500k is the nano-corpus inode ceiling.
+    # coherent output, ~500k is a soft reference scale (R2 has no inode cap).
     FLOOR_NOISE, FLOOR_COHERENT, CEILING = 10_000, 50_000, 500_000
 
     # --- corpus / packed (trainable) ---
-    corpus = {p.stem for p in Path("/corpus").glob("*.mp3")}
+    # rglob: raw audio lives in R2 under waves/wave_*/ (and possibly flat legacy).
+    corpus = {p.stem for p in Path("/corpus").rglob("*.mp3")}
     print(f"corpus mp3s:              {len(corpus)}")
 
     trainable: set[str] = set()

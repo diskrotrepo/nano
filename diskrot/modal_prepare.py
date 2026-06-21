@@ -1,4 +1,4 @@
-"""Validate, dedupe, and filter the nano-corpus volume.
+"""Validate, dedupe, and filter the raw audio in the R2 (``nano-audio``) bucket.
 
 Cheap CPU pass that runs after the corpus is uploaded and before the GPU steps
 (`modal_tokenize.py`, `modal_auto_tag.py`, `modal_transcribe.py`). Catches
@@ -33,7 +33,7 @@ left off. Re-runs over a fully-validated corpus regenerate the report from
 the manifest with zero validation work.
 
 Setup (one-time):
-    modal volume create nano-corpus
+    # raw audio lives in the R2 nano-audio bucket (NANO_AUDIO_BUCKET / NANO_AUDIO_ENDPOINT)
     modal volume create nano-tokens
 
 Spawns the orchestrator and returns immediately; `--detach` keeps the app
@@ -62,7 +62,7 @@ image = (
 )
 
 # read_only=False: prepare deletes undecodable/dup/too-long files in place
-# (works on the nano-corpus Volume or an object-storage bucket).
+# (R2 bucket — unlinks flush through the CloudBucketMount, no .commit()).
 corpus_vol = corpus_mount(read_only=False)
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
@@ -218,7 +218,7 @@ def apply_deletions(names: list[str]) -> int:
             n_missing += 1
         except OSError as e:
             print(f"failed to delete {name}: {e}")
-    corpus_vol.commit()
+    # corpus is an R2 CloudBucketMount: unlinks flush through the FUSE mount; no commit().
     if n_missing:
         print(f"(skipped {n_missing} already-gone files)")
     return n_deleted

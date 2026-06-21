@@ -55,7 +55,7 @@ image = (
     .add_local_python_source("diskrot")
 )
 
-corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
+corpus_vol = corpus_mount()  # R2 audio bucket (read-only); see modal_common.corpus_mount
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 # Dedicated volume for the per-song chroma sidecars: keeps the ~1 file/song they
 # add off nano-tokens, which is already near the 500k-inode cap.

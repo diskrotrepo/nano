@@ -4,11 +4,12 @@ Mirrors the parallelism pattern from modal_transcribe.py: one container per GPU,
 each loads DAC once via @modal.enter() and processes files via .map().
 
 Setup (one-time):
-    modal volume create nano-corpus
-    modal volume put nano-corpus /path/to/mp3s/ /
+    # raw audio lives in the R2 nano-audio bucket, under waves/wave_<id>/
+    # (NANO_AUDIO_BUCKET / NANO_AUDIO_ENDPOINT + the r2-creds secret)
+    modal volume create nano-tokens
 
 Run tokenization (detached so the local shell can disconnect):
-    modal run --detach diskrot/modal_tokenize.py
+    modal run --detach diskrot/modal_tokenize.py --wave-id <id>
 
 Pull tokens locally (optional):
     modal volume get nano-tokens / ./token_cache/
@@ -105,7 +106,7 @@ else:
     _GPU = "L4"
     _cache_vol = None
 
-corpus_vol = corpus_mount()  # nano-corpus Volume, or object storage via NANO_CORPUS_SOURCE=bucket
+corpus_vol = corpus_mount()  # R2 audio bucket (read-only); see modal_common.corpus_mount
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 _VOLUMES = {"/corpus": corpus_vol, "/tokens": tokens_vol}
 if _cache_vol is not None:

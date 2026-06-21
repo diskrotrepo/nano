@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import modal
 
+from diskrot.modal_common import corpus_mount
+
 app = modal.App("nano-wave-cleanup")
 
 image = (
@@ -32,7 +34,7 @@ image = (
 
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount(read_only=False)  # R2 bucket; only mounted for --drop-mp3
 
 
 @app.function(
@@ -88,8 +90,7 @@ def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) ->
             pass
     tokens_vol.commit()
     melody_vol.commit()
-    if drop_mp3:
-        corpus_vol.commit()
+    # corpus is an R2 CloudBucketMount: --drop-mp3 unlinks flush through the mount, no commit().
     print(f"[cleanup wave {wave_id}] deleted {deleted} files — inodes reclaimed",
           flush=True)
     return deleted

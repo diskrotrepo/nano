@@ -4,7 +4,7 @@ End-to-end pipeline using Modal's cloud GPUs. Best path if you don't have local 
 
 This is a bespoke model: it trains on one kind of data at scale. You supply your own MP3s — more of the same data helps, but variety does not, so the corpus is not curated for genre/style diversity.
 
-**Recommended corpus size:** at least **~50,000 songs** for coherent musical output. Below **~10,000 songs** the model mostly produces noise — useful only for validating the pipeline end-to-end, not for a real model. More of the same kind of data keeps helping, so larger is better; the practical ceiling is **~500,000 files** (the `nano-corpus` volume's inode limit). A tiny "smoke" corpus is still handy for exercising the pipeline, but it will not produce musical output.
+**Recommended corpus size:** at least **~50,000 songs** for coherent musical output. Below **~10,000 songs** the model mostly produces noise — useful only for validating the pipeline end-to-end, not for a real model. More of the same kind of data keeps helping, so larger is better; the raw audio lives in the R2 `nano-audio` bucket (object storage — no inode cap, so no hard file ceiling). A tiny "smoke" corpus is still handy for exercising the pipeline, but it will not produce musical output.
 
 ## Cost summary
 
@@ -53,16 +53,20 @@ modal secret create huggingface-secret HF_TOKEN=hf_YOUR_TOKEN_HERE
 
 Get a token at https://huggingface.co/settings/tokens (a read-only token is sufficient).
 
-## 1. Get your corpus onto Modal
+## 1. Get your corpus into R2
 
-Create a Modal volume and upload your own MP3s (trailing `/` is important):
+Raw audio lives in a Cloudflare R2 bucket (`nano-audio`), not a Modal Volume —
+object storage has no inode cap, so the corpus can grow without a hard ceiling.
+One-time R2 + Modal-secret setup (the `r2-creds` secret, the `NANO_AUDIO_*` env)
+is in [README.waves.md](README.waves.md#one-time-setup). Then upload your MP3s
+under a wave prefix (S3-compatible — rclone / `aws s3 cp` / the Cloudflare UI):
 
 ```bash
-modal volume create nano-corpus
-modal volume put nano-corpus /path/to/mp3s/ /
+rclone copy /path/to/mp3s/ r2:nano-audio/waves/wave_0/
 ```
 
-Upload runs at your connection speed (~0.7 GB/min at 100 Mbps).
+Upload runs at your connection speed (~0.7 GB/min at 100 Mbps). For the
+unlimited-scale, wave-by-wave ingestion model, see [README.waves.md](README.waves.md).
 
 
 ## 2. Prepare (required for tokenize on L4)
@@ -220,11 +224,12 @@ Or skip the download and serve straight from the volume: `modal serve diskrot/mo
 
 ## Resetting (start fresh)
 
-Delete tags, lyrics, packed shards, and checkpoints to retrain from scratch:
+Delete the derived artifacts (tags, lyrics, packed shards, checkpoints) to retrain
+from scratch. The raw audio in R2 is the source — leave it in place (re-derive from
+it); only clear the R2 bucket via `rclone`/`aws s3` if you truly want to discard the
+corpus.
 
 ```bash
-modal volume delete nano-corpus
-modal volume create nano-corpus
 modal volume rm nano-tokens tags.json
 modal volume rm -r nano-tokens lyrics
 modal volume rm -r nano-tokens packed

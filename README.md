@@ -20,7 +20,7 @@ nano is a single bespoke model. Its shape is the `DEFAULTS` dict in [diskrot/mod
 | Max single-shot generation | ~95s (via the 8192-token RoPE table) |
 | Inference | CPU, MPS (Apple Silicon), or CUDA — no GPU required |
 
-This is a bespoke model: it is trained at scale on one kind of data. More of the same data helps; variety does not — the corpus is not curated for genre/style diversity. You supply your own MP3s; **plan on at least ~50,000 songs** for coherent musical output (below ~10,000 the model mostly produces noise, useful only for validating the pipeline), with quality improving as you add more of the same kind of data up to the `nano-corpus` volume's ~500,000-file ceiling.
+This is a bespoke model: it is trained at scale on one kind of data. More of the same data helps; variety does not — the corpus is not curated for genre/style diversity. You supply your own MP3s (stored in the R2 `nano-audio` bucket); **plan on at least ~50,000 songs** for coherent musical output (below ~10,000 the model mostly produces noise, useful only for validating the pipeline), with quality improving as you add more of the same kind of data — object storage has no inode cap, so the corpus can grow without a hard ceiling.
 
 ## What to expect during training
 

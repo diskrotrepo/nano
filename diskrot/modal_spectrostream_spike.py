@@ -34,6 +34,8 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import corpus_mount
+
 app = modal.App("nano-ss-spike")
 
 # Magenta RT's prebuilt GPU image already has python3.12 + magenta_rt + the full
@@ -66,11 +68,9 @@ image = (
     .add_local_python_source("model", "diskrot")
 )
 
-# Mount the nano-corpus Volume directly (NOT via corpus_mount(): the shell may set
-# NANO_CORPUS_SOURCE=bucket, which returns an R2 CloudBucketMount needing a secret +
-# endpoint the spike doesn't want). The original mp3 corpus lives on this Volume; if
-# it's empty the spike falls back to a synthetic-only round-trip.
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+# Read the mp3 corpus from R2 (rglob picks up the waves/wave_*/ layout). If the
+# bucket is empty/unreachable the spike falls back to a synthetic-only round-trip.
+corpus_vol = corpus_mount()  # read-only R2 CloudBucketMount
 out_vol = modal.Volume.from_name("nano-output", create_if_missing=True)
 cache_vol = modal.Volume.from_name("nano-ss-cache", create_if_missing=True)
 

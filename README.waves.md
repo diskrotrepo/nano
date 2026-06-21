@@ -7,8 +7,8 @@ the inode-cheap packed shard set (~1 file per 5k songs). Raw audio lives in
 object storage (no inode cap). See the design in
 `.claude/plans/i-think-v8-sing4-is-prancy-glacier.md`.
 
-The same entrypoints still work in the legacy flat layout when you omit
-`--wave-id` and leave `NANO_CORPUS_SOURCE` unset — this is purely additive.
+The same entrypoints still work in the legacy flat layout (bucket root) when you
+omit `--wave-id` — waves are purely additive.
 
 ---
 
@@ -29,29 +29,23 @@ The same entrypoints still work in the legacy flat layout when you omit
 
 ### 2. Point the code at the bucket
 
-Set these in every shell you run/deploy from (the mount is chosen at
-`modal run`/`modal deploy` time):
+R2 is the only audio source — set these in every shell you run/deploy from (the
+mount and its env are resolved at `modal run`/`modal deploy` time):
 
 ```bash
-export NANO_CORPUS_SOURCE=bucket
 export NANO_AUDIO_BUCKET=nano-audio
 export NANO_AUDIO_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 ```
 
-Leaving `NANO_CORPUS_SOURCE` unset keeps the legacy `nano-corpus` Volume source.
+`NANO_AUDIO_ENDPOINT` is **required** for R2. (The legacy `nano-corpus` Modal
+Volume and the one-time Volume→R2 migration have been retired — everything is in
+R2 now.)
 
-### 3. Migrate the existing corpus into the bucket (resumable)
-
-```bash
-modal run --detach diskrot/modal_migrate_corpus.py
-modal app logs nano-migrate-corpus     # watch; copies skip files already present
-```
-
-### 4. Deploy the stage apps (only needed for the one-command orchestrator)
+### 3. Deploy the stage apps (only needed for the one-command orchestrator)
 
 `modal run` apps are ephemeral and can't be looked up by name; `modal deploy`
-registers them so `modal_ingest_wave.py` can call them. Deploy **with the bucket
-env vars exported** so the mount is the bucket:
+registers them so `modal_ingest_wave.py` can call them. Deploy **with the R2 env
+vars exported** so the mount resolves:
 
 ```bash
 for m in prepare tokenize melody auto_tag transcribe structure \
@@ -84,8 +78,9 @@ only one GPU stage runs at a time — respects a 50-GPU cap automatically).
 Resumable: a re-run with the same `--wave-id` skips stages already marked done in
 `/tokens/waves/wave_17/status.json`, and each stage also resumes mid-stage by
 skip-by-existence. Toggle streams with `--no-with-melody` / `--no-with-tags` /
-`--no-with-lyrics` / `--no-with-structure`. Volume-source (no bucket) users add
-`--drop-mp3` so cleanup also reclaims the wave's raw mp3 inodes.
+`--no-with-lyrics` / `--no-with-structure`. Leave the raw mp3s in R2 (no inode
+cap, and they're the re-derivation source) — `--drop-mp3` deletes a wave's source
+audio from the bucket and is only for reclaiming space you don't need.
 
 ### Option B — per-stage (no deploy needed)
 

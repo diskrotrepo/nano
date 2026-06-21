@@ -12,8 +12,9 @@ cap is respected automatically (no extra throttling needed).
 
 PREREQUISITE — deploy the stage apps once so they can be looked up by name
 (``modal run`` apps are ephemeral and can't be looked up; ``modal deploy``
-registers them). For the object-storage source, set NANO_CORPUS_SOURCE=bucket
-(+ NANO_AUDIO_*) in the shell you DEPLOY from — the mount is fixed at deploy time::
+registers them). Set the R2 env (``NANO_AUDIO_BUCKET`` / ``NANO_AUDIO_ENDPOINT``,
++ the ``r2-creds`` secret) in the shell you DEPLOY from — the mount is fixed at
+deploy time::
 
     for m in prepare tokenize melody auto_tag transcribe structure \
              pack_cache wave_cleanup phonemize key_detect; do

@@ -1,6 +1,6 @@
 # Pricing for your corpus (322,530 songs)
 
-What a full Modal run costs **at your actual corpus size** — 322,530 MP3s on the `nano-corpus` volume (as of 2026-06-09). For the dependency graph see [README.plan.md](README.plan.md); for per-step detail see [README.modal.md](README.modal.md).
+What a full Modal run costs **at your actual corpus size** — 322,530 MP3s in the R2 `nano-audio` bucket (as of 2026-06-09). For the dependency graph see [README.plan.md](README.plan.md); for per-step detail see [README.modal.md](README.modal.md).
 
 > **Read this if you only read one thing:** a full *mandatory* run is roughly **$4,500–5,600**, dominated by **transcribe (~$3,000)** and **train (~$1,000–1,650)**. The optional **structure** pass adds **~$1,500**. Skip transcribe entirely if you don't need lyric conditioning and the data-prep side drops to a few hundred dollars.
 
@@ -60,9 +60,9 @@ Everything else combined (prepare + tokenize + melody + pack + auto-tag + key-de
 
 ## Storage (recurring, not in the totals above)
 
-The corpus and its derived artifacts live on Modal volumes and bill **monthly** while they exist — separate from the one-shot compute above:
+The corpus lives in Cloudflare R2 and its derived artifacts on Modal volumes; both bill **monthly** while they exist — separate from the one-shot compute above:
 
-- `nano-corpus` — ~2.5 TB of MP3s (322,530 files ≤ 5:30).
+- `nano-audio` (R2 bucket) — ~2.5 TB of MP3s (322,530 files ≤ 5:30). R2 storage is billed by Cloudflare, not Modal.
 - `nano-tokens` — DAC tokens + packed shards + tags + lyrics + structure + keys.json + phonemes (~100–155 GB; phonemes/ adds ~1–2 GB, keys.json ~15 MB).
 - `nano-melody` — chroma sidecars (~140 GB).
 - `nano-ckpts` — checkpoints (every ~5k steps; tens of GB).

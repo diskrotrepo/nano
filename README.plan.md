@@ -22,7 +22,7 @@ Upload ──► Prepare ──► Tokenize ──► Melody ──► Pack ─�
 
 The longest mandatory chain — everything else fits inside its shadow:
 
-1. **Upload** — MP3s → `nano-corpus`.
+1. **Upload** — MP3s → R2 `nano-audio` bucket (under `waves/wave_<id>/`).
 2. **Prepare** — validate / dedupe / drop too-short and too-long files. Gates everything downstream.
 3. **Tokenize** — MP3 → DAC tokens (`.pt`).
 4. **Melody** — chroma sidecar (`.mel.npy`). Waits on Tokenize (needs the token frame count to align).
@@ -54,9 +54,8 @@ All Modal steps are detached (`--detach`) — they return immediately and run in
 **Wave 0 — serial gate** (each waits on the previous):
 
 ```bash
-# Upload
-modal volume create nano-corpus
-modal volume put nano-corpus /path/to/mp3s/ /
+# Upload to R2 (see README.waves.md for the one-time bucket + r2-creds setup)
+rclone copy /path/to/mp3s/ r2:nano-audio/waves/wave_0/
 
 # Prepare — dry-run first, then --apply
 modal run --detach diskrot/modal_prepare.py

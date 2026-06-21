@@ -33,7 +33,6 @@ REPO = Path(__file__).resolve().parent.parent
 # spawn. Add here ONLY for a short interactive tool, never a corpus sweep.
 BLOCKING_OK = {
     "modal_clean_corrupt.py",   # one-off maintenance sweep, inline report
-    "modal_drop_long.py",       # dry-run blocks inline; apply path spawns
     "modal_export_ckpt.py",     # seconds — prints the pull command
     "modal_inspect_ckpts.py",   # seconds — prints the checkpoint table
     "modal_merge_lora.py",      # minutes — prints the pull command

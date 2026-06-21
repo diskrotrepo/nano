@@ -5,7 +5,7 @@ Audio generation model. Decoder-only transformer trained on DAC-tokenized audio 
 ## Project principles
 
 - **This is a bespoke model — there is one model, not a family of tiers.** The `DEFAULTS` dict in [diskrot/modal_train.py](diskrot/modal_train.py) is the single source of truth for its shape. (Earlier "v4/v5/v6" framing is retired; the only surviving artifact is the `ckpt_subdir="v7_1500m"` constant, which is just a directory name — the model scaled from ~287M to ~2.0B.)
-- **Scale of training data matters; variety does not.** Recommended corpus size is **~50k songs minimum** (below ~10k produces noise — pipeline-validation only) up to the `nano-corpus` volume's ~500k-file ceiling. More of the same kind of data helps; do **not** optimize tagging or curation for genre/style diversity. Breadth of genre is not a goal.
+- **Scale of training data matters; variety does not.** Recommended corpus size is **~50k songs minimum** (below ~10k produces noise — pipeline-validation only); there is no hard ceiling now that the corpus lives in R2 object storage (the old ~500k-file figure was the retired `nano-corpus` Volume's inode cap). More of the same kind of data helps; do **not** optimize tagging or curation for genre/style diversity. Breadth of genre is not a goal.
 
 ## Architecture
 
@@ -113,7 +113,7 @@ Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `
 
 ## Data Flow
 
-1. **Add corpus**: upload your own MP3s → `nano-corpus` volume (`modal volume put`)
+1. **Add corpus**: upload your own MP3s → the R2 `nano-audio` bucket under `waves/wave_<id>/` (object storage; no inode cap)
 2. **Prepare**: validate (ffprobe) + dedupe (SHA-256) + drop <20s + drop long files (>5:30) via `diskrot.modal_prepare` — required so the L4 tokenizer doesn't OOM
 3. **Tokenize**: MP3 → librosa (44.1kHz mono) → DAC encode → int16 tensor [9, T_frames] saved as .pt
 4. **Melody** (optional): MP3 → `chroma_cqt` (forced to the song's token frame count) → per-song `<name>.mel.npy` on the **nano-melody** volume via `diskrot.modal_melody` — runs after tokenize, before pack (own volume so it doesn't blow nano-tokens' inode cap)
@@ -127,11 +127,17 @@ Local defaults live in [diskrot/train.py](diskrot/train.py); Modal defaults in `
 12. **Train**: packed shards (+ chroma sidecar) + tags.json + lyrics/ + structure/ + keys.json + phonemes/ → TokenDataset (mmap-backed random `segment_seconds` crops — 60s on Modal) → delayed sequence → cross-entropy loss per codebook
 13. **Inference**: checkpoint → NanoAudioGPT → autoregressive generation with KV cache → DAC decode → MP3 via ffmpeg (the `/cover` path additionally feeds the uploaded hum's chromagram)
 
-## Modal Volumes
+## Storage
 
-| Volume | Contents |
+Raw audio lives in **Cloudflare R2** (the `nano-audio` bucket), mounted via
+`modal_common.corpus_mount()` (a `CloudBucketMount` carrying the `r2-creds` secret;
+needs `NANO_AUDIO_BUCKET`/`NANO_AUDIO_ENDPOINT`). The legacy `nano-corpus` Modal
+Volume has been retired — object storage has no inode cap, so the corpus can grow
+past the old ~500k-file ceiling. Everything else is on Modal Volumes:
+
+| Store | Contents |
 |---|---|
-| nano-corpus | Raw MP3 files |
+| `nano-audio` (R2 bucket) | Raw MP3 files under `waves/wave_<id>/` |
 | nano-tokens | .pt token files, packed/ shards (incl. `.mel.bin`), tags.json, lyrics/, structure/, keys.json, phonemes/ |
 | nano-melody | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its ~500k-inode cap) |
 | nano-ckpts | Training checkpoints (step_*.pt, latest.pt, best.pt) |

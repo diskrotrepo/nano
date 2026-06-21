@@ -21,18 +21,23 @@ nano is **one bespoke model trained at scale on one kind of data**. More of the
 same data helps; variety does not — do **not** curate for genre/style diversity.
 
 - **Recommended corpus size:** ~50k songs minimum for coherent output. Below ~10k
-  the model produces noise (pipeline-validation only). Ceiling is ~500k files
-  (the `nano-corpus` volume's inode limit).
+  the model produces noise (pipeline-validation only). No hard ceiling — the raw
+  audio lives in R2 object storage (the old ~500k figure was the retired
+  `nano-corpus` Volume's inode cap).
 - For the cost-per-1,000-songs table and end-to-end walkthrough, read
   [README.modal.md](../../../README.modal.md) — don't restate the numbers here.
 - For the per-stage data shapes, see the **Data Flow** section of
   [CLAUDE.md](../../../CLAUDE.md).
 
-## Volumes
+## Storage
 
-| Volume | Holds |
+Raw audio lives in **Cloudflare R2** (the `nano-audio` bucket, under
+`waves/wave_<id>/`), mounted via `modal_common.corpus_mount()`. The legacy
+`nano-corpus` Volume is retired. Everything else is on Modal Volumes:
+
+| Store | Holds |
 |---|---|
-| `nano-corpus` | Raw MP3 files |
+| `nano-audio` (R2) | Raw MP3 files under `waves/wave_<id>/` |
 | `nano-tokens` | `.pt` token files, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/`, `structure/`, `keys.json`, `phonemes/` |
 | `nano-melody` | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its inode cap) |
 | `nano-ckpts` | Training checkpoints |
@@ -43,11 +48,14 @@ re-run the same command to continue; it's safe to close your terminal.
 ## Pipeline (run in order)
 
 ### 1. Upload your MP3s
+Raw audio goes to the R2 `nano-audio` bucket under a wave prefix (S3-compatible
+upload — rclone / `aws s3 cp` / the Cloudflare UI). One-time R2 + `r2-creds` +
+`NANO_AUDIO_*` setup is in [README.waves.md](../../../README.waves.md#one-time-setup).
 ```bash
-modal volume create nano-corpus      # first time only
-modal volume put nano-corpus /path/to/mp3s/ /
+rclone copy /path/to/mp3s/ r2:nano-audio/waves/wave_0/
 ```
-Trailing `/` matters. (No crawler — you supply your own MP3s.)
+(No crawler — you supply your own MP3s. See [README.waves.md](../../../README.waves.md)
+for the wave-by-wave ingestion model.)
 
 ### 2. Prepare — validate, dedupe, drop
 Dry-run first (no deletions), inspect the report, then apply:
