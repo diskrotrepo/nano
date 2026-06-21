@@ -1,19 +1,33 @@
-"""Reorganize the flat (non-wave) R2 audio into ``waves/wave_base_<N>/`` folders.
+"""Repartition ALL R2 audio into uniform ``waves/wave_base_<N>/`` folders of 100k.
 
 So the v9 pipeline can treat the ENTIRE corpus as waves — one uniform ``--wave-id``
-flow, non-destructive to the source audio (it stays in R2, just re-prefixed). Uses
-**server-side** S3 ``CopyObject`` (no bytes leave R2), assigns each flat ``*.mp3``
-to a wave by sorted index // ``wave_size`` (deterministic + resumable: a re-run
-skips objects already under ``wave_base_*``). Dry-run by default.
+flow. This is a full, deterministic **re-partition** (not just a flat->wave sweep):
 
-Assumes the flat audio is in the R2 bucket (``NANO_CORPUS_SOURCE=bucket`` world).
-Set the same env the corpus mount uses:
+  * It considers EVERY ``*.mp3`` in the bucket — the flat top-level objects AND
+    everything already under ``waves/`` (existing ``wave_base_*`` plus any other
+    wave folder, e.g. a ``wave_missing/`` gap-fill). Nothing is left behind.
+  * Files are sorted by basename and assigned ``index // wave_size`` → so wave 0
+    holds the first 100k basenames, wave 1 the next 100k, etc. Every wave ends up
+    with exactly ``wave_size`` files (the last wave is the remainder).
+  * It is a **move**: each misplaced file is copied (server-side ``CopyObject`` —
+    no bytes leave R2) to its canonical ``waves/wave_base_<N>/<name>.mp3`` and the
+    old object is then deleted. Files already at their canonical spot are skipped.
+
+Because the assignment is deterministic, this is idempotent + resumable: a second
+run (after one completes) moves nothing. It also normalizes existing waves —
+over-full waves shed their tail, partial waves get filled, stragglers in the
+wrong wave get relocated.
+
+Duplicate basenames (same stem, different keys) are NOT overwritten: one canonical
+copy is kept and the extras are left in place and reported (let ``r2-dedup`` handle
+them). The pipeline keys by stem, so duplicates can't share a wave slot anyway.
+
+Assumes the audio is in the R2 bucket. Set the same env the corpus mount uses:
 
     export NANO_AUDIO_BUCKET=nano-audio
     export NANO_AUDIO_ENDPOINT=https://<acct>.r2.cloudflarestorage.com
-    modal run diskrot/modal_r2_wavify.py                              # dry-run plan
-    modal run --detach diskrot/modal_r2_wavify.py --apply             # copy (keep sources)
-    modal run --detach diskrot/modal_r2_wavify.py --apply --delete-source  # copy + delete flat
+    modal run diskrot/modal_r2_wavify.py                      # dry-run plan
+    modal run --detach diskrot/modal_r2_wavify.py --apply     # move (server-side)
 
 After this, run the per-wave v9 pipeline for ``wave_base_0..N`` (see README.v9.md).
 """
@@ -46,8 +60,8 @@ SRC_EXT = ".mp3"
     secrets=[modal.Secret.from_name("r2-creds")],
     timeout=60 * 60 * 6,
 )
-def wavify(apply: bool = False, delete_source: bool = False, wave_size: int = 100_000) -> None:
-    from collections import Counter
+def wavify(apply: bool = False, wave_size: int = 100_000) -> None:
+    from collections import Counter, defaultdict
     from concurrent.futures import ThreadPoolExecutor
 
     import boto3
@@ -56,59 +70,82 @@ def wavify(apply: bool = False, delete_source: bool = False, wave_size: int = 10
     endpoint = os.environ.get("NANO_AUDIO_ENDPOINT") or None
     s3 = boto3.client("s3", endpoint_url=endpoint)
 
-    # 1. list flat source keys (*.mp3 NOT already under waves/) + already-copied basenames
-    src: list[str] = []
-    done: set[str] = set()
+    # 1. list EVERY *.mp3 anywhere in the bucket (flat + under waves/*).
+    by_base: dict[str, list[str]] = defaultdict(list)
+    n_objs = 0
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
         for obj in page.get("Contents", []):
             k = obj["Key"]
-            if k.startswith(WAVE_PREFIX):
-                done.add(k.rsplit("/", 1)[-1])
-            elif not k.startswith("waves/") and k.lower().endswith(SRC_EXT):
-                src.append(k)
-    src.sort()  # deterministic wave assignment (sorted index // wave_size)
-    n = len(src)
-    n_waves = (n + wave_size - 1) // wave_size if n else 0
-    plan = [(k, i // wave_size, k.rsplit("/", 1)[-1]) for i, k in enumerate(src)]
+            if k.lower().endswith(SRC_EXT):
+                by_base[k.rsplit("/", 1)[-1]].append(k)
+                n_objs += 1
+    for keys in by_base.values():
+        keys.sort()  # deterministic representative = first key
 
-    print(f"\n=== R2 wavify: {n:,} flat .mp3 -> {n_waves} waves of {wave_size:,} "
-          f"(already under {WAVE_PREFIX}*: {len(done):,}) ===", flush=True)
-    for w, c in sorted(Counter(w for _, w, _ in plan).items()):
+    # 2. deterministic canonical order = sorted basename -> wave = index // wave_size.
+    bases = sorted(by_base)
+    n = len(bases)
+    n_waves = (n + wave_size - 1) // wave_size if n else 0
+    n_dupes = n_objs - n
+
+    # 3. classify every basename: already placed / needs move (flat vs wrong-wave).
+    moves: list[tuple[str, str]] = []
+    per_wave: Counter = Counter()
+    already = move_from_flat = move_from_wave = 0
+    for i, base in enumerate(bases):
+        w = i // wave_size
+        per_wave[w] += 1
+        target = f"{WAVE_PREFIX}{w}/{base}"
+        copies = by_base[base]
+        if target in copies:        # canonical copy already in the right place
+            already += 1
+            continue
+        rep = copies[0]             # move the first-sorted copy to its canonical wave
+        moves.append((rep, target))
+        if "/" in rep:
+            move_from_wave += 1
+        else:
+            move_from_flat += 1
+
+    print(f"\n=== R2 wavify (repartition): {n:,} unique .mp3 -> {n_waves} waves "
+          f"of {wave_size:,} ===", flush=True)
+    print(f"  total objects: {n_objs:,}  (duplicate basenames left in place: "
+          f"{n_dupes:,})", flush=True)
+    for w, c in sorted(per_wave.items()):
         print(f"  {WAVE_PREFIX}{w}: {c:,}", flush=True)
+    print(f"  already canonical: {already:,}   to move: {len(moves):,} "
+          f"(from flat {move_from_flat:,}, from wrong wave {move_from_wave:,})",
+          flush=True)
     if not apply:
-        print("\nDRY RUN — re-run with --apply to copy (server-side). "
-              "Add --delete-source to also remove the flat originals.", flush=True)
+        print("\nDRY RUN — re-run with --apply to MOVE (server-side copy + delete "
+              "old). Duplicates are never overwritten; extras stay put.", flush=True)
         return
 
-    def _copy(item: tuple[str, int, str]) -> str:
-        src_key, w, base = item
-        if base in done:
-            return "skip"
+    def _move(item: tuple[str, str]) -> str:
+        src_key, target = item
         s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src_key},
-                       Key=f"{WAVE_PREFIX}{w}/{base}")
-        if delete_source:
-            s3.delete_object(Bucket=bucket, Key=src_key)
-        return "done"
+                       Key=target)
+        s3.delete_object(Bucket=bucket, Key=src_key)  # move = copy then drop old
+        return "moved"
 
-    n_done = n_skip = n_err = 0
+    n_done = n_err = 0
     with ThreadPoolExecutor(max_workers=64) as pool:
-        for i, r in enumerate(pool.map(_copy, plan)):
-            if r == "done":
-                n_done += 1
-            else:
-                n_skip += 1
+        for i, r in enumerate(pool.map(_move, moves)):
+            n_done += 1 if r == "moved" else 0
             if (i + 1) % 20_000 == 0:
-                print(f"  {i + 1:,}/{n:,}  (copied {n_done:,}, skipped {n_skip:,})", flush=True)
-    print(f"\ndone: copied {n_done:,}, skipped {n_skip:,}"
-          f"{', deleted flat sources' if delete_source else ''}.", flush=True)
-    print("next: run the per-wave v9 pipeline for each wave_base_N (README.v9.md).", flush=True)
+                print(f"  {i + 1:,}/{len(moves):,}  moved", flush=True)
+    print(f"\ndone: moved {n_done:,} into canonical waves "
+          f"({already:,} already placed, {n_dupes:,} duplicate extras left).",
+          flush=True)
+    print("next: run the per-wave v9 pipeline for each wave_base_N (README.v9.md).",
+          flush=True)
 
 
 @app.local_entrypoint()
-def main(apply: bool = False, delete_source: bool = False):
+def main(apply: bool = False, wave_size: int = 100_000):
     if apply:
-        # spawn + --detach so a long copy survives the terminal closing.
-        wavify.spawn(apply=True, delete_source=delete_source)
+        # spawn + --detach so a long repartition survives the terminal closing.
+        wavify.spawn(apply=True, wave_size=wave_size)
         print("wavify launched (detached). watch: modal app logs <ap-...> -f")
     else:
-        wavify.remote(apply=False)  # dry-run blocks inline + prints the plan
+        wavify.remote(apply=False, wave_size=wave_size)  # dry-run blocks + prints plan
