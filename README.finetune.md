@@ -57,8 +57,8 @@ python -m diskrot.train --device mps \
   --init-from ./checkpoints/latest.pt --lora --ckpt-dir ./checkpoints/ft_run \
   --cache-dir ./token_cache --tags-path ./tags.json --lyrics-path ./lyrics
 
-# Modal full fine-tune (8×H100, lower LR than the from-scratch 2.1e-4)
-modal run --detach diskrot/modal_train.py --n-gpus 8 \
+# Modal full fine-tune (4×B200, lower LR than the from-scratch 1.5e-4)
+modal run --detach diskrot/modal_train.py --n-gpus 4 \
   --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
 ```
 

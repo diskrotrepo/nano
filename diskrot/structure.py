@@ -43,6 +43,25 @@ def _struct_bucket(stem: str) -> int:
     return int(hashlib.sha1(stem.encode()).hexdigest()[:8], 16) % N_STRUCT_SHARDS
 
 
+def _sample_keep(stem: str, sample_pct: int) -> bool:
+    """Deterministic membership in the sampled subset, in [0, sample_pct) of 100.
+
+    The allin1 section pass is the most expensive (optional) data-prep step, and
+    downstream the signal collapses to 8 section labels that degrade gracefully to
+    ``<no_section>`` for any song without an entry. So we can run it on a fraction
+    of the corpus and let the rest fall back. ``sample_pct >= 100`` keeps all,
+    ``<= 0`` keeps none. The ``"sample:"`` salt makes this grid INDEPENDENT of
+    ``_struct_bucket``'s shard grid, so the kept set isn't correlated with shard id.
+    Stable across processes (sha1, not the salted builtin ``hash()``), so a re-run
+    with the same ``sample_pct`` never re-decides membership — resume stays correct.
+    """
+    if sample_pct >= 100:
+        return True
+    if sample_pct <= 0:
+        return False
+    return int(hashlib.sha1(("sample:" + stem).encode()).hexdigest()[:8], 16) % 100 < sample_pct
+
+
 def _shard_path(structure_dir: str | Path, bucket: int) -> Path:
     return Path(structure_dir) / f"structure_{bucket:03d}.json"
 
@@ -145,12 +164,15 @@ def analyze_corpus(
     device: str = "cuda",
     flush_callback=None,
     flush_every: int = 10,
+    sample_pct: int = 100,
 ) -> None:
     """Analyze structure for all mp3s in corpus_dir into a sharded structure dir.
 
     Resumes by skipping any stem already present in the shards, and flushes only
     the shards touched since the last flush (atomic temp+rename), so a kill
-    mid-write corrupts at most one shard, never the whole corpus.
+    mid-write corrupts at most one shard, never the whole corpus. ``sample_pct``
+    (<100) runs only the deterministic ``_sample_keep`` subset (cost reduction;
+    the rest fall back to ``<no_section>``).
     """
     corpus_dir = Path(corpus_dir)
     structure_dir = Path(out_path)
@@ -158,6 +180,10 @@ def analyze_corpus(
     mp3s = sorted(corpus_dir.glob("*.mp3"))
     if not mp3s:
         raise SystemExit(f"No mp3s found in {corpus_dir}")
+    if sample_pct < 100:
+        n_all = len(mp3s)
+        mp3s = [m for m in mp3s if _sample_keep(m.stem, sample_pct)]
+        print(f"sampling {sample_pct}%: {len(mp3s)}/{n_all} mp3s kept")
     print(f"found {len(mp3s)} mp3s | device: {device}")
 
     print("loading allin1...")
@@ -214,7 +240,10 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default="./structure",
                    help="output directory for sharded structure_NNN.json files")
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--sample-pct", type=int, default=100,
+                   help="run allin1 on only this %% of songs (deterministic stem hash); "
+                        "the rest fall back to <no_section>. 100 = full corpus.")
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    analyze_corpus(args.corpus, args.out, device=device)
+    analyze_corpus(args.corpus, args.out, device=device, sample_pct=args.sample_pct)

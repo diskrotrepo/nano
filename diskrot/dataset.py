@@ -108,6 +108,29 @@ def _load_keys(keys_path: str | Path | None, verbose: bool = True) -> dict[str, 
     return keys
 
 
+def _load_tempo(tempo_path: str | Path | None, verbose: bool = True) -> dict[str, float]:
+    """Load per-song bpm (diskrot.tempo_detect's tempo.json) for the ``<tempo_*>``
+    header marker. The cheap DENSE tempo source — preferred over the (sampled)
+    structure pass's bpm in ``load_mmap_bundle``. Sparse: a song without an entry
+    falls back to the structure bpm (if any) or ``<unknown_tempo>``. Mirrors
+    ``_load_keys`` (sharded dir or a single JSON)."""
+    if tempo_path is None:
+        return {}
+    tp = Path(tempo_path)
+    if not tp.exists():
+        return {}
+    if tp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(tp, "tempo")
+    else:
+        raw = json.loads(tp.read_text())
+    tempo = {name: float(val["bpm"]) for name, val in raw.items()
+             if isinstance(val, dict) and isinstance(val.get("bpm"), (int, float))}
+    if verbose:
+        print(f"[tempo] loaded {len(tempo)} entries from {tp}", flush=True)
+    return tempo
+
+
 # Word-entry validity lives in transcribe_lyrics.is_valid_word (the schema
 # producer) so the dataset loader and diskrot.phonemize filter with the
 # IDENTICAL predicate — the pre-phonemized store's group-count==word-count
@@ -317,6 +340,7 @@ def load_mmap_bundle(
     structure_path: str | Path | None = None,
     keys_path: str | Path | None = None,
     phonemes_path: str | Path | None = None,
+    tempo_path: str | Path | None = None,
     pad_short: bool = False,
 ) -> dict:
     """Parent-process bundle for the v2 sharded mmap path.
@@ -340,6 +364,11 @@ def load_mmap_bundle(
           f"(melody={'on' if has_melody else 'off'}) ({time.time()-t0:.1f}s)",
           flush=True)
     structure, bpm = _load_structure(structure_path)
+    # tempo.json (diskrot.tempo_detect) is the cheap DENSE tempo source and takes
+    # precedence over the structure pass's bpm, which now covers only a sampled
+    # fraction of the corpus. Merge tempo last so it wins per-song; structure bpm
+    # remains a fallback for any song tempo.json missed.
+    bpm = {**bpm, **_load_tempo(tempo_path)}
     lyrics, instrumental = _load_lyrics(lyrics_path, with_instrumental=True)
     return {
         "packed_dir": str(packed_dir),
@@ -379,6 +408,7 @@ class TokenDataset(Dataset):
         structure_path: str | Path | None = None,
         keys_path: str | Path | None = None,
         phonemes_path: str | Path | None = None,
+        tempo_path: str | Path | None = None,
         max_lyric_len: int = 256,
         n_codebooks: int | None = None,
         pad_short: bool = False,
@@ -405,6 +435,7 @@ class TokenDataset(Dataset):
             structure_path=structure_path,
             keys_path=keys_path,
             phonemes_path=phonemes_path,
+            tempo_path=tempo_path,
             pad_short=pad_short,
         )
         # Delegate to from_mmap and steal its state into self.
@@ -460,8 +491,9 @@ class TokenDataset(Dataset):
         # markers into the time-aligned lyric stream. Songs without an entry get a
         # <no_section> prefix, so a partial structure pass is fine.
         ds._structure = {n: all_structure[n] for n in name_set if n in all_structure}
-        # Per-song bpm (allin1 tempo), used for the <tempo_*> header marker. Sparse:
-        # songs without a bpm aren't in the map and get <unknown_tempo> at crop time.
+        # Per-song bpm for the <tempo_*> header marker — tempo.json (dense,
+        # diskrot.tempo_detect) merged over the sampled structure pass's bpm in
+        # load_mmap_bundle. Sparse: songs without a bpm get <unknown_tempo> at crop.
         all_bpm = bundle.get("bpm", {})
         ds._bpm = {n: all_bpm[n] for n in name_set if n in all_bpm}
         # Per-song key labels (diskrot.key_detect), used for the <key_*> header

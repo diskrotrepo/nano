@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -54,6 +55,10 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 @app.cls(
     image=image,
     gpu="L4",
+    # 4 cores so the two @modal.concurrent inputs' CPU work (ffmpeg decode,
+    # 44.1→16k resample, Silero VAD, the pyin gender Viterbi) doesn't contend —
+    # same pattern as the structure sibling stage.
+    cpu=4.0,
     timeout=60 * 60,
     max_containers=50,
     # Retry inputs whose container died under them (guard exits, preemptions,
@@ -64,6 +69,12 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
+# Two inputs per container overlaps one song's GPU work (Demucs/Whisper) with the
+# other's GPU-idle CPU tail (resample/VAD/pyin), raising L4 utilization at no FLOP
+# cost. Capped at 2: the structure sibling found 4 ballooned the neural step
+# ~4s→20s from GPU contention; htdemucs activations on full-length tracks are the
+# VRAM driver, so 2 concurrent long tracks is the safe ceiling on the L4's 24 GB.
+@modal.concurrent(max_inputs=2)
 class Transcriber:
     @modal.enter()
     def load_models(self):
@@ -110,6 +121,14 @@ class Transcriber:
         # fails EVERY input in ~4s and eats the queue (observed 2026-06-11:
         # ~146k of 180k results failed in-band; the NameError-only guard below
         # missed it because the storm wasn't a NameError).
+        # Guarded with a lock: under @modal.concurrent(max_inputs=2) two inputs
+        # run in this container's thread pool, so the read-modify-write of this
+        # int would race. The threshold is raised to 5 below (from 3) because up
+        # to 2 genuinely-bad files can be in-flight together on a HEALTHY
+        # container and both fail — we want more evidence of a persistent fault
+        # before exiting (and a spurious exit is only a wasted container: its
+        # inputs stay pending and are redone on a healthy one).
+        self._fail_lock = threading.Lock()
         self.consecutive_failures = 0
 
     @modal.method()
@@ -122,7 +141,8 @@ class Transcriber:
         try:
             vocals = _separate_vocals(self.demucs_model, self.apply_fn, mp3_path, "cuda")
             result = _transcribe(self.whisper_model, vocals)
-            self.consecutive_failures = 0
+            with self._fail_lock:
+                self.consecutive_failures = 0
             return (key, result, None)
         except NameError as e:
             # Poisoned module state (a lazy import died and left sys.modules
@@ -132,18 +152,21 @@ class Transcriber:
             print(f"poisoned container ({e}); exiting so Modal replaces it", flush=True)
             os._exit(13)
         except Exception as e:
-            self.consecutive_failures += 1
+            with self._fail_lock:
+                self.consecutive_failures += 1
+                n_fail = self.consecutive_failures
             err = f"{type(e).__name__}: {str(e)[:300]}"
             # Print in the WORKER so a failure storm is visible live in any
             # container's logs — save_results only surfaces these at flush time.
-            print(f"ERROR (consecutive {self.consecutive_failures}) {key}: {err}",
-                  flush=True)
-            if self.consecutive_failures >= 3:
-                # Distinct files don't fail back-to-back on a healthy container;
+            print(f"ERROR (consecutive {n_fail}) {key}: {err}", flush=True)
+            if n_fail >= 5:
+                # Distinct files don't fail repeatedly on a healthy container;
                 # persistent broken state (sticky CUDA assert etc.) does. Same
                 # remedy as the NameError guard: die, get replaced, the inputs
-                # stay pending and are redone on a healthy container.
-                print("3 consecutive failures — poisoned container; exiting so "
+                # stay pending and are redone on a healthy container. 5 (not 3)
+                # tolerates up to 2 concurrent genuinely-bad files without a
+                # spurious exit under @modal.concurrent.
+                print("5 consecutive failures — poisoned container; exiting so "
                       "Modal replaces it", flush=True)
                 os._exit(13)
             return (key, None, err)

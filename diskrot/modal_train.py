@@ -16,11 +16,11 @@ Override architecture / hyperparams via CLI:
       --batch-size 32 --lr 2.1e-4 --warmup-steps 5000 \\
       --eval-batches 50 --ckpt-subdir v8_sing
 
-Multi-GPU DDP on 8×H100 (per-rank batch_size; global = n_gpus × that):
-    modal run --detach diskrot/modal_train.py --n-gpus 8 --batch-size 4
+Multi-GPU DDP on 4×B200 (per-rank batch_size; global = n_gpus × that):
+    modal run --detach diskrot/modal_train.py --n-gpus 4 --batch-size 8
 
 Fine-tune from an existing checkpoint (fresh optimizer/step, new subdir):
-    modal run --detach diskrot/modal_train.py --n-gpus 8 \\
+    modal run --detach diskrot/modal_train.py --n-gpus 4 \\
       --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
 
 LoRA-train (frozen base + adapters; single H100 is plenty; see README.finetune.md):
@@ -275,6 +275,7 @@ def _build_cfg_kwargs(
     structure_path = f"{root}/structure" if text_conditioned else None
     keys_path = f"{root}/keys.json" if text_conditioned else None
     phonemes_path = f"{root}/phonemes" if text_conditioned else None
+    tempo_path = f"{root}/tempo.json" if text_conditioned else None
     from model.lora import DEFAULT_TARGETS
 
     return dict(
@@ -293,6 +294,7 @@ def _build_cfg_kwargs(
         structure_path=structure_path,
         keys_path=keys_path,
         phonemes_path=phonemes_path,
+        tempo_path=tempo_path,
         text_conditioned=text_conditioned,
         segment_seconds=segment_seconds,
         pad_short_songs=pad_short_songs,
@@ -762,6 +764,7 @@ def train_remote_multi(
         structure_path=cfg_kwargs["structure_path"],
         keys_path=cfg_kwargs["keys_path"],
         phonemes_path=cfg_kwargs["phonemes_path"],
+        tempo_path=cfg_kwargs["tempo_path"],
         pad_short=cfg_kwargs.get("pad_short_songs", False),
     )
     tag_cache: dict = {}

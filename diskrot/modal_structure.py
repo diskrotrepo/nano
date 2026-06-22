@@ -178,17 +178,23 @@ STRUCTURE_DIR = "/tokens/structure"
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending(wave_id: str = "") -> list[str]:
+def list_pending(wave_id: str = "", sample_pct: int = 100) -> list[str]:
     """Return mp3 names (relative to /corpus) not yet in the sharded structure
     dir. ``wave_id`` scopes the glob to /corpus/waves/wave_<id>; structure shards
-    key on the song stem either way."""
-    from diskrot.structure import load_structure_shards
+    key on the song stem either way. ``sample_pct`` (<100) keeps only the
+    deterministic ``_sample_keep`` subset — the cost-reduction lever; the rest of
+    the corpus is never dispatched and falls back to ``<no_section>`` at train
+    time. Filtering here is the single chokepoint, so resume-by-skip is unaffected
+    (already-done sampled songs are skipped; non-sampled songs are never queued)."""
+    from diskrot.structure import _sample_keep, load_structure_shards
 
     mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     existing = load_structure_shards(STRUCTURE_DIR)
     pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
-               if mp3.stem not in existing]
-    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, {len(pending)} pending")
+               if mp3.stem not in existing and _sample_keep(mp3.stem, sample_pct)]
+    sampled = "" if sample_pct >= 100 else f" (sampled to {sample_pct}%)"
+    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, "
+          f"{len(pending)} pending{sampled}")
     return pending
 
 
@@ -259,7 +265,7 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     retries=modal.Retries(max_retries=3, backoff_coefficient=1.0, initial_delay=10.0),
 )
 def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
-                wave_id: str = ""):
+                wave_id: str = "", sample_pct: int = 100):
     """Dispatch analysis and merge results into the sharded structure dir.
     ``wave_id`` scopes the pass to /corpus/waves/wave_<id>.
 
@@ -268,8 +274,10 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
     use it for the calibration run. ``list_pending`` skips songs already in the
     shards, so re-launching resumes. ``batch_size`` songs share one allin1 call
     (one demucs subprocess + one ensemble load per chunk instead of per song).
+    ``sample_pct`` (<100) runs allin1 on only a deterministic fraction of songs
+    (cost reduction; the rest fall back to ``<no_section>``).
     """
-    pending = list_pending.remote(wave_id=wave_id)
+    pending = list_pending.remote(wave_id=wave_id, sample_pct=sample_pct)
     if limit and limit > 0:
         pending = pending[:limit]
     if not pending:
@@ -312,15 +320,18 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
 
 @app.local_entrypoint()
 def main(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
-         wave_id: str = ""):
+         wave_id: str = "", sample_pct: int = 100):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` (both pieces required: ``.spawn()`` so the entrypoint
     exits without blocking, and ``--detach`` so the app isn't auto-stopped when
     the entrypoint completes). ``--limit 200`` runs the calibration subset.
-    --wave-id N scopes analysis to /corpus/waves/wave_N.
+    --wave-id N scopes analysis to /corpus/waves/wave_N. ``--sample-pct 50`` runs
+    allin1 on only half the songs (the rest fall back to <no_section>); pair it
+    with the cheap dense ``modal_tempo.py`` pass to keep tempo coverage full.
     """
-    call = orchestrate.spawn(flush_every, limit, batch_size, wave_id=wave_id)
+    call = orchestrate.spawn(flush_every, limit, batch_size, wave_id=wave_id,
+                             sample_pct=sample_pct)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

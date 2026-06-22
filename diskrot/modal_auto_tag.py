@@ -22,6 +22,7 @@ Watch:
 # rule consistent across modal_*.py files makes it safe to add one later.
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -48,13 +49,28 @@ def _is_current(entry) -> bool:
     return isinstance(entry, dict) and entry.get("captioner") == CAPTIONER_MARKER
 
 
-# Heavy image for the GPU workers (audio-LLM captioner + torch).
+# With vLLM continuous batching each container saturates its OWN A100 independently,
+# so total cost (GPU-seconds = songs × s/song) is ~container-count-independent — the
+# vLLM init + KV-cache allocation amortizes via warm-container reuse across .map
+# elements regardless of count, leaving only a few $ of per-container startup +
+# idle-tail. So more containers just finish the WALL-CLOCK faster at ~the same price:
+# default to the account's full 50-GPU allowance. Dial down via env to limit blast
+# radius (e.g. while calibrating). Keep <= the account GPU cap (50).
+MAX_CONTAINERS = int(os.environ.get("NANO_AUTOTAG_MAX_CONTAINERS", "50"))
+
+
+# Heavy image for the GPU workers (audio-LLM captioner + vLLM).
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
     .pip_install(
-        "torch>=2.4",
-        "torchaudio>=2.4",
+        # vLLM owns the torch build (it pins a compatible one) — don't pin torch
+        # here or the resolver fights it. torchaudio is dropped (unused: librosa +
+        # soundfile do the decode). NOTE: vLLM's multimodal-audio API — the raw
+        # (np, sr) tuple in multi_modal_data and limit_mm_per_prompt — is
+        # version-sensitive; LOCK the exact vllm version after the --limit
+        # calibration confirms caption parity.
+        "vllm>=0.10.0",
         "librosa>=0.10",
         "numpy>=1.26",
         "tqdm>=4.66",
@@ -92,7 +108,11 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     image=image,
     gpu="A100",  # Qwen2-Audio-7B in fp16 (~15 GB) — too big for the L4
     timeout=60 * 60 * 4,
-    max_containers=50,
+    max_containers=MAX_CONTAINERS,
+    # Retry an element whose container died under it (preemption, OOM, platform
+    # cancellation) so it completes in-run instead of staying pending — the marker
+    # resume makes a retry idempotent (already-captioned stems are skipped).
+    retries=modal.Retries(max_retries=2, initial_delay=1.0),
     volumes={"/corpus": corpus_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -100,27 +120,83 @@ class Captioner:
     @modal.enter()
     def load_model(self):
         from model.audio_llm_captioner import load_captioner
+        # NANO_CAPTIONER_BACKEND defaults to vllm (continuous batching); set =hf
+        # for the transformers fallback (slower, the parity oracle).
         self.model = load_captioner("cuda")
+
+    def _caption_decoded(
+        self, decoded: list[tuple[str, list | None, str | None]]
+    ) -> list[tuple[str, dict | None, str | None]]:
+        """Caption an already-decoded sub-batch. Decode errors pass through; the
+        decoded-ok songs run through the batched vLLM path (one continuous batch)
+        when available, else the serial HF path."""
+        out: list[tuple[str, dict | None, str | None]] = [
+            (stem, None, err) for (stem, _w, err) in decoded if err is not None
+        ]
+        ok = [(stem, w) for (stem, w, err) in decoded if err is None]
+        if not ok:
+            return out
+        if hasattr(self.model, "caption_many"):
+            try:
+                caps = self.model.caption_many([w for (_s, w) in ok])
+                out.extend(
+                    (stem, {"description": d, "captioner": CAPTIONER_MARKER}, None)
+                    for (stem, _w), d in zip(ok, caps)
+                )
+            except Exception as e:
+                # A whole-batch generation failure must not crash the element —
+                # mark these songs failed (they stay pending, redone next run).
+                out.extend((stem, None, f"caption_many: {str(e)[:180]}")
+                           for (stem, _w) in ok)
+        else:
+            for stem, w in ok:
+                try:
+                    d = self.model.caption(w)
+                    out.append((stem, {"description": d,
+                                       "captioner": CAPTIONER_MARKER}, None))
+                except Exception as e:
+                    out.append((stem, None, str(e)[:200]))
+        return out
 
     @modal.method()
     def caption_batch(
         self, names: list[str]
     ) -> list[tuple[str, dict | None, str | None]]:
-        """Returns one (stem, tags_or_None, error_or_None) per input. Captions the
-        WHOLE song (several windows) into a rich multi-facet description."""
+        """Returns one (stem, tags_or_None, error_or_None) per input. Captions each
+        WHOLE song (several windows) into a rich multi-facet description, running a
+        whole sub-batch as ONE vLLM continuous batch. Audio decodes on CPU threads
+        (librosa releases the GIL) and the NEXT sub-batch decodes while the current
+        one generates on the GPU, so CPU decode overlaps GPU compute."""
+        from concurrent.futures import ThreadPoolExecutor
+
         from model.audio_llm_captioner import load_song_windows
 
-        out: list[tuple[str, dict | None, str | None]] = []
-        for name in names:
+        n_workers = int(os.environ.get(
+            "NANO_DECODE_WORKERS", str(min(16, (os.cpu_count() or 4)))))
+        sub = int(os.environ.get("NANO_CAPTION_SUBBATCH", "64"))
+        subbatches = [names[i:i + sub] for i in range(0, len(names), sub)]
+
+        def _decode(name: str) -> tuple[str, list | None, str | None]:
             path = Path("/corpus") / name
-            stem = path.stem
             try:
-                windows = load_song_windows(str(path))
-                description = self.model.caption(windows)
-                out.append((stem, {"description": description,
-                                   "captioner": CAPTIONER_MARKER}, None))
+                return (path.stem, load_song_windows(str(path)), None)
             except Exception as e:
-                out.append((stem, None, str(e)[:200]))
+                return (path.stem, None, str(e)[:200])
+
+        out: list[tuple[str, dict | None, str | None]] = []
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            def submit(sb):
+                return [ex.submit(_decode, nm) for nm in sb]
+
+            next_futs = submit(subbatches[0]) if subbatches else []
+            for idx in range(len(subbatches)):
+                cur_futs = next_futs
+                # Kick off the next sub-batch's decode BEFORE generating this one,
+                # so CPU decode runs while the GPU is busy.
+                next_futs = (submit(subbatches[idx + 1])
+                             if idx + 1 < len(subbatches) else [])
+                decoded = [f.result() for f in cur_futs]
+                out.extend(self._caption_decoded(decoded))
         return out
 
 
@@ -180,7 +256,7 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
     chunks = [pending[i:i + batch_size]
               for i in range(0, len(pending), batch_size)]
     print(f"dispatching {len(pending):,} files in {len(chunks):,} batches "
-          f"of ~{batch_size} across up to 50 containers...", flush=True)
+          f"of ~{batch_size} across up to {MAX_CONTAINERS} containers...", flush=True)
 
     def flush() -> None:
         tags_path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,14 +322,16 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
 
 
 @app.local_entrypoint()
-def main(batch_size: int = 8, flush_every_batches: int = 4, wave_id: str = "",
+def main(batch_size: int = 256, flush_every_batches: int = 4, wave_id: str = "",
          redo: bool = False):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.
     # --wave-id N scopes captioning to /corpus/waves/wave_N; --redo re-captions all.
-    # batch_size default 8 (down from 16): the audio-LLM caption is far slower
-    # per song than the BART one, so smaller batches keep flushes frequent.
+    # batch_size default 256: each .map element is run as ONE vLLM continuous batch
+    # (internally pipelined in NANO_CAPTION_SUBBATCH-sized sub-batches so CPU decode
+    # overlaps GPU compute), keeping the GPU saturated; the orchestrator still
+    # flushes tags.json every flush_every_batches elements.
     fc = run_auto_tag.spawn(
         batch_size=batch_size,
         flush_every_batches=flush_every_batches,

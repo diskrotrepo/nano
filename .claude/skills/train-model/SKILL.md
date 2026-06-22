@@ -21,7 +21,7 @@ is logged at startup) — harmless, just no melody signal.
 
 | Path | Command | Use when |
 |---|---|---|
-| **Modal 8×H100 DDP** | `modal run --detach diskrot/modal_train.py --n-gpus 8` | **The real path.** Full ~1.5B model, from scratch or full fine-tune. |
+| **Modal 4×B200 DDP** | `modal run --detach diskrot/modal_train.py --n-gpus 4` | **The real path.** Full ~1.5B model, from scratch or full fine-tune. |
 | **LoRA (local or Modal 1×H100)** | `… --init-from <ckpt> --lora …` | Adapt a trained checkpoint on new data — the frozen base makes the 1.5B trainable on a single GPU / Apple Silicon. See [README.finetune.md](../../../README.finetune.md). |
 | Local from-scratch | `python -m diskrot.train ...` | Pipeline validation only — the local CLI has **no** architecture flags, so a from-scratch run trains the full ~1.5B `GPTConfig` shape and won't fit on consumer GPUs. (With `--init-from`, the architecture comes from the checkpoint instead.) |
 | Modal single-GPU from-scratch | `modal run --detach diskrot/modal_train.py` | Not recommended — each rank pays the CLAP precompute and memory is tight. (Single-GPU **is** the recommended LoRA path, though.) |
@@ -34,9 +34,9 @@ checkpoints (old weights are incompatible).
 
 ```bash
 modal volume create nano-ckpts        # first time only
-modal run --detach diskrot/modal_train.py --n-gpus 8
+modal run --detach diskrot/modal_train.py --n-gpus 4
 ```
-DDP auto-picks per-rank batch 8 → global 64, matching the tuned LR. Common flags
+DDP auto-picks per-rank batch 8 → global 32, matching the tuned LR. Common flags
 (all optional — defaults come from `DEFAULTS`):
 
 ```
@@ -69,7 +69,7 @@ instead; precedence is `latest.pt` > `--init-from` > scratch):
 
 ```bash
 # Full fine-tune (every weight, fresh optimizer/step, lower LR)
-modal run --detach diskrot/modal_train.py --n-gpus 8 \
+modal run --detach diskrot/modal_train.py --n-gpus 4 \
   --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
 # optional: --data-subdir my_corpus  (pack the fine-tune corpus under /tokens/my_corpus)
 ```

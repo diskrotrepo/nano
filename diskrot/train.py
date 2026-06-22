@@ -76,6 +76,7 @@ class TrainConfig:
     structure_path: str | None = None  # path to structure (sharded dir or JSON) for section-marker conditioning
     keys_path: str | None = None  # path to keys.json (diskrot.key_detect) for the <key_*> header marker
     phonemes_path: str | None = None  # path to the pre-phonemized phonemes/ dir (diskrot.phonemize)
+    tempo_path: str | None = None  # path to tempo.json (diskrot.tempo_detect); dense bpm, overrides structure bpm
     cfg_dropout: float = 0.1  # probability of dropping text conditioning (classifier-free guidance)
     # Fraction of training batches reordered into the FIM (infill) layout. Only
     # active when model.use_fim is True. A FIM batch drops lyric conditioning
@@ -993,6 +994,7 @@ def train_run(
                                 val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
                                 lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
                                 keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
+                                tempo_path=cfg.tempo_path,
                                 max_lyric_len=cfg.model.max_lyric_len,
                                 n_codebooks=cfg.model.n_codebooks,
                                 pad_short=cfg.pad_short_songs, pad_id=cfg.model.pad_id)
@@ -1000,6 +1002,7 @@ def train_run(
                               val_ratio=cfg.val_ratio, seed=cfg.seed, tags_path=cfg.tags_path,
                               lyrics_path=cfg.lyrics_path, structure_path=cfg.structure_path,
                               keys_path=cfg.keys_path, phonemes_path=cfg.phonemes_path,
+                              tempo_path=cfg.tempo_path,
                               max_lyric_len=cfg.model.max_lyric_len,
                               n_codebooks=cfg.model.n_codebooks,
                               pad_short=cfg.pad_short_songs, pad_id=cfg.model.pad_id)
@@ -1634,6 +1637,7 @@ if __name__ == "__main__":
     p.add_argument("--structure-path", type=str, default=None, help="path to structure (sharded dir or JSON) for section-marker conditioning")
     p.add_argument("--keys-path", type=str, default=None, help="path to keys.json (diskrot.key_detect) for the <key_*> header marker")
     p.add_argument("--phonemes-path", type=str, default=None, help="path to the pre-phonemized phonemes/ dir (diskrot.phonemize)")
+    p.add_argument("--tempo-path", type=str, default=None, help="path to tempo.json (diskrot.tempo_detect) for the dense <tempo_*> header marker; overrides structure bpm")
     p.add_argument("--melody", action="store_true",
                    help="enable melody (chroma) conditioning — requires the pack to "
                         "have been built with --mel-cache-dir (parallel .mel.bin)")
@@ -1678,6 +1682,7 @@ if __name__ == "__main__":
         structure_path=args.structure_path,
         keys_path=args.keys_path,
         phonemes_path=args.phonemes_path,
+        tempo_path=args.tempo_path,
         init_from=args.init_from,
         lora=args.lora,
         lora_r=args.lora_r,

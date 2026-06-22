@@ -90,7 +90,7 @@ modal run --detach diskrot/modal_phonemize.py     # → phonemes/   (waits on Fi
 
 ```bash
 modal volume create nano-ckpts
-modal run --detach diskrot/modal_train.py --n-gpus 8
+modal run --detach diskrot/modal_train.py --n-gpus 4
 ```
 
 Pull the trained checkpoint when it's done:

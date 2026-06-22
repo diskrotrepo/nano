@@ -102,6 +102,15 @@ def _ffmpeg_load_stereo(path: str | Path, sr: int = 44100) -> np.ndarray:
         return np.stack([y, y]) if y.ndim == 1 else y
 
 
+# Demucs apply_model window overlap. The library default is 0.25 — windows stride
+# at 0.75×segment, ~1.33× redundant recompute. 0.1 trims ~17% of that overhead,
+# landing entirely on the dominant separation op, while keeping overlap>0 so the
+# triangular cross-fade still smooths the ~7.8s window seams (they don't land
+# mid-word) — adequate for a transcription-grade vocal stem. NANO_DEMUCS_OVERLAP
+# overrides it for the cost A/B (word count / avg_logprob / seam-timestamp parity).
+_DEMUCS_OVERLAP = float(os.environ.get("NANO_DEMUCS_OVERLAP", "0.1"))
+
+
 def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str) -> np.ndarray:
     """Isolate vocals from an audio file using Demucs. Returns mono float32 numpy array at 44100Hz."""
     audio = _ffmpeg_load_stereo(audio_path, 44100)  # [2, T]
@@ -109,7 +118,7 @@ def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str
     wav = wav.unsqueeze(0).to(device)  # [1, 2, T]
 
     with torch.no_grad():
-        sources = apply_fn(demucs_model, wav, device=device)
+        sources = apply_fn(demucs_model, wav, device=device, overlap=_DEMUCS_OVERLAP)
     # sources shape: [1, n_sources, 2, T] — source order: drums, bass, other, vocals
     vocals = sources[0, -1]  # [2, T] — last source is vocals
     vocals_mono = vocals.mean(dim=0).cpu().numpy()
@@ -126,7 +135,11 @@ def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str
 # model/lyric_encoder.py, which are robust to some label noise.
 _GENDER_F0_THRESHOLD_HZ = 165.0   # ~E3; >= -> female, < -> male
 _GENDER_MIN_VOICED_FRAMES = 50    # need enough voiced pitch to trust the median
-_GENDER_MAX_ANALYSIS_SEC = 90     # cap pYIN cost; plenty for a stable median
+# Cap pYIN cost: a stable median voiced-F0 needs far less than the old 90s, and
+# pYIN's Viterbi runs on the GPU-priced container's idle tail — 25s ~3×-cheapens
+# it. NANO_GENDER_MAX_SEC overrides it for the label-stability check (None-rate /
+# male-female balance vs the 90s baseline). Kernel/threshold/voiced-gate unchanged.
+_GENDER_MAX_ANALYSIS_SEC = float(os.environ.get("NANO_GENDER_MAX_SEC", "25"))
 
 
 def estimate_vocal_gender(vocals: np.ndarray, sr: int) -> str | None:
@@ -243,9 +256,12 @@ def transcribe_corpus(
     print("loading Demucs (htdemucs)...")
     demucs_model, apply_fn = _load_demucs(device)
 
-    print("loading Whisper (large-v3)...")
+    print("loading Whisper (large-v3-turbo)...")
     from faster_whisper import WhisperModel
-    whisper_model = WhisperModel("large-v3", device=device, compute_type="float16")
+    # large-v3-turbo: 4 decoder layers vs 32, ~4-6× faster ASR at near-identical
+    # quality — matches the Modal production model (modal_transcribe.py) so local
+    # pipeline-validation runs are representative of the corpus pass.
+    whisper_model = WhisperModel("large-v3-turbo", device=device, compute_type="float16")
 
     lyrics = load_lyrics_shards(lyrics_dir)
     if lyrics:

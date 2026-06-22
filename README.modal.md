@@ -184,14 +184,14 @@ CPU-only, one container, ~$1; needs the pack to carry the melody sidecar (`packe
 
 Trains the ~1.5B parameter transformer (d_model=2048, n_layers=22, n_heads=16, d_ff=8192) over 30-second segments with RoPE (`max_seq_len=8192`) so inference can extrapolate to ~95s single-shot generation. Defaults to 400K steps with early stopping at `patience=20`, gradient checkpointing on, and checkpoints under `/ckpts/v8_sing/` — the `DEFAULTS` dict in [diskrot/modal_train.py](diskrot/modal_train.py) is the source of truth. Text conditioning is enabled by default (requires step 4 auto-tagging).
 
-This is an 8×H100 DDP job. Single-GPU is technically possible but not recommended — the per-GPU memory footprint of the 1.5B model at 30s segments + bf16 + grad-checkpointing is tight on 80 GB H100s even at the per-rank batch of 8:
+This is a 4×B200 DDP job (the only multi-GPU function is hardwired `gpu="B200:4"`; `--n-gpus 8` would trip its device-count assert). Single-GPU is technically possible but not recommended — each rank pays the CLAP precompute and memory is tighter:
 
 ```bash
 modal volume create nano-ckpts
-modal run --detach diskrot/modal_train.py --n-gpus 8
+modal run --detach diskrot/modal_train.py --n-gpus 4
 ```
 
-The DDP path auto-picks `batch_size = DDP_PER_RANK_BATCH = 8` per rank → global = 64, matching the tuned LR (lr=3.0e-4, warmup=5000). Single-GPU runs use the full `batch_size=64`. Pass `--batch-size N` to override (per-rank in DDP mode); if you do, sqrt-scale the LR proportionally. Any field can be overridden on the CLI (`--d-model`, `--steps`, `--ckpt-subdir`, …).
+The DDP path auto-picks `batch_size = 32 // n_gpus` (8 per rank on 4 ranks) → global = 32, matching the tuned LR (lr=1.5e-4, warmup=10000). Single-GPU runs use the full `batch_size=32`. Pass `--batch-size N` to override (per-rank in DDP mode); if you do, sqrt-scale the LR proportionally. Any field can be overridden on the CLI (`--d-model`, `--steps`, `--ckpt-subdir`, …).
 
 Expect considerably more wall-clock and cost than the old 287M model — the 1.5B is ~5× the per-step compute. Rough order: a few thousand USD on 8×H100 for the full 400k steps (treat as an estimate, not a quote); early stopping (`patience=20`) commonly cuts this once the val loss plateaus. Training cost is independent of corpus size — only `steps` and model size drive it. Checkpoints land in `/ckpts/v7_1500m/` every ~5000 steps.
 
