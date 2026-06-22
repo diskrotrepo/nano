@@ -63,6 +63,12 @@ _IPA: tuple[str, ...] = (
     "̝", "̞", "̘", "̙", "̺", "̻", "͡",
     # tone letters
     "˥", "˦", "˧", "˨", "˩", "↗", "↘",
+    # espeak-ng notational symbols the cardinal-IPA groups above omit — surfaced by
+    # the W9 IPA-coverage spike (diskrot/modal_ipa_coverage.py) over the real corpus,
+    # where these four were ~92% of all UNK codepoints: ᵻ centralized reduced vowel,
+    # ä centralized open vowel, ɫ velarized "dark l", ᵝ bilabial-fricative/
+    # labialization modifier. Appended at the END so existing ids never renumber.
+    "ᵻ", "ä", "ɫ", "ᵝ",
 )
 
 # Special tokens occupy the low ids; everything downstream keys off these names.
@@ -201,7 +207,7 @@ PAD_PHONEME_ID: int = PHONEME_TO_ID[PAD_PHONEME]
 BOS_PHONEME_ID: int = PHONEME_TO_ID[BOS_PHONEME]
 WORD_BOUNDARY_ID: int = PHONEME_TO_ID[WORD_BOUNDARY_PHONEME]
 UNK_PHONEME_ID: int = PHONEME_TO_ID[UNK_PHONEME]
-PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # v9: 4 specials + 9 structure + 3 gender + 15 tempo + 25 key + 3 vocal + 36 lang + 157 IPA = 252 (checkpoint-incompatible vs v8's 129)
+PHONEME_VOCAB_SIZE: int = len(PHONEME_VOCAB)  # v9: 4 specials + 9 structure + 3 gender + 15 tempo + 25 key + 3 vocal + 36 lang + 161 IPA = 256 (checkpoint-incompatible vs v8's 129)
 
 # Structure label <-> phoneme id, the single source of truth shared by the dataset
 # (train-time injection) and inference (bracket parsing) so the two agree exactly.
