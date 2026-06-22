@@ -65,10 +65,23 @@ def wavify(apply: bool = False, wave_size: int = 100_000) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     import boto3
+    from botocore.config import Config
 
     bucket = os.environ.get("NANO_AUDIO_BUCKET", "nano-audio")
     endpoint = os.environ.get("NANO_AUDIO_ENDPOINT") or None
-    s3 = boto3.client("s3", endpoint_url=endpoint)
+    # max_pool_connections >= the 64 mover threads or they starve waiting for a
+    # connection (the original cause of the read timeouts); adaptive retries +
+    # a longer read_timeout ride out R2's transient slow CopyObject responses.
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        config=Config(
+            retries={"max_attempts": 10, "mode": "adaptive"},
+            read_timeout=120,
+            connect_timeout=30,
+            max_pool_connections=128,
+        ),
+    )
 
     # 1. list EVERY *.mp3 anywhere in the bucket (flat + under waves/*).
     by_base: dict[str, list[str]] = defaultdict(list)
@@ -121,22 +134,52 @@ def wavify(apply: bool = False, wave_size: int = 100_000) -> None:
               "old). Duplicates are never overwritten; extras stay put.", flush=True)
         return
 
+    import random
+    import time
+
     def _move(item: tuple[str, str]) -> str:
         src_key, target = item
-        s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src_key},
-                       Key=target)
-        s3.delete_object(Bucket=bucket, Key=src_key)  # move = copy then drop old
-        return "moved"
+        for attempt in range(8):  # ride out transient R2/network hiccups
+            try:
+                s3.copy_object(Bucket=bucket,
+                               CopySource={"Bucket": bucket, "Key": src_key},
+                               Key=target)
+                s3.delete_object(Bucket=bucket, Key=src_key)  # move = copy then drop old
+                return "moved"
+            except Exception as e:  # NEVER let one move crash the whole repartition
+                if attempt == 7:
+                    return f"FAILED\t{e}"
+                time.sleep(min(2 ** attempt, 30) + random.random())
+        return "FAILED"
 
-    n_done = n_err = 0
-    with ThreadPoolExecutor(max_workers=64) as pool:
-        for i, r in enumerate(pool.map(_move, moves)):
-            n_done += 1 if r == "moved" else 0
-            if (i + 1) % 20_000 == 0:
-                print(f"  {i + 1:,}/{len(moves):,}  moved", flush=True)
+    def _run(items: list[tuple[str, str]], label: str) -> list[tuple[str, str]]:
+        done = 0
+        failed: list[tuple[str, str]] = []
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            for i, (item, r) in enumerate(zip(items, pool.map(_move, items))):
+                if r == "moved":
+                    done += 1
+                else:
+                    failed.append(item)
+                if (i + 1) % 20_000 == 0:
+                    print(f"  [{label}] {i + 1:,}/{len(items):,}  "
+                          f"({done:,} ok, {len(failed):,} failed)", flush=True)
+        return failed
+
+    failed = _run(moves, "pass1")
+    if failed:  # one more sweep so a transient blip doesn't force a manual re-run
+        print(f"\n{len(failed):,} moves failed pass1 — retrying once more...",
+              flush=True)
+        failed = _run(failed, "pass2")
+    n_done = len(moves) - len(failed)
     print(f"\ndone: moved {n_done:,} into canonical waves "
           f"({already:,} already placed, {n_dupes:,} duplicate extras left).",
           flush=True)
+    if failed:
+        print(f"WARNING: {len(failed):,} moves still failed after retry — re-run "
+              f"(idempotent) to finish them. First few:", flush=True)
+        for src, tgt in failed[:10]:
+            print(f"  FAILED {src} -> {tgt}", flush=True)
     print("next: run the per-wave v9 pipeline for each wave_base_N (README.v9.md).",
           flush=True)
 

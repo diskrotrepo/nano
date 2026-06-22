@@ -33,6 +33,7 @@ Pull checkpoints back when training is done (substitute the subdir):
 """
 from __future__ import annotations
 
+import os
 import threading
 
 import modal
@@ -98,6 +99,16 @@ image = (
         "TORCHINDUCTOR_CACHE_DIR": "/compile-cache/inductor",
         "TRITON_CACHE_DIR": "/compile-cache/triton",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",  # explicit; default varies by torch version
+        # Codec selection MUST reach the train container: dataset.py and the
+        # segment-frames math resolve the frame rate from NANO_CODEC at import
+        # (codec_constants()). Modal does not forward the local shell env to remote
+        # containers, so bake the build-shell value in here — same contract as
+        # modal_tokenize.py. Default "dac" keeps legacy runs byte-identical; a v9
+        # run just needs `export NANO_CODEC=spectrostream` before `modal run`.
+        # Without this the container falls back to DAC's 86 Hz and 180s -> 15,480
+        # frames overruns max_seq_len=8192.
+        "NANO_CODEC": os.environ.get("NANO_CODEC", "dac"),
+        "NANO_SS_DEPTH": os.environ.get("NANO_SS_DEPTH", "32"),
     })
     .add_local_python_source("model", "diskrot")
 )

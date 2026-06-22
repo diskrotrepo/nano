@@ -31,7 +31,12 @@ Monitor::
 
     modal app logs nano-melody
 """
-from __future__ import annotations
+# NOTE: do NOT add `from __future__ import annotations` here. Modal's class
+# parameter validation (`@app.cls` + `modal.parameter()`, e.g. `subdir` below)
+# reads raw type annotations and rejects them when PEP 563 stringifies them —
+# you'll see `KeyError: 'str'` / `AttributeError: 'str' object has no attribute
+# '__name__'` at deploy time. Python 3.12 doesn't need the future import anyway
+# (`list[str]`, `tuple[int, int, int]` work natively).
 
 import os
 import time
