@@ -19,12 +19,6 @@ from diskrot.modal_common import corpus_mount, wave_subdir
 app = modal.App("nano-transcribe")
 
 
-def _cache_demucs():
-    from demucs.pretrained import get_model
-
-    get_model("htdemucs")
-
-
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
@@ -42,7 +36,14 @@ image = (
         "faster-whisper",
     )
     .run_commands("pip install 'protobuf>=4'")
-    .run_function(_cache_demucs)
+    # Cache the Demucs htdemucs weights into the image layer. MUST be run_commands
+    # (a pure shell step), NOT run_function: a build-time run_function imports this
+    # module to find the callable, but `diskrot` is only added by the
+    # add_local_python_source below (copy=False → absent at build time), so the
+    # top-level `from diskrot...` import fails with ModuleNotFoundError.
+    .run_commands(
+        "python -c \"from demucs.pretrained import get_model; get_model('htdemucs')\""
+    )
     .add_local_python_source("model", "diskrot")
 )
 

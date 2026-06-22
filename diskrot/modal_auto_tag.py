@@ -48,12 +48,6 @@ def _is_current(entry) -> bool:
     return isinstance(entry, dict) and entry.get("captioner") == CAPTIONER_MARKER
 
 
-def _prefetch_captioner():
-    """Bake the audio-LLM weights into the image layer (snapshot, no instantiate)."""
-    from huggingface_hub import snapshot_download
-    snapshot_download(_CAPTION_MODEL)
-
-
 # Heavy image for the GPU workers (audio-LLM captioner + torch).
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -69,7 +63,17 @@ image = (
         "accelerate>=0.30",
         "huggingface_hub",
     )
-    .run_function(_prefetch_captioner, secrets=[modal.Secret.from_name("huggingface-secret")])
+    # Bake the audio-LLM weights into the image layer. MUST be run_commands (a
+    # pure shell step), NOT run_function: a build-time run_function imports this
+    # module to find the callable, but `diskrot` is only added by the
+    # add_local_python_source below (copy=False → absent at build time), so the
+    # top-level `from diskrot...` import fails with ModuleNotFoundError. A shell
+    # command needs no module import and keeps the 16 GB download cached
+    # independently of source changes.
+    .run_commands(
+        f"python -c \"from huggingface_hub import snapshot_download; snapshot_download('{_CAPTION_MODEL}')\"",
+        secrets=[modal.Secret.from_name("huggingface-secret")],
+    )
     .add_local_python_source("model", "diskrot")
 )
 
