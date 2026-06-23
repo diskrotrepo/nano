@@ -110,19 +110,76 @@ def _ffmpeg_load_stereo(path: str | Path, sr: int = 44100) -> np.ndarray:
 # overrides it for the cost A/B (word count / avg_logprob / seam-timestamp parity).
 _DEMUCS_OVERLAP = float(os.environ.get("NANO_DEMUCS_OVERLAP", "0.1"))
 
+# Skip-Demucs mode: run Whisper on the raw MIX instead of the isolated vocal stem.
+# Recent ALT work (arXiv:2506.15514) shows that for a strong Whisper model WITH
+# VAD already on — exactly our setup (large-v3-turbo + vad_filter=True) — Demucs
+# separation buys ~0% WER on Jam-ALT (slightly worse) and ~3% on MUSDB-ALT, the
+# real win is the VAD segmentation we already do, and separation ARTIFACTS even
+# raise the hallucination rate. So the mix is a defensible ASR input and dropping
+# the full-track separation is the dominant transcribe-cost lever (Demucs is
+# ~45-60% of the stage). The F0 gender estimate genuinely needs a clean vocal
+# signal (bass/drums wreck the median pitch), so skip-mode keeps a SHORT
+# "Demucs-lite" clip (NANO_GENDER_CLIP_SEC, default 30s ≈ 15% of full-track) just
+# for that. OFF by default — a bare run is byte-identical to the stem path.
+_SKIP_DEMUCS_DEFAULT = os.environ.get("NANO_SKIP_DEMUCS", "false").lower() in ("1", "true", "yes")
+_GENDER_CLIP_START_SEC = float(os.environ.get("NANO_GENDER_CLIP_START", "60"))
+_GENDER_CLIP_SEC = float(os.environ.get("NANO_GENDER_CLIP_SEC", "30"))
+
+
+def _demucs_vocals(demucs_model, apply_fn, audio_stereo: np.ndarray, device: str) -> np.ndarray:
+    """Run Demucs on a ``[2, T]`` float32 mix, return mono vocals ``[T]`` @44100Hz."""
+    wav = torch.from_numpy(np.ascontiguousarray(audio_stereo))  # [2, T]
+    wav = wav.unsqueeze(0).to(device)  # [1, 2, T]
+    with torch.no_grad():
+        sources = apply_fn(demucs_model, wav, device=device, overlap=_DEMUCS_OVERLAP)
+    # sources shape: [1, n_sources, 2, T] — source order: drums, bass, other, vocals
+    return sources[0, -1].mean(dim=0).cpu().numpy()  # mono of the last (vocals) source
+
 
 def _separate_vocals(demucs_model, apply_fn, audio_path: str | Path, device: str) -> np.ndarray:
     """Isolate vocals from an audio file using Demucs. Returns mono float32 numpy array at 44100Hz."""
     audio = _ffmpeg_load_stereo(audio_path, 44100)  # [2, T]
-    wav = torch.from_numpy(np.ascontiguousarray(audio))  # [2, T]
-    wav = wav.unsqueeze(0).to(device)  # [1, 2, T]
+    return _demucs_vocals(demucs_model, apply_fn, audio, device)
 
-    with torch.no_grad():
-        sources = apply_fn(demucs_model, wav, device=device, overlap=_DEMUCS_OVERLAP)
-    # sources shape: [1, n_sources, 2, T] — source order: drums, bass, other, vocals
-    vocals = sources[0, -1]  # [2, T] — last source is vocals
-    vocals_mono = vocals.mean(dim=0).cpu().numpy()
-    return vocals_mono
+
+def _gender_clip_vocals(demucs_model, apply_fn, audio_stereo: np.ndarray, device: str) -> np.ndarray:
+    """Demucs-lite: isolate vocals from a SHORT clip for the F0 gender estimate
+    only (skip-Demucs mode). Takes NANO_GENDER_CLIP_SEC seconds starting at
+    NANO_GENDER_CLIP_START (mid-song, where verse/chorus vocals are densest),
+    CLAMPED so a song shorter than start+clip still yields a non-empty window
+    (an unclamped [60s:90s] slice on a 45s song would be empty -> gender None)."""
+    T = audio_stereo.shape[1]
+    clip_n = int(_GENDER_CLIP_SEC * 44100)
+    if T <= clip_n:
+        clip = audio_stereo  # whole (short) song
+    else:
+        start = int(_GENDER_CLIP_START_SEC * 44100)
+        if start + clip_n > T:
+            start = max(0, T - clip_n)  # slide the window back so it fits
+        clip = audio_stereo[:, start:start + clip_n]
+    return _demucs_vocals(demucs_model, apply_fn, clip, device)
+
+
+def _prepare_transcribe_audio(
+    demucs_model, apply_fn, audio_path: str | Path, device: str,
+    skip_demucs: bool | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Return ``(asr_vocals, gender_vocals)``, both mono float32 @44100Hz.
+
+    Normal (Demucs) mode: the full-track vocal stem for BOTH; ``gender_vocals`` is
+    None to tell the caller it can reuse the ASR signal for the F0 estimate.
+    Skip-Demucs mode: the raw mix for ASR + a short Demucs-lite clip stem for the
+    gender F0. ``skip_demucs`` defaults to the NANO_SKIP_DEMUCS env (the local
+    CLI path); the Modal worker passes it explicitly per run."""
+    if skip_demucs is None:
+        skip_demucs = _SKIP_DEMUCS_DEFAULT
+    if skip_demucs:
+        audio = _ffmpeg_load_stereo(audio_path, 44100)  # [2, T] — decoded once
+        mix_mono = audio.mean(axis=0)  # [T] raw mix for Whisper
+        gender_vocals = _gender_clip_vocals(demucs_model, apply_fn, audio, device)
+        return mix_mono, gender_vocals
+    stem = _separate_vocals(demucs_model, apply_fn, audio_path, device)
+    return stem, None
 
 
 # Vocal-gender labeling (F0 heuristic) ----------------------------------------
@@ -168,16 +225,21 @@ def estimate_vocal_gender(vocals: np.ndarray, sr: int) -> str | None:
     return "female" if median_f0 >= _GENDER_F0_THRESHOLD_HZ else "male"
 
 
-def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
-    """Transcribe vocals array at 44100Hz. Returns {text, words, gender} or None.
+def _transcribe(whisper_model, asr_vocals: np.ndarray,
+                gender_vocals: np.ndarray | None = None) -> dict | None:
+    """Transcribe ``asr_vocals`` (mono @44100Hz). Returns {text, words, gender, ...} or None.
 
-    ``gender`` is the F0-estimated vocal gender ("male"/"female"/None); it rides
-    in the same per-song entry the dataset reads, so the gender marker is wired
-    with no extra store. None entries (instrumental) carry no gender at all."""
+    ``asr_vocals`` is what Whisper sees — the isolated vocal stem (normal path) or
+    the raw mix (skip-Demucs path). ``gender_vocals`` is the clean vocal signal for
+    the F0 gender estimate; when None the ASR signal IS the stem and is reused (no
+    second resample). ``gender`` is the F0-estimated vocal gender ("male"/"female"
+    /None); it rides in the same per-song entry the dataset reads, so the gender
+    marker is wired with no extra store. None entries (instrumental) carry no
+    gender at all."""
     # faster-whisper expects 16kHz
     import librosa
 
-    vocals_16k = librosa.resample(vocals, orig_sr=44100, target_sr=16000)
+    vocals_16k = librosa.resample(asr_vocals, orig_sr=44100, target_sr=16000)
 
     # Language auto-detected (NOT forced to "en"): forcing English produced
     # ~17% English-phoneme "salad" over non-English vocals in the first v8
@@ -205,8 +267,13 @@ def _transcribe(whisper_model, vocals: np.ndarray) -> dict | None:
     if not full_text:
         return None
 
-    # Estimate on the 16 kHz vocals (Nyquist 8 kHz >> vocal F0; cheaper than 44.1).
-    gender = estimate_vocal_gender(vocals_16k, sr=16000)
+    # Gender F0 on a CLEAN vocal signal at 16 kHz (Nyquist 8 kHz >> vocal F0;
+    # cheaper than 44.1): the reused ASR stem (normal path) or the separate
+    # Demucs-lite clip (skip-Demucs path, where vocals_16k is the raw mix and
+    # would give a bass/drum-polluted median).
+    gender_16k = vocals_16k if gender_vocals is None else librosa.resample(
+        gender_vocals, orig_sr=44100, target_sr=16000)
+    gender = estimate_vocal_gender(gender_16k, sr=16000)
     avg_logprob = round(sum(seg_logprobs) / len(seg_logprobs), 4) if seg_logprobs else None
     return {
         "text": full_text,
@@ -253,6 +320,9 @@ def transcribe_corpus(
 
     print(f"found {len(mp3s)} mp3s | device: {device}")
 
+    if _SKIP_DEMUCS_DEFAULT:
+        print(f"NANO_SKIP_DEMUCS on: Whisper on the raw mix; Demucs only on a "
+              f"{_GENDER_CLIP_SEC:.0f}s clip for gender.")
     print("loading Demucs (htdemucs)...")
     demucs_model, apply_fn = _load_demucs(device)
 
@@ -277,8 +347,9 @@ def transcribe_corpus(
             pbar.set_postfix(done=n_done, skip=n_skipped, inst=n_instrumental, fail=n_failed)
             continue
         try:
-            vocals = _separate_vocals(demucs_model, apply_fn, mp3, device)
-            result = _transcribe(whisper_model, vocals)
+            asr_vocals, gender_vocals = _prepare_transcribe_audio(
+                demucs_model, apply_fn, mp3, device)
+            result = _transcribe(whisper_model, asr_vocals, gender_vocals)
         except Exception as e:
             tqdm.write(f"FAILED {mp3.name}: {e}")
             n_failed += 1

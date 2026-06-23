@@ -16,7 +16,7 @@ registers them). Set the R2 env (``NANO_AUDIO_BUCKET`` / ``NANO_AUDIO_ENDPOINT``
 + the ``r2-creds`` secret) in the shell you DEPLOY from — the mount is fixed at
 deploy time::
 
-    for m in prepare tokenize melody auto_tag transcribe structure \
+    for m in prepare tokenize melody auto_tag transcribe structure tempo \
              pack_cache wave_cleanup phonemize key_detect; do
         modal deploy diskrot/modal_$m.py
     done
@@ -27,8 +27,14 @@ Then per wave (resumable: a re-run skips stages already marked done in
     modal run --detach diskrot/modal_ingest_wave.py --wave-id 17
 
 Toggle optional conditioning streams with --no-with-melody / --no-with-tags /
---no-with-lyrics / --no-with-structure. Volume-source users (no bucket) pass
---drop-mp3 so cleanup also reclaims the wave's raw mp3 inodes.
+--no-with-lyrics / --no-with-structure / --no-with-tempo. Volume-source users
+(no bucket) pass --drop-mp3 so cleanup also reclaims the wave's raw mp3 inodes.
+
+COST: --structure-sample-pct (default 50) runs the expensive allin1 structure
+stage (~28% of wave cost) on only a deterministic fraction of songs; the rest
+fall back to <no_section> at train time. The cheap dense tempo stage runs at
+full coverage so <tempo_*> markers stay 100% (the dataset prefers tempo.json
+over the structure bpm) — keep with_tempo on whenever structure is sampled.
 """
 from __future__ import annotations
 
@@ -54,6 +60,8 @@ def ingest_wave(
     with_tags: bool = True,
     with_lyrics: bool = True,
     with_structure: bool = True,
+    with_tempo: bool = True,
+    structure_sample_pct: int = 50,
     drop_mp3: bool = False,
 ):
     import os
@@ -100,12 +108,26 @@ def ingest_wave(
     if with_melody:
         run("melody", "nano-melody", "orchestrate", wave_id=wave_id)
     if with_tags:
+        # batch_size=256 (auto_tag's own default), NOT 16: each .map element is
+        # run as ONE vLLM continuous batch, internally pipelined in
+        # NANO_CAPTION_SUBBATCH(=64)-sized sub-batches so CPU decode overlaps GPU
+        # generate. At 16 there's a single 16-song sub-batch and that overlap
+        # never engages — the A100 idles during decode. 256 keeps it saturated.
         run("auto_tag", "nano-auto-tag", "run_auto_tag",
-            batch_size=16, flush_every_batches=4, wave_id=wave_id)
+            batch_size=256, flush_every_batches=4, wave_id=wave_id)
     if with_lyrics:
         run("transcribe", "nano-transcribe", "orchestrate", wave_id=wave_id)
     if with_structure:
-        run("structure", "nano-structure", "orchestrate", wave_id=wave_id)
+        # sample_pct<100 runs allin1 (the ~28%-of-wave structure stage) on only a
+        # deterministic fraction; non-sampled songs fall back to <no_section>.
+        run("structure", "nano-structure", "orchestrate",
+            wave_id=wave_id, sample_pct=structure_sample_pct)
+    if with_tempo:
+        # Dense cheap-CPU tempo pass at FULL coverage. Structure (above) is the
+        # only other <tempo_*> source, so when it's sampled this keeps tempo
+        # markers at 100% — the dataset prefers this tempo.json over the structure
+        # bpm. Only needs /corpus, so its order vs structure doesn't matter.
+        run("tempo", "nano-tempo", "orchestrate", wave_id=wave_id)
     run("pack", "nano-pack", "pack_append_remote", wave_id=wave_id)
     # Cleanup AFTER pack (needs the wave's .pt/.mel.npy). phonemize/key_detect
     # read the lyrics shards / packed chroma, so they're safe to run after.
@@ -126,6 +148,8 @@ def main(
     with_tags: bool = True,
     with_lyrics: bool = True,
     with_structure: bool = True,
+    with_tempo: bool = True,
+    structure_sample_pct: int = 50,
     drop_mp3: bool = False,
 ):
     if not wave_id:
@@ -133,7 +157,8 @@ def main(
     fc = ingest_wave.spawn(
         wave_id=wave_id, min_seconds=min_seconds, tokenize_batch=tokenize_batch,
         with_melody=with_melody, with_tags=with_tags, with_lyrics=with_lyrics,
-        with_structure=with_structure, drop_mp3=drop_mp3,
+        with_structure=with_structure, with_tempo=with_tempo,
+        structure_sample_pct=structure_sample_pct, drop_mp3=drop_mp3,
     )
     print(f"wave {wave_id} ingest launched (detached) — function call id: {fc.object_id}")
     print("monitor: modal app logs nano-ingest-wave")

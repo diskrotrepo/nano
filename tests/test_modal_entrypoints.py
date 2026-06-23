@@ -43,6 +43,7 @@ BLOCKING_OK = {
     "modal_duration_audit.py",       # quick read-only duration histogram, inline
     "modal_ipa_coverage.py",         # v9 IPA-coverage spike — read-only, inline report
     "modal_lyrics_lang_audit.py",    # read-only lyrics language-field audit, inline
+    "modal_lyrics_stats.py",         # read-only skip-Demucs gate: wave-vs-rest stats, inline
     "modal_r2_wavify.py",            # dry-run blocks inline; apply path spawns
     "modal_clean_dac_pt.py",         # dry-run blocks inline; apply path spawns
 }

@@ -132,15 +132,23 @@ class Transcriber:
         self.consecutive_failures = 0
 
     @modal.method()
-    def transcribe_file(self, mp3_name: str) -> tuple[str, dict | None, str | None]:
-        """Transcribe a single file. Returns (stem, result_or_None, error_or_None)."""
-        from diskrot.transcribe_lyrics import _separate_vocals, _transcribe
+    def transcribe_file(self, mp3_name: str, skip_demucs: bool = False) -> tuple[str, dict | None, str | None]:
+        """Transcribe a single file. Returns (stem, result_or_None, error_or_None).
+
+        ``skip_demucs`` runs Whisper on the raw mix (keeping a short Demucs-lite
+        clip for the gender F0) — the transcribe-cost lever; see
+        transcribe_lyrics._prepare_transcribe_audio. Passed per-run via the
+        orchestrator's .map(kwargs=...) so no redeploy / modal.parameter is needed
+        (the class still carries no parameter fields, keeping it clear of the
+        PEP 563 modal.parameter pitfall)."""
+        from diskrot.transcribe_lyrics import _prepare_transcribe_audio, _transcribe
 
         mp3_path = Path("/corpus") / mp3_name
         key = mp3_path.stem
         try:
-            vocals = _separate_vocals(self.demucs_model, self.apply_fn, mp3_path, "cuda")
-            result = _transcribe(self.whisper_model, vocals)
+            asr_vocals, gender_vocals = _prepare_transcribe_audio(
+                self.demucs_model, self.apply_fn, mp3_path, "cuda", skip_demucs=skip_demucs)
+            result = _transcribe(self.whisper_model, asr_vocals, gender_vocals)
             with self._fail_lock:
                 self.consecutive_failures = 0
             return (key, result, None)
@@ -347,7 +355,7 @@ def _release_lock() -> None:
     nonpreemptible=True,
 )
 def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
-                redo_missing_language: bool = False):
+                redo_missing_language: bool = False, skip_demucs: bool = False):
     """Dispatch transcription and merge results into the sharded lyrics dir.
     ``wave_id`` scopes the pass to /corpus/waves/wave_<id>. ``redo_missing_language``
     additionally re-transcribes legacy entries that lack a ``language`` field.
@@ -404,7 +412,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                 return
             prev_pending = len(pending)
             print(f"sweep {sweep}: {len(pending)} pending, dispatching in "
-                  f"chunks of {chunk_size} (flush_every={flush_every})...")
+                  f"chunks of {chunk_size} (flush_every={flush_every}"
+                  f"{', SKIP-DEMUCS: Whisper on raw mix' if skip_demucs else ''})...")
 
             n_seen = n_errors = n_inband = 0
             # n_inband: per-file errors (returned, not raised) — these stay
@@ -424,7 +433,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                 # file stays pending (not in the shards) and is re-queued by
                 # the next sweep.
                 for result in transcriber.transcribe_file.map(
-                    chunk, order_outputs=False, return_exceptions=True
+                    chunk, kwargs={"skip_demucs": skip_demucs},
+                    order_outputs=False, return_exceptions=True
                 ):
                     n_seen += 1
                     if isinstance(result, Exception):
@@ -466,7 +476,7 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
 
 @app.local_entrypoint()
 def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
-         redo_missing_language: bool = False):
+         redo_missing_language: bool = False, skip_demucs: bool = False):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are
@@ -475,9 +485,15 @@ def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
     --wave-id N scopes transcription to /corpus/waves/wave_N.
     --redo-missing-language re-transcribes legacy entries lacking a ``language``
     field (the forced-English 128k) — auto-detect overwrites them.
+    --skip-demucs runs Whisper on the raw mix (Demucs only on a short gender
+    clip) — the ~25-37%-of-wave cost lever. Gate it by running ONE wave with it
+    on, then `modal run diskrot/modal_lyrics_stats.py --wave-id <id>` to confirm
+    the instrumental %, word count, gender and language stats match the
+    Demucs-transcribed corpus before keeping it for the rest.
     """
     call = orchestrate.spawn(flush_every, chunk_size, wave_id=wave_id,
-                             redo_missing_language=redo_missing_language)
+                             redo_missing_language=redo_missing_language,
+                             skip_demucs=skip_demucs)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")
