@@ -59,6 +59,11 @@ app = modal.App("nano-prepare")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")  # ffprobe ships with ffmpeg
+    # Required for `modal deploy` (used by the ingest orchestrator's from_name
+    # lookup): unlike `modal run`, deploy does NOT auto-mount the entrypoint's
+    # package, so the top-level `from diskrot...` import below would fail with
+    # ModuleNotFoundError without this.
+    .add_local_python_source("diskrot")
 )
 
 # read_only=False: prepare deletes undecodable/dup/too-long files in place
