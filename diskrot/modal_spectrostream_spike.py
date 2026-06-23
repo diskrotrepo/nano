@@ -251,6 +251,70 @@ def verify_wrapper(depth: int = 16) -> None:
     print("WRAPPER OK — model.codec.SpectroStreamCodec validated end-to-end.", flush=True)
 
 
+@app.function(
+    image=image,
+    gpu=os.environ.get("NANO_SPIKE_GPU", "A100-40GB"),
+    timeout=60 * 30,
+    volumes={"/cache": cache_vol},
+    retries=0,  # the overflow CHECK aborts (SIGABRT) — do NOT re-run the sweep
+)
+def measure_overflow(start_s: int = 180, stop_s: int = 480, step_s: int = 10,
+                     depth: int = 32) -> None:
+    """Pin the SpectroStream encoder's int32 CUDA launch-config overflow length.
+
+    Encodes synthetic stereo audio (content-irrelevant; only LENGTH drives the
+    overflowing front-end feature map) at increasing lengths via the PRODUCTION
+    path (model.codec.SpectroStreamCodec, depth=32 == NANO_SS_DEPTH) until TF's
+    `Check failed: work_element_count >= 0` aborts the container with SIGABRT.
+
+    Two readings come out of the flushed logs:
+      - BRACKET: the largest "OK secs=X" before the abort, and the "ATTEMPT
+        secs=Y" with no matching OK -> crossover C is in (X, Y].
+      - EXACT: pair the abort's F0000 work_element_count (a wrapped int32) with
+        the attempted sample count to solve elements-per-sample k, hence the
+        exact C = INT_MAX / k. (Printed pre-encode so it survives the abort.)
+    """
+    import torch
+
+    from model.codec import SpectroStreamCodec
+
+    INT_MAX = 2**31 - 1
+    sr = 48000
+    print(f"=== SS overflow measurement: depth={depth} sr={sr} INT_MAX={INT_MAX} ===",
+          flush=True)
+    codec = SpectroStreamCodec(device="cuda", depth=depth)
+    last_ok = None
+    for secs in range(start_s, stop_s + 1, step_s):
+        n = secs * sr
+        # Pure silence: the int32 overflow is a TENSOR-SIZE (length) effect, fully
+        # content-independent, and the silence quality-gate lives in tokenize, not
+        # in codec.encode — so feeding zeros here is correct and cheap.
+        stereo = torch.zeros((2, n), dtype=torch.float32)
+        print(f"ATTEMPT secs={secs} samples={n} "
+              f"(if this aborts, k=(2**32+work_element_count)/{n})", flush=True)
+        codes = codec.encode(stereo)
+        frames = int(codes.shape[1])
+        last_ok = secs
+        elems_per_sample_lo = INT_MAX / n  # lower bound on k while still OK
+        print(f"OK secs={secs} samples={n} frames={frames} "
+              f"(k < {elems_per_sample_lo:.2f} elems/sample so far)", flush=True)
+        del codes, stereo
+    print(f"=== NO overflow up to {stop_s}s (last_ok={last_ok}); widen stop_s ===",
+          flush=True)
+
+
+@app.local_entrypoint()
+def measure(start_s: int = 180, stop_s: int = 480, step_s: int = 10, depth: int = 32):
+    # .spawn() (NOT .remote()) so the sweep runs fully server-side and survives the
+    # local client exiting — a blocking .remote() gets cancelled mid-encode the
+    # moment the (backgrounded) launcher disconnects. Pair with `modal run --detach`.
+    print(f"measuring SS int32 overflow length (sweep {start_s}..{stop_s}s step {step_s}s, "
+          f"depth={depth}) on one A100 — it will SIGABRT at the crossover...")
+    fc = measure_overflow.spawn(start_s=start_s, stop_s=stop_s, step_s=step_s, depth=depth)
+    print(f"spawned (detached) — function call id: {fc.object_id}")
+    print("read: modal app logs nano-ss-spike   (find last 'OK secs=' before the F0000 abort)")
+
+
 @app.local_entrypoint()
 def main(n_songs: int = 6):
     print("launching SpectroStream codec spike (single A100 container)...")

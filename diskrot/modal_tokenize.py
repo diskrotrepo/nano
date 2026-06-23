@@ -67,6 +67,19 @@ if _IS_SS:
                 "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                 "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.4",
                 "TF_FORCE_GPU_ALLOW_GROWTH": "true",
+                # Quiet the TF/absl/XLA C++ WARNING flood (convolution-redzone,
+                # bfc_allocator GC notices, the absl::InitializeLog preamble) that
+                # buries the real progress lines. Level "2" drops INFO+WARNING but
+                # KEEPS ERROR+FATAL — so the int32-overflow crash
+                # ("F0000 ... gpu_launch_config.h: work_element_count >= 0") that
+                # the length guard exists to prevent stays fully visible. Never "3".
+                "TF_CPP_MIN_LOG_LEVEL": "2",
+                "GRPC_VERBOSITY": "ERROR",
+                "GLOG_minloglevel": "2",
+                # Kill the per-cold-start huggingface_hub SavedModel download
+                # progress-bar redraws (the weights cache on nano-ss-cache anyway).
+                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                "HF_HUB_DISABLE_TELEMETRY": "1",
                 "HF_HOME": "/cache/hf",
                 "HF_HUB_CACHE": "/cache/hf",
                 "XDG_CACHE_HOME": "/cache",
@@ -198,6 +211,11 @@ orchestrator_image = modal.Image.debian_slim(python_version="3.12")
 if _IS_SS:
     # So the in-container summary reports the SpectroStream frame rate (25 Hz).
     orchestrator_image = orchestrator_image.env({"NANO_CODEC": "spectrostream"})
+# Required for `modal deploy` (the ingest orchestrator calls run_tokenize via
+# from_name): unlike `modal run`, deploy does NOT auto-mount the entrypoint's
+# package, so the module's top-level `from diskrot...` import would crash-loop
+# with ModuleNotFoundError without this. Kept as the final layer (after .env).
+orchestrator_image = orchestrator_image.add_local_python_source("model", "diskrot")
 
 
 def _wave_subdir(wave_id: str) -> str:
@@ -261,6 +279,7 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
 
     n_done = n_short = n_failed = 0
     n_oom = n_decode = n_other = 0
+    n_too_long = 0  # subset of n_short: skipped pre-encode by the int32 length guard
     n_batch_errors = 0
     total_frames = 0
     # Periodic progress: unlike auto_tag (which flushes a shared tags.json and
@@ -312,6 +331,8 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
                                   f"(category will still be counted)")
             elif status == "skipped_short":
                 n_short += 1
+                if (error or "").startswith("too_long:"):
+                    n_too_long += 1
             elif status == "done":
                 n_done += 1
                 total_frames += frames
@@ -325,7 +346,9 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
             next_report += PROGRESS_EVERY
 
     print(f"\ndone:                {n_done}", flush=True)
-    print(f"skipped (too short): {n_short}", flush=True)
+    print(f"skipped (too short): {n_short} "
+          f"(incl. {n_too_long} over the int32 length cap — likely corrupt-metadata mp3s)",
+          flush=True)
     print(f"failed:              {n_failed} "
           f"(OOM {n_oom} · decode {n_decode} · other {n_other})", flush=True)
     if n_batch_errors:

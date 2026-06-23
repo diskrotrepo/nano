@@ -20,7 +20,6 @@ import os
 from pathlib import Path
 
 import torch
-from tqdm import tqdm
 
 # Number of shard files structure data is split across. Keyed by a stable hash of
 # the song stem (sha1, not builtin hash() which is process-salted) so the same
@@ -188,6 +187,11 @@ def analyze_corpus(
 
     print("loading allin1...")
     import allin1
+    # Lazy import: keeps `from diskrot.structure import _sample_keep` (used by
+    # modal_tempo.list_pending) from requiring tqdm, which isn't in the tempo
+    # image — a top-level `from tqdm import tqdm` here crashed the tempo stage
+    # with ModuleNotFoundError. tqdm is only used in this analysis loop.
+    from tqdm import tqdm
 
     structure = load_structure_shards(structure_dir)
     if structure:

@@ -44,18 +44,25 @@ DEFAULT_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 # new model) and you want a --redo to redo everything. NOTE: diskrot/modal_auto_tag.py
 # duplicates this literal (its slim orchestrator image can't import this module) —
 # keep the two in sync.
-CAPTIONER_MARKER = "audio_llm_v1"
+CAPTIONER_MARKER = "audio_llm_v2"
 
 _CAPTION_INSTRUCTION = (
     "You are an expert music annotator. The audio contains one or more excerpts "
     "from the SAME track, in order. Write ONE rich, information-dense description "
     "of the music as flowing prose. Cover, each in its own short sentence where "
     "audible: the overall genre and mood; the drums and percussion; the bass; the "
-    "harmony and lead instruments; the vocals (or say it is instrumental); the "
-    "production and mix character; and how the track evolves across its sections. "
-    "Be concrete and evocative — name instruments, textures, micro-genres and "
-    "production artifacts. Do NOT transcribe or invent lyrics. No markdown, no "
-    "lists, no preamble — description only. Aim for 150-350 words."
+    "harmony and lead instruments; the vocals; the production and mix character; "
+    "and how the track evolves across its sections. For the vocals, if you can "
+    "hear singing describe its character — voice type, range and delivery (belted, "
+    "crooned, rapped, screamed, harmonized, spoken-word) — otherwise state plainly "
+    "that the track is instrumental; do NOT hedge with vague filler like 'vocals "
+    "are sparse' or 'occasional vocals'. Be concrete and evocative — name "
+    "instruments, textures, micro-genres and production artifacts, and describe "
+    "only what you actually hear. If the genre is unclear or unfamiliar, describe "
+    "the sound itself — instrumentation, rhythm, texture and mood — rather than "
+    "guessing or falling back on a generic genre label. Do NOT transcribe or "
+    "invent lyrics. No markdown, no lists, no preamble — description only. Aim for "
+    "150-350 words."
 )
 
 

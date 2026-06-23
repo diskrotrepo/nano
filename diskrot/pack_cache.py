@@ -46,7 +46,15 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ModuleNotFoundError:
+    # pack_cache is imported by slim wave stages (e.g. modal_wave_cleanup, which
+    # only needs SHARD_INDEX_NAME) whose images carry no torch. torch is used
+    # solely by the pack/load functions below, which run in the torch-equipped
+    # pack image — so a torch-less import must succeed for the constants alone.
+    torch = None  # type: ignore[assignment]
 
 # Match diskrot.dataset._DEFAULT_LOAD_WORKERS — torch.load over Modal FUSE
 # bottoms out at ~7 files/sec aggregate with 16 threads. Going past 16 has

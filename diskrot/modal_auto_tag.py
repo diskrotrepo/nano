@@ -41,7 +41,7 @@ _CAPTION_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 # --redo-missing-language transcribe pass uses. MUST match
 # model.audio_llm_captioner.CAPTIONER_MARKER (duplicated as a literal because the
 # slim orchestrator image can't import that numpy-heavy module).
-CAPTIONER_MARKER = "audio_llm_v1"
+CAPTIONER_MARKER = "audio_llm_v2"
 
 
 def _is_current(entry) -> bool:
@@ -90,6 +90,20 @@ image = (
         f"python -c \"from huggingface_hub import snapshot_download; snapshot_download('{_CAPTION_MODEL}')\"",
         secrets=[modal.Secret.from_name("huggingface-secret")],
     )
+    # FlashInfer's top-p/top-k sampler JIT-compiles a CUDA kernel at vLLM
+    # EngineCore init via nvcc, which this debian_slim+pip-vllm image lacks (no
+    # CUDA toolkit) -> "Could not find nvcc ... /usr/local/cuda doesn't exist"
+    # killed the engine on EVERY caption (captioned: 0). We decode greedily
+    # (temperature=0.0), so the FlashInfer sampler buys nothing: disabling it
+    # ("FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0")
+    # removes the only active nvcc-JIT path — vLLM auto-selects the precompiled,
+    # nvcc-free FLASH_ATTN attention backend, and the inductor/VLLM_COMPILE path
+    # uses Triton+gcc, not nvcc. Placed AFTER the 16 GB weight bake so this is a
+    # cheap env layer, not a re-download. NOTE: do NOT add VLLM_ATTENTION_BACKEND
+    # here — v0.23.0 doesn't recognize it (logs "Unknown vLLM environment
+    # variable") and it's inert. The real forward-proofing is to LOCK the vllm
+    # version above so the resolver can't drift back onto a FlashInfer default.
+    .env({"VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("model", "diskrot")
 )
 

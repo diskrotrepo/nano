@@ -39,10 +39,53 @@ _LOUDNORM_LUFS = float(os.environ.get("NANO_LOUDNORM_LUFS", "-14.0"))
 _SILENCE_RMS_DBFS = float(os.environ.get("NANO_SILENCE_RMS_DBFS", "-50.0"))
 _CLIP_FRACTION = float(os.environ.get("NANO_CLIP_FRACTION", "0.20"))
 
+# Hard per-file length ceiling, in SECONDS at the codec's sample rate, beyond
+# which we SKIP the file pre-encode rather than feed it to the codec.
+#
+# The SpectroStream (TF/JAX) encoder builds an intermediate feature map whose
+# flat element count is LINEAR in input length, and TF computes its CUDA launch
+# config (`work_element_count`) as a signed int32. A long enough stereo file
+# overflows INT_MAX (2,147,483,647): TF CHECK-fails ("F0000 ...
+# gpu_launch_config.h: Check failed: work_element_count >= 0 (-1900404736 vs.
+# 0)") and calls abort() -> SIGABRT, killing the whole worker. abort() is
+# uncatchable from Python, so this MUST be a pre-encode skip, never a try/except.
+#
+# MEASURED (diskrot/modal_spectrostream_spike.py::measure, depth=32, A100): every
+# length 260..360s encodes cleanly, so the overflow length is ABOVE 360s (6:00)
+# — well beyond any real song. Working back from the production abort (2.394e9
+# elements => the offending file's ACTUAL decoded length was >~400s), the crash
+# came from an mp3 whose ffprobe duration was <=330s (so it passed modal_prepare's
+# MAX_DURATION_S=330 cap) but whose REAL audio is >~400s: a corrupt/VBR-metadata
+# file, NOT a long song. So the binding constraint is metadata-lying files, not
+# song length. We cap at 360s: provably safe (360s encoded without overflow), it
+# keeps ALL real music (prepare already drops ffprobe>330s and the guard re-checks
+# the TRUE decoded length via audio.shape[-1]), and it skips exactly those rare
+# liars. Do NOT lower this toward song lengths — that discards huge amounts of
+# legitimate 4-6min music to catch a handful of broken files. DAC (mono, 44.1k,
+# much smaller intermediates) never approaches int32; its ceiling is a backstop
+# only. Both env-overridable.
+_MAX_ENCODE_SECONDS_SS = float(os.environ.get("NANO_MAX_ENCODE_SECONDS_SS", "360.0"))
+_MAX_ENCODE_SECONDS_DAC = float(os.environ.get("NANO_MAX_ENCODE_SECONDS_DAC", "420.0"))
+
+
+def _max_encode_samples(codec) -> int:
+    """Max input samples (per channel, at codec.SAMPLE_RATE) we'll encode before
+    skipping. SpectroStream's TF int32 launch-config overflow is the binding
+    constraint; DAC gets a looser ceiling purely as a leak backstop."""
+    is_ss = int(getattr(codec, "N_CHANNELS", 1)) == 2 and int(codec.SAMPLE_RATE) >= 48000
+    secs = _MAX_ENCODE_SECONDS_SS if is_ss else _MAX_ENCODE_SECONDS_DAC
+    return int(secs * codec.SAMPLE_RATE)
+
 
 class QualitySkip(Exception):
     """Raised by _load_audio when the conservative quality gate rejects a file
     (near-silent / egregiously clipped). Carries the reason string."""
+
+
+class LengthSkip(Exception):
+    """Raised when a file's encoded length would overflow the codec's int32 CUDA
+    launch config (the SpectroStream abort()). A pre-encode skip — abort() can't
+    be caught after the fact. Carries a human-readable reason string."""
 
 
 def _audio_quality_reason(y: np.ndarray, sr: int) -> str | None:
@@ -136,9 +179,21 @@ def tokenize_one_file(
         # Route through _load_audio so loudness-norm + stereo handling + the
         # quality gate apply on the single-file path too (encode() given a path
         # would skip them).
-        tokens = codec.encode(_load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS))
+        audio = _load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS)
+        # Pre-encode length guard: a file long enough to overflow the codec's
+        # int32 CUDA launch config (SpectroStream) would abort() the worker —
+        # uncatchable — so skip it here, before encode().
+        max_samples = _max_encode_samples(codec)
+        if int(audio.shape[-1]) > max_samples:
+            raise LengthSkip(
+                f"{audio.shape[-1] / codec.SAMPLE_RATE:.0f}s > "
+                f"{max_samples / codec.SAMPLE_RATE:.0f}s cap (int32 overflow guard)"
+            )
+        tokens = codec.encode(audio)
     except QualitySkip as e:
         return TokenizeResult(status="skipped_short", error=f"quality:{e}")
+    except LengthSkip as e:
+        return TokenizeResult(status="skipped_short", error=f"too_long:{e}")
     except Exception as e:
         return TokenizeResult(status="failed", error=str(e))
     if tokens.shape[1] < min_frames:
@@ -181,12 +236,24 @@ def tokenize_files_streaming(
         item: tuple[Path, Path],
     ) -> tuple[tuple[Path, Path], torch.Tensor | None, str, str | None]:
         """Returns (item, audio_or_None, status, error_or_None). status is one of
-        'ready', 'skipped_existing', 'quality_skip', 'failed_load'."""
+        'ready', 'skipped_existing', 'quality_skip', 'length_skip', 'failed_load'."""
         mp3_path, out_path = item
         if out_path.exists():
             return item, None, "skipped_existing", None
         try:
             audio = _load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS)
+            # Pre-encode length guard: a file long enough to overflow the codec's
+            # int32 CUDA launch config (SpectroStream) would abort() this worker —
+            # uncatchable by try/except around encode — so skip it now. Dropping
+            # it here means simply no .pt is written (same as a quality skip / a
+            # decode failure), which keeps packed-corpus membership consistent.
+            max_samples = _max_encode_samples(codec)
+            if int(audio.shape[-1]) > max_samples:
+                reason = (
+                    f"{audio.shape[-1] / codec.SAMPLE_RATE:.0f}s > "
+                    f"{max_samples / codec.SAMPLE_RATE:.0f}s cap (int32 overflow guard)"
+                )
+                return item, None, "length_skip", reason
             return item, audio, "ready", None
         except QualitySkip as e:
             return item, None, "quality_skip", str(e)
@@ -247,6 +314,12 @@ def tokenize_files_streaming(
                 if status == "quality_skip":
                     # Near-silent / egregiously-clipped source — skip (don't tokenize).
                     yield TokenizeResult(status="skipped_short", error=f"quality:{err}")
+                    continue
+                if status == "length_skip":
+                    # Too long for the codec's int32 launch config — skip pre-encode
+                    # (would otherwise abort() the worker). Counted as skipped_short;
+                    # no .pt written, so packed-corpus membership stays consistent.
+                    yield TokenizeResult(status="skipped_short", error=f"too_long:{err}")
                     continue
                 if status == "failed_load":
                     yield TokenizeResult(status="failed", error=err)
