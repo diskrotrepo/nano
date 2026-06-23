@@ -10,7 +10,7 @@ Usage:
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Literal
@@ -152,16 +152,28 @@ def tokenize_files_streaming(
     items: list[tuple[Path, Path]],
     min_frames: int,
     batch_size: int = 4,
+    prefetch: int = 8,
 ) -> Iterator[TokenizeResult]:
-    """Tokenize a sequence of (mp3_path, out_path) pairs, processing in chunks
-    of ``batch_size``. Within each chunk a background thread prefetches the next
-    file's audio (CPU librosa load + resample) while the current one is being
-    handled; the loaded chunk is then encoded with a single batched DAC forward
-    pass to amortize GPU kernel launch overhead. Yields one TokenizeResult per
-    input item, in input order.
+    """Tokenize a sequence of (mp3_path, out_path) pairs.
 
-    Set batch_size=1 to disable encode batching (still benefits from prefetch
-    across chunk boundaries less, but useful for memory-constrained devices)."""
+    Two knobs, deliberately independent:
+      - ``batch_size`` — how many successfully-loaded audios are handed to one
+        ``codec.encode_batch`` call. For DAC this is a real padded GPU forward
+        (>1 amortizes kernel launches but multiplies peak GPU memory); for
+        SpectroStream ``encode_batch`` just loops per file, so batch_size has no
+        GPU/memory effect there.
+      - ``prefetch`` — how many files' CPU audio (librosa decode + loudness-norm)
+        are loaded *ahead* by a background thread pool. This is what hides decode
+        latency behind the GPU/TF encode: while the main thread is blocked in
+        ``encode_batch``, the pool keeps the next ~``prefetch`` files decoded and
+        waiting, so the (often idle) GPU stays fed. Decoupling it from
+        ``batch_size`` means even ``batch_size=1`` (the SpectroStream path, where
+        batching buys nothing) still overlaps decode with encode.
+
+    Yields one TokenizeResult per input item, in input order. Encode grouping is
+    per ``batch_size`` window of input items: the ready items in a window go into a
+    single ``encode_batch`` call (skipped/failed items in the window don't split
+    it), keeping output deterministic and order-stable."""
     if not items:
         return
 
@@ -169,7 +181,7 @@ def tokenize_files_streaming(
         item: tuple[Path, Path],
     ) -> tuple[tuple[Path, Path], torch.Tensor | None, str, str | None]:
         """Returns (item, audio_or_None, status, error_or_None). status is one of
-        'ready', 'skipped_existing', 'failed_load'."""
+        'ready', 'skipped_existing', 'quality_skip', 'failed_load'."""
         mp3_path, out_path = item
         if out_path.exists():
             return item, None, "skipped_existing", None
@@ -181,64 +193,74 @@ def tokenize_files_streaming(
         except Exception as e:
             return item, None, "failed_load", str(e)
 
-    for chunk_start in range(0, len(items), batch_size):
-        chunk = items[chunk_start:chunk_start + batch_size]
+    n = len(items)
+    # Persistent loader pool with a sliding submission window: at most
+    # ``prefetch`` loads are kept outstanding ahead of the window being encoded,
+    # so decoded audio for upcoming files overlaps the current encode without
+    # growing memory past ~(prefetch + batch_size) waveforms.
+    with ThreadPoolExecutor(max_workers=max(1, prefetch)) as pool:
+        futures: dict[int, Future] = {}
+        submitted = 0
 
-        # Phase 1: load every file in the chunk, with a one-ahead background
-        # prefetch so the CPU loader overlaps with itself (and, for chunks > 1,
-        # the previous chunk's encode tail).
-        loaded: list[tuple[tuple[Path, Path], torch.Tensor | None, str, str | None]] = []
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_maybe_load, chunk[0])
-            for i, _ in enumerate(chunk):
-                result = future.result()
-                if i + 1 < len(chunk):
-                    future = pool.submit(_maybe_load, chunk[i + 1])
-                loaded.append(result)
+        def _submit_through(target: int) -> None:
+            nonlocal submitted
+            target = min(target, n)
+            while submitted < target:
+                futures[submitted] = pool.submit(_maybe_load, items[submitted])
+                submitted += 1
 
-        # Phase 2: batched encode for everything that loaded successfully.
-        encodable = [(idx, audio) for idx, (_, audio, status, _) in enumerate(loaded)
-                     if status == "ready" and audio is not None]
-        codes_by_idx: dict[int, torch.Tensor] = {}
-        encode_error: str | None = None
-        if encodable:
-            try:
-                codes_list = codec.encode_batch([audio for _, audio in encodable])
-                for (idx, _), codes in zip(encodable, codes_list):
-                    codes_by_idx[idx] = codes
-            except Exception as e:
-                # If the whole batch fails (OOM, model error), report each
-                # encodable item as failed so the caller can still make progress.
-                encode_error = str(e)
-            # Release cached-but-unallocated GPU memory between batches so a
-            # long encoder loop doesn't fragment its way into an OOM ~20
-            # files in. No-op on CPU; cheap on CUDA.
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        for win_start in range(0, n, batch_size):
+            win_end = min(win_start + batch_size, n)
+            # Submit this window plus a prefetch lookahead so the NEXT window's
+            # files decode while this window encodes.
+            _submit_through(win_end + prefetch)
 
-        # Phase 3: persist + yield in chunk order.
-        for idx, (item, _, status, err) in enumerate(loaded):
-            _, out_path = item
-            if status == "skipped_existing":
-                yield TokenizeResult(status="skipped_existing")
-                continue
-            if status == "quality_skip":
-                # Near-silent / egregiously-clipped source — skip (don't tokenize).
-                yield TokenizeResult(status="skipped_short", error=f"quality:{err}")
-                continue
-            if status == "failed_load":
-                yield TokenizeResult(status="failed", error=err)
-                continue
-            # status == "ready"
-            if encode_error is not None:
-                yield TokenizeResult(status="failed", error=encode_error)
-                continue
-            codes = codes_by_idx[idx]
-            if codes.shape[1] < min_frames:
-                yield TokenizeResult(status="skipped_short", frames=int(codes.shape[1]))
-                continue
-            frames = _save_tokens(codes, out_path)
-            yield TokenizeResult(status="done", frames=frames)
+            # Phase 1: collect this window's loads, in input order.
+            loaded = [futures.pop(idx).result() for idx in range(win_start, win_end)]
+
+            # Phase 2: batched encode for everything that loaded successfully.
+            encodable = [(idx, audio) for idx, (_, audio, status, _) in enumerate(loaded)
+                         if status == "ready" and audio is not None]
+            codes_by_idx: dict[int, torch.Tensor] = {}
+            encode_error: str | None = None
+            if encodable:
+                try:
+                    codes_list = codec.encode_batch([audio for _, audio in encodable])
+                    for (idx, _), codes in zip(encodable, codes_list):
+                        codes_by_idx[idx] = codes
+                except Exception as e:
+                    # If the whole batch fails (OOM, model error), report each
+                    # encodable item as failed so the caller can still make progress.
+                    encode_error = str(e)
+                # Release cached-but-unallocated GPU memory between batches so a
+                # long encoder loop doesn't fragment its way into an OOM ~20
+                # files in. No-op on CPU; cheap on CUDA.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # Phase 3: persist + yield in window order.
+            for idx, (item, _, status, err) in enumerate(loaded):
+                _, out_path = item
+                if status == "skipped_existing":
+                    yield TokenizeResult(status="skipped_existing")
+                    continue
+                if status == "quality_skip":
+                    # Near-silent / egregiously-clipped source — skip (don't tokenize).
+                    yield TokenizeResult(status="skipped_short", error=f"quality:{err}")
+                    continue
+                if status == "failed_load":
+                    yield TokenizeResult(status="failed", error=err)
+                    continue
+                # status == "ready"
+                if encode_error is not None:
+                    yield TokenizeResult(status="failed", error=encode_error)
+                    continue
+                codes = codes_by_idx[idx]
+                if codes.shape[1] < min_frames:
+                    yield TokenizeResult(status="skipped_short", frames=int(codes.shape[1]))
+                    continue
+                frames = _save_tokens(codes, out_path)
+                yield TokenizeResult(status="done", frames=frames)
 
 
 def tokenize_corpus(

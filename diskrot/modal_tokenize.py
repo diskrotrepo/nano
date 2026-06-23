@@ -158,15 +158,19 @@ class Tokenizer:
             for name in mp3_names
         ]
         out: list[tuple[str, str, int, str | None]] = []
-        # batch_size=1: encode one file at a time. Batching multiple 5-min
-        # chunks into a single forward pass pads them to the longest and
-        # multiplies peak GPU memory by the batch size — OOMs on L4 (22 GiB)
-        # at batch_size=8 even after prep splits long tracks to ≤10 min.
-        # Per-file encode loses ~30% throughput vs batched but is safe.
+        # batch_size=1: encode one file at a time. For DAC this avoids padding
+        # multiple 5-min files into one forward pass, which multiplies peak GPU
+        # memory and OOMs L4 (22 GiB) at batch_size=8. For SpectroStream
+        # encode_batch just loops per file, so batching buys nothing there either.
+        # The throughput win comes from prefetch (NOT batch_size): a background
+        # pool keeps the next ~8 files' CPU audio (librosa decode + loudness-norm)
+        # ready, so the GPU/TF encode never stalls on librosa — the expensive
+        # (A100) SpectroStream GPU would otherwise sit idle through every file's
+        # decode.
         for (mp3_path, _), result in zip(
             items,
             tokenize_files_streaming(
-                self.codec, items, self.min_frames, batch_size=1
+                self.codec, items, self.min_frames, batch_size=1, prefetch=8
             ),
         ):
             out.append((mp3_path.stem, result.status, result.frames, result.error))
