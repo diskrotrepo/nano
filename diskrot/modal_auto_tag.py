@@ -41,7 +41,7 @@ _CAPTION_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 # --redo-missing-language transcribe pass uses. MUST match
 # model.audio_llm_captioner.CAPTIONER_MARKER (duplicated as a literal because the
 # slim orchestrator image can't import that numpy-heavy module).
-CAPTIONER_MARKER = "audio_llm_v2"
+CAPTIONER_MARKER = "audio_llm_v3"
 
 
 def _is_current(entry) -> bool:

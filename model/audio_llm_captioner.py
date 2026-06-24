@@ -44,26 +44,36 @@ DEFAULT_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 # new model) and you want a --redo to redo everything. NOTE: diskrot/modal_auto_tag.py
 # duplicates this literal (its slim orchestrator image can't import this module) —
 # keep the two in sync.
-CAPTIONER_MARKER = "audio_llm_v2"
+CAPTIONER_MARKER = "audio_llm_v3"
 
-_CAPTION_INSTRUCTION = (
-    "You are an expert music annotator. The audio contains one or more excerpts "
-    "from the SAME track, in order. Write ONE rich, information-dense description "
-    "of the music as flowing prose. Cover, each in its own short sentence where "
-    "audible: the overall genre and mood; the drums and percussion; the bass; the "
-    "harmony and lead instruments; the vocals; the production and mix character; "
-    "and how the track evolves across its sections. For the vocals, if you can "
-    "hear singing describe its character — voice type, range and delivery (belted, "
-    "crooned, rapped, screamed, harmonized, spoken-word) — otherwise state plainly "
-    "that the track is instrumental; do NOT hedge with vague filler like 'vocals "
-    "are sparse' or 'occasional vocals'. Be concrete and evocative — name "
-    "instruments, textures, micro-genres and production artifacts, and describe "
-    "only what you actually hear. If the genre is unclear or unfamiliar, describe "
-    "the sound itself — instrumentation, rhythm, texture and mood — rather than "
-    "guessing or falling back on a generic genre label. Do NOT transcribe or "
-    "invent lyrics. No markdown, no lists, no preamble — description only. Aim for "
-    "150-350 words."
-)
+_CAPTION_INSTRUCTION = """You are an expert music annotator. The audio contains one or more excerpts from the same track, presented in order. Listen to all of it before writing.
+Write ONE rich, information-dense description of the music as flowing prose. In separate short sentences, cover each of the following where audible:
+
+Overall genre (or micro-genre) and mood
+Drums and percussion
+Bass
+Harmony and lead instruments
+Vocals
+Production and mix character
+How the track evolves across its sections
+
+HARD RULES — follow exactly:
+
+Commit to specifics. State what you hear as fact. Never qualify with "seems," "possibly," "likely," "perhaps," "I think," "could be," or "might be." If you are unsure of a label, describe the sound directly instead of hedging.
+Vocals: if you hear singing, describe its character — voice type, range, and delivery (belted, crooned, rapped, screamed, harmonized, spoken-word). If there is no singing, write exactly one short sentence stating the track is instrumental, then move on. BANNED phrases: "vocals are sparse," "occasional vocals," "minimal vocals," "some vocals," "there may be vocals," and any similar filler.
+Be concrete and evocative: name specific instruments, textures, micro-genres, and production artifacts. Describe only what you actually hear.
+If the genre is unclear or unfamiliar, describe instrumentation, rhythm, texture, and mood directly. Never default to a generic label like "electronic music" or "a song."
+Do NOT transcribe, quote, or invent lyrics.
+Do NOT comment on recording quality unless it is an intentional production choice (e.g., lo-fi tape hiss, bitcrushing).
+
+FORMAT — follow exactly:
+
+Output the description and nothing else. No preamble ("Here is," "Sure," "This track"), no title, no closing remark, no meta-commentary.
+Plain prose only. No markdown, no bullet points, no headings, no numbered lists, no bold.
+Do not name the dimensions you are covering (do not write "The vocals:" or "Genre:"). Weave them into continuous prose.
+Length: 150–350 words. One paragraph.
+
+Begin the description now with a concrete observation about the sound."""
 
 
 def load_song_windows(
