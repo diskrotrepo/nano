@@ -22,7 +22,7 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import assert_stage_produced_output, corpus_mount, wave_subdir
 
 app = modal.App("nano-structure")
 
@@ -316,6 +316,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
     if n_errors:
         print(f"chunk errors: {n_errors} "
               f"(transient — affected files stay pending; re-run to finish them)")
+    assert_stage_produced_output("structure", n_seen, len(pending), n_errors)
 
 
 @app.local_entrypoint()

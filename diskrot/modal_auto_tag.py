@@ -28,7 +28,7 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import assert_stage_produced_output, corpus_mount, wave_subdir
 
 app = modal.App("nano-auto-tag")
 
@@ -328,6 +328,7 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
 
     flush()
     print(f"\ncaptioned: {n_done:,}  failed: {n_failed:,}", flush=True)
+    assert_stage_produced_output("auto_tag", n_done, len(pending), n_failed)
     if n_batch_errors:
         print(f"batch errors: {n_batch_errors:,} "
               f"(transient — affected files stay pending; re-run to finish them)",

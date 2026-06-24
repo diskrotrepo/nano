@@ -44,7 +44,7 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount
+from diskrot.modal_common import assert_stage_produced_output, corpus_mount
 
 app = modal.App("nano-melody")
 
@@ -195,6 +195,9 @@ def orchestrate(batch: int = _BATCH, wave_id: str = ""):
             print(f"{n_chunks_seen}/{len(chunks)} batches  done={tot_done} "
                   f"missing={tot_missing} failed={tot_failed}  ({rate:.1f}/s)", flush=True)
     print(f"\nDONE: chroma={tot_done}  missing_inputs={tot_missing}  failed={tot_failed}")
+    # Hard-stop a silent no-op (the exact failure mode this stage just had: the
+    # worker image missing "model" → 0 chroma while marked done).
+    assert_stage_produced_output("melody", tot_done, len(pending), tot_failed)
 
 
 @app.local_entrypoint()

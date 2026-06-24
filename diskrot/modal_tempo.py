@@ -33,7 +33,7 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import assert_stage_produced_output, corpus_mount, wave_subdir
 
 app = modal.App("nano-tempo")
 
@@ -193,6 +193,7 @@ def orchestrate(batch_size: int = 200, limit: int = 0, wave_id: str = "",
     if batch:
         save_tempo.remote(batch)
     print(f"\nDONE: {n_seen} tempo estimates over {len(pending)} pending songs")
+    assert_stage_produced_output("tempo", n_seen, len(pending))
 
 
 @app.local_entrypoint()

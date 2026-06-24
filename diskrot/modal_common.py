@@ -131,3 +131,26 @@ def corpus_mount(read_only: bool = True):
 def wave_subdir(wave_id: str) -> str:
     """'' (flat legacy layout) or 'waves/wave_<id>' for a wave ingest."""
     return f"waves/wave_{wave_id}" if wave_id else ""
+
+
+def assert_stage_produced_output(
+    stage: str, n_success: int, n_pending: int, n_failed: int = 0
+) -> None:
+    """Halt a wave stage that silently produced NOTHING despite having work.
+
+    A worker-fan-out stage whose workers ALL die (e.g. a missing-dependency
+    import bug in the worker image) returns normally with 0 successes — and the
+    ingest orchestrator's run() marks a stage "done" whenever the call RETURNS
+    without raising, so it advances and leaves the corpus missing that whole
+    stream. That is exactly how melody (0 chroma) and auto_tag (0 captions)
+    silently failed on every wave. Raising here turns those silent no-ops into a
+    hard stop with a clear message instead of a "done" stage. Only fires when
+    there WAS pending work and NONE of it succeeded (a clean 0-pending re-run is
+    fine)."""
+    if n_pending > 0 and n_success <= 0:
+        raise RuntimeError(
+            f"[{stage}] CATASTROPHIC: 0 of {n_pending} pending items succeeded "
+            f"(failed={n_failed}). Every worker produced nothing — almost certainly a "
+            f"missing-dependency / import bug in the worker image (check the stage app "
+            f"logs for the per-worker error). NOT marking the stage done."
+        )
