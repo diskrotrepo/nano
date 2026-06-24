@@ -75,17 +75,17 @@ def test_sanitize_strips_only_wrapping_quotes():
     assert kept.endswith('"tennis favorable 2015"')
 
 
-def test_sweeten_clamps_runaway_to_60_words():
+def test_sweeten_clamps_runaway_to_240_words():
     sw = PromptSweetener(device="cpu")
-    long_caption = '"' + " ".join(f"w{i}" for i in range(80)) + '"'
+    long_caption = '"' + " ".join(f"w{i}" for i in range(300)) + '"'
     _install_fake_model(sw, long_caption)
     out = sw.sweeten("anything")
     assert not out.startswith('"') and not out.endswith('"')
-    assert len(out.split()) <= 60
+    assert len(out.split()) <= 240
 
 
 def test_sweeten_skips_long_prompts_verbatim():
-    """A >60-word prompt is already caption-style; pass it through without ever
+    """A >120-word prompt is already caption-style; pass it through without ever
     calling the model (rewriting would discard the user's detail)."""
     sw = PromptSweetener(device="cpu")
 
@@ -93,7 +93,7 @@ def test_sweeten_skips_long_prompts_verbatim():
         raise AssertionError("the model must NOT be loaded for a long prompt")
 
     sw._ensure_model = _boom
-    long_prompt = " ".join(f"word{i}" for i in range(70))
+    long_prompt = " ".join(f"word{i}" for i in range(130))
     assert sw.sweeten(long_prompt) == long_prompt
 
 

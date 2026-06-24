@@ -1,22 +1,27 @@
 """Local LLM prompt "sweetener" for inference conditioning.
 
-nano's text conditioning is frozen Microsoft CLAP, whose projection was trained
-on LP-MusicCaps prose captions (see eval/tags.json — median ~40 words, e.g.
-"The low quality recording features a passionate male vocal singing over electric
-guitar chords, groovy bass, punchy kick and shimmering hi hats. It sounds
-energetic."). A terse user prompt like "lofi beat to study to" lands far from
-that distribution in CLAP space, so conditioning is weak.
+nano's text conditioning is frozen Microsoft CLAP, and the decoder is trained on
+the corpus's audio-LLM captions (model/audio_llm_captioner.py — flowing
+~120-160-word multi-facet prose covering genre/mood, drums, bass, harmony/lead,
+vocals, production and arc, chunked across CLAP into a SEQUENCE of pooled
+vectors). A terse user prompt like "lofi beat to study to" lands far from that
+distribution in CLAP space, so conditioning is weak.
 
-PromptSweetener rewrites the raw user prompt into a caption that looks like the
-training data using a small local Qwen2.5-Instruct model, strengthening
+PromptSweetener rewrites the raw user prompt into a caption that matches that
+training style using a small local Qwen2.5-Instruct model, strengthening
 conditioning without retraining anything. It is opt-in (server `sweeten` flag)
 and lazy-loaded — the Qwen weights are only fetched/loaded on first use.
 
-Tags and lyrics now travel as SEPARATE request fields (no "tags. lyrics" join,
-no ". " split), and tags are chunked across CLAP, so a multi-sentence caption is
-safe as natural prose — there's nothing to collapse. An already-long / detailed
-prompt is passed through verbatim: it is caption-style on its own, and rewriting
-it to ~40 words would throw away exactly the detail the user wrote.
+This MUST track the captioner: if the audio-LLM prompt/style in
+model/audio_llm_captioner.py changes, re-anchor the few-shots + system prompt
+below, or train (long captions) and inference (sweetened prompts) drift into
+different CLAP regions and adherence drops.
+
+Tags and lyrics travel as SEPARATE request fields (no "tags. lyrics" join, no
+". " split), and tags are chunked across CLAP, so a multi-sentence paragraph
+caption is exactly what the decoder expects. An already caption-length prompt
+(>~120 words) is passed through verbatim — it is caption-style on its own, and
+rewriting it would throw away the detail the user wrote.
 """
 from __future__ import annotations
 
@@ -27,48 +32,76 @@ import torch
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
-# Real captions sampled from eval/tags.json — anchor the rewrite to the corpus.
+# Few-shots written in the audio-LLM (audio_llm_v3) caption style the decoder is
+# trained on — flowing multi-facet prose, concrete instruments, no hedging, no
+# "low quality recording" opener. Keep these in sync with the captioner prompt.
 _FEW_SHOT = [
     (
         "make me some techno",
-        "The low quality recording features a techno song that consists of punchy "
-        "kick and snare hits, shimmering hi hats, reversed crash cymbal and groovy "
-        "synth bass. It sounds energetic, aggressive and addictive.",
+        "A driving peak-time techno cut with a dark, hypnotic mood. A four-on-the-"
+        "floor kick anchors the groove beneath crisp closed hi-hats, a sharp clap "
+        "on the backbeat and an occasional reversed cymbal swell. A rolling analog "
+        "sub-bass locks to the kick, gritty and saturated. The harmony is built "
+        "from a detuned synth stab and a hypnotic acid line twisting through a "
+        "resonant filter, with metallic percussion loops adding texture. The track "
+        "is instrumental. The production is warm and analog, with tape saturation, "
+        "tight sidechain pumping and a wide, immersive stereo field. It opens "
+        "stripped to kick and bass, layers in the acid line over a long build, "
+        "drops into a relentless peak-time section, then strips back for the outro.",
     ),
     (
-        "emotional rock song with vocals, cinematic",
-        "The low quality recording features a passionate male vocal, alongside "
-        "harmonizing background vocals, singing over claps, shimmering cymbals, "
-        "groovy bass and electric guitar melody. It sounds energetic and addictive "
-        "- like something you would hear in movies.",
+        "male vocals over a hard hit 808 and funky bassline",
+        "A confident trap-soul track with a smooth, late-night mood. Crisp rolling "
+        "hi-hats and snappy rimshots ride over a hard-hitting 808 kick that booms "
+        "and glides through the low end. Beneath it a funky electric bassline walks "
+        "with syncopated groove, trading space with the 808. Warm Rhodes chords and "
+        "a muted guitar lick carry the harmony while a jazzy synth lead floats on "
+        "top. A male vocal delivers the hook in a melodic, half-sung croon, doubled "
+        "with subtle ad-libs. The production is punchy and clean, the low end tight, "
+        "the vocal set forward with light reverb and tape warmth. It opens on keys "
+        "and vocal, drops the full 808 and drums on the hook, then pulls back for a "
+        "stripped-down verse before the final chorus.",
     ),
     (
         "eerie instrumental background music",
-        "The song is an instrumental. The tempo is medium with a keyboard "
-        "accompaniment, various percussion hits, strong bass line and synth pad "
-        "section. The song is eerie and full of tension.",
+        "An eerie, cinematic dark-ambient piece steeped in tension and unease. "
+        "There is no drum kit; time is marked by a slow, distant pulse and "
+        "occasional metallic hits that ring out and decay. A deep droning sub-bass "
+        "sits underneath, swelling and receding like breath. The harmony drifts "
+        "through detuned synth pads, a lone piano figure and high glassy textures "
+        "that shimmer at the edges. The track is instrumental. The production is "
+        "cavernous, with long cathedral reverbs, granular textures and a faint tape "
+        "hiss used as atmosphere. It begins with a single sustained drone, layers "
+        "in the piano and metallic accents, builds to an unsettling swell, then "
+        "dissolves back toward silence.",
     ),
 ]
 
-_SYSTEM_PROMPT = """You rewrite short music prompts into a single descriptive \
-caption that matches the style of the LP-MusicCaps audio-captioning dataset, \
-which a music generation model was trained on.
+_SYSTEM_PROMPT = """You rewrite short music prompts into a single rich caption \
+that matches the style a music-generation model was trained on: flowing, \
+information-dense prose describing one track.
 
 Rules:
-- Output ONE caption only. No preamble, no markdown, no quotes, no lyrics, no \
-explanation. ~40 words.
-- Describe concrete instruments and production, then end with a short mood \
-sentence (e.g. "It sounds energetic and danceable.").
-- Prefer this vocabulary, which the model knows well: synth, groovy bass, \
-electric guitar, punchy kick, shimmering hi hats, shimmering cymbals, piano, \
-strings, male vocal. Genres that work: electronic, techno, house, rock, metal, \
-pop, ambient, hip hop, soul.
-- AVOID jazz, country, latin, blues, gospel — the model has little of this data \
-and generates them as noise; map vague requests toward the genres above.
-- If the user does not specify vocals, prefer "male vocal" or make it \
-instrumental (the training data skews male-vocal and instrumental).
-- Keep the user's intent (genre, mood, tempo) but express it in the caption \
-style above."""
+- Output ONE caption only, as a single paragraph of natural prose. No preamble, \
+no markdown, no lists, no quotes, no lyrics, no explanation. Aim for 120-160 \
+words.
+- Weave together, where relevant, the overall genre or micro-genre and mood; \
+the drums and percussion; the bass; the harmony and lead instruments; the \
+vocals; the production and mix character; and how the track evolves across its \
+sections. Do NOT label these dimensions or write a list — continuous prose only.
+- Be concrete: name specific instruments, textures, micro-genres and production \
+artifacts (e.g. 808, sub-bass, Rhodes, analog synth, electric guitar, tape \
+saturation, sidechain, reverb, crisp hi-hats).
+- Vocals: if the prompt implies singing, describe the singer's character — \
+gender, range and delivery (belted, crooned, rapped, screamed, harmonized, \
+spoken-word). If the track is instrumental, say so in one short sentence. Do NOT \
+pad with filler like "sparse vocals" or "occasional vocals". If the user does \
+not mention vocals, make it instrumental or add a male vocal (the corpus skews \
+instrumental and male-vocal).
+- Commit to specifics — state things as fact, never "seems", "possibly" or \
+"might be".
+- Keep the user's intent (genre, mood, tempo, instrumentation, vocals) and \
+express it in the rich caption style above."""
 
 
 class PromptSweetener:
@@ -112,11 +145,11 @@ class PromptSweetener:
         text = re.sub(r"\s+", " ", text)
         # No ". " collapse: tags/lyrics are separate fields now, so a multi-
         # sentence caption is safe as natural prose and chunked CLAP reads it all.
-        # Cap at ~60 words as a runaway guard for the rewriter (a sweetened
-        # caption targets ~40 words).
+        # Cap at ~240 words as a runaway guard for the rewriter (a sweetened
+        # caption targets ~120-160 words, matching the audio-LLM training style).
         words = text.split()
-        if len(words) > 60:
-            text = " ".join(words[:60])
+        if len(words) > 240:
+            text = " ".join(words[:240])
         return text.strip()
 
     @torch.no_grad()
@@ -126,10 +159,10 @@ class PromptSweetener:
         raw = (raw or "").strip()
         if not raw:
             return raw
-        # An already-long / detailed prompt is caption-style on its own. Rewriting
-        # it into ~40 words would discard the detail the user wrote (and chunked
-        # CLAP can condition on all of it), so pass it through verbatim.
-        if len(raw.split()) > 60:
+        # An already caption-length prompt (~the audio-LLM training length) is
+        # caption-style on its own. Rewriting it would discard the detail the user
+        # wrote (and chunked CLAP conditions on all of it), so pass it verbatim.
+        if len(raw.split()) > 120:
             return raw
         try:
             self._ensure_model()
@@ -141,7 +174,7 @@ class PromptSweetener:
             inputs = self._tok(text, return_tensors="pt").to(self._device)
             out = self._model.generate(
                 **inputs,
-                max_new_tokens=80,
+                max_new_tokens=256,
                 do_sample=True,
                 temperature=0.3,
                 top_p=0.9,

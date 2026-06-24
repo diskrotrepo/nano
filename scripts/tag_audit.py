@@ -338,7 +338,13 @@ def compare(n_examples: int = 8):
                 (name, v.get("description", "")))
 
     GENRE_DEFAULT = re.compile(r"electronic,?\s+folk,?\s+and\s+idm", re.I)
-    VOCAL_HEDGE = re.compile(r"vocals?\s+(are|is)\s+sparse|occasional vocals", re.I)
+    # The full v3 BANNED list + the adjective forms ("sparse vocals") the model
+    # also leaks, so the rate isn't undercounted.
+    VOCAL_HEDGE = re.compile(
+        r"vocals?\s+(are|is)\s+(sparse|minimal)"
+        r"|(occasional|minimal|some|sparse)\s+vocals"
+        r"|there\s+(may|might)\s+be\s+vocals",
+        re.I)
     report = {}
     for m, rows in sorted(by_marker.items()):
         descs = [d for _, d in rows]
@@ -351,11 +357,12 @@ def compare(n_examples: int = 8):
             "vocal_hedge": sum(bool(VOCAL_HEDGE.search(d)) for d in descs),
         }
 
-    v2 = by_marker.get("audio_llm_v2", [])
-    stride = max(1, len(v2) // n_examples)
+    newest = max(by_marker, default=None)  # audio_llm_v3 > v2 > v1 lexicographically
+    latest = by_marker.get(newest, [])
+    stride = max(1, len(latest) // n_examples)
     examples = [{"name": nm, "description": d}
-                for nm, d in v2[::stride][:n_examples]]
-    return {"report": report, "examples": examples}
+                for nm, d in latest[::stride][:n_examples]]
+    return {"report": report, "examples": examples, "newest": newest}
 
 
 @app.local_entrypoint()
@@ -366,7 +373,7 @@ def main(max_tokenize: int = 200_000):
 @app.local_entrypoint()
 def verify(n_examples: int = 8):
     res = compare.remote(n_examples=n_examples)
-    print("\n=== audio_llm marker comparison (v2 = the new prompt) ===")
+    print("\n=== audio_llm marker comparison (newest = current prompt) ===")
     print(f"{'marker':<16} {'n':>8} {'mean_w':>7} {'genre-default':>14} "
           f"{'vocal-hedge':>12}")
     for m, r in res["report"].items():
@@ -374,7 +381,7 @@ def verify(n_examples: int = 8):
         print(f"{m:<16} {r['n']:>8,} {r['mean_words']:>7.0f} "
               f"{r['genre_default']:>7,} ({r['genre_default']/n:>4.1%}) "
               f"{r['vocal_hedge']:>6,} ({r['vocal_hedge']/n:>4.1%})")
-    print("\n=== v2 examples ===")
+    print(f"\n=== {res.get('newest')} examples ===")
     for i, e in enumerate(res["examples"], 1):
         print(f"\n--- [{i}] {e['name']} ---\n{e['description']}")
 
