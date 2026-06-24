@@ -57,7 +57,14 @@ image = (
         "numpy>=1.26",
         "soundfile>=0.12",
     )
-    .add_local_python_source("diskrot")
+    # MUST include "model": the worker imports diskrot.melody, which imports
+    # `from model.codec import codec_constants` (for the codec frame rate that
+    # aligns the chroma). Without "model" baked in, every batch dies with
+    # ModuleNotFoundError("No module named 'model'") -> 0 chroma written, yet the
+    # orchestrator still returns "DONE: chroma=0" -> melody silently no-ops on
+    # every wave (and /cover trains on nothing). torch is already pip-installed
+    # above, so the model.codec top-level `import torch` resolves fine.
+    .add_local_python_source("model", "diskrot")
 )
 
 corpus_vol = corpus_mount()  # R2 audio bucket (read-only); see modal_common.corpus_mount
