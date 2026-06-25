@@ -85,6 +85,19 @@ if _IS_SS:
             index_url="https://download.pytorch.org/whl/cu121",
         )
         .pip_install("demucs>=4.0")
+        # CuDNN reconciliation: the magenta-rt image's TensorFlow is compiled
+        # against CuDNN 9.3.0, but torch==2.4.1+cu121 hard-pins
+        # nvidia-cudnn-cu12==9.1.0.70 and DOWNGRADES the bundled 9.3 wheel. TF
+        # then loads 9.1.0 at runtime and aborts every codec encode with
+        # "Loaded runtime CuDNN library: 9.1.0 but source was compiled with:
+        # 9.3.0" (CuDNN requires same major + equal-or-higher minor). Force the
+        # single installed CuDNN back to 9.3.x — it satisfies TF (built for 9.3)
+        # AND torch (built for 9.1, runs on any ≥9.1 minor). --no-deps so it
+        # doesn't drag torch's exact pin back in; the resulting pip metadata
+        # mismatch is advisory only (runtime uses the on-disk 9.3 lib).
+        .run_commands(
+            "pip install --no-deps --force-reinstall 'nvidia-cudnn-cu12==9.3.0.75'"
+        )
         .env(
             {
                 "NANO_CODEC": "spectrostream",
