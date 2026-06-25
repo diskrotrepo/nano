@@ -1380,6 +1380,128 @@ class InferenceEngine:
         )
         return _encode_audio(mono, self.codec.SAMPLE_RATE, meta)
 
+    @_gated
+    @torch.no_grad()
+    def add_stem(
+        self,
+        audio_bytes: bytes,
+        target_stem: str,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        stem_cfg_scale: float | None = None,
+        output: str = "mix",
+        lyrics: str | None = None,
+        lyric_cfg_scale: float | None = None,
+    ) -> tuple[bytes, str]:
+        """Generate a NEW isolated stem that fits an existing song (the /addstem path).
+
+        The generative inverse of ``/stem``'s removal: the upload is Demucs-separated,
+        the model conditions on the song's OTHER stems (everything except
+        ``target_stem``) + ``text`` (the desired stem's vibe, e.g. "funky 70s warbly
+        bassline") and generates ``target_stem`` from scratch. ``output="mix"`` (the
+        default) returns the song with the new stem summed in; ``output="stem"``
+        returns the isolated generated stem alone. Needs a stem-trained checkpoint
+        (``use_stem_conditioning``) and the ``demucs`` package. Returns (bytes, mime).
+
+        ``lyrics`` applies ONLY when ``target_stem='vocals'`` — the model then sings
+        those words (phoneme + marker stream, like /generate) over the song's other
+        stems. Ignored for drums/bass/other (instrumental stems have no words).
+        """
+        if not getattr(self.model.cfg, "use_stem_conditioning", False):
+            raise RuntimeError(
+                "This checkpoint was trained without stem conditioning — /addstem "
+                "needs a model with use_stem_conditioning=True."
+            )
+        from diskrot.stems import extract_stem_tokens
+        from model.stem_encoder import STEM_TYPES, STEM_TYPE_TO_ID
+
+        target = (target_stem or "").lower().strip()
+        if target not in STEM_TYPE_TO_ID:
+            raise ValueError(
+                f"unknown target_stem {target_stem!r}; valid: {', '.join(STEM_TYPES)}")
+        target_id = STEM_TYPE_TO_ID[target]
+
+        demucs = self._ensure_demucs()
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+
+        # Separate + tokenize every stem of the upload via the SHARED extractor —
+        # byte-identical to the training stem cache (diskrot.stems).
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_bytes)
+            in_path = f.name
+        try:
+            tokens = extract_stem_tokens(in_path, self.codec, demucs, device=self.device)
+            orig_wav = self._load_wav(in_path) if output == "mix" else None
+        finally:
+            os.unlink(in_path)
+
+        cond_names = [n for n in STEM_TYPES if n != target]
+        new_frames = min(int(tokens[target].shape[1]), max_total - 1)
+        if new_frames <= 0:
+            raise ValueError("Audio is too short or the context limit too small.")
+        dev = self.device
+        # Condition on the OTHER stems (target excluded), sliced to the model's K.
+        cond_stack = torch.stack(
+            [tokens[n][:K, :new_frames] for n in cond_names], dim=0
+        )[None].to(dev)  # [1, S, K, new_frames] long
+        cond_types = torch.tensor(
+            [STEM_TYPE_TO_ID[n] for n in cond_names], device=dev, dtype=torch.long)[None]
+        cond_present = torch.ones(1, len(cond_names), device=dev)
+        target_type = torch.tensor([target_id], device=dev, dtype=torch.long)
+
+        # Lyrics only apply to a vocals target (the only stem that sings words). For
+        # the other stems the lyric stream stays off, matching how the model trained.
+        use_lyrics = (target == "vocals" and bool((lyrics or "").strip())
+                      and getattr(self.model.cfg, "use_lyric_conditioning", False))
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics if use_lyrics else None)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt=None, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb, cfg_scale=cfg_scale,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            lyric_cfg_scale=lyric_cfg_scale if use_lyrics else None,
+            stem_tokens=cond_stack, stem_types=cond_types, stem_present=cond_present,
+            target_stem_type=target_type, stem_cfg_scale=stem_cfg_scale,
+        )  # [K, 1 + new_frames]
+        out_tokens = out_tokens[:, 1:]  # strip the seed frame
+        stem_wav = self.codec.decode(out_tokens.cpu())  # [C, samples] or [samples]
+        if stem_wav.dim() == 1:
+            stem_wav = stem_wav.unsqueeze(0)
+
+        if output == "stem":
+            result = stem_wav
+        else:
+            ow = orig_wav.unsqueeze(0) if orig_wav.dim() == 1 else orig_wav
+            # Match channel count, then sum the new stem onto the song (truncate to
+            # the shorter side) and normalize if the sum clips.
+            if ow.shape[0] != stem_wav.shape[0]:
+                if stem_wav.shape[0] == 1:
+                    stem_wav = stem_wav.repeat(ow.shape[0], 1)
+                elif ow.shape[0] == 1:
+                    ow = ow.repeat(stem_wav.shape[0], 1)
+            n = min(ow.shape[1], stem_wav.shape[1])
+            result = ow[:, :n] + stem_wav[:, :n]
+            peak = result.abs().max()
+            if peak > 1.0:
+                result = result / peak
+
+        meta = self._gen_metadata(
+            "addstem", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            target_stem=target, output=output, stem_cfg_scale=stem_cfg_scale,
+            lyrics=(lyrics if use_lyrics else None),
+            seconds=new_frames / self.codec.FRAME_RATE_HZ,
+        )
+        return _encode_audio(result, self.codec.SAMPLE_RATE, meta)
+
 
 def _crossfade_concat(
     segments: list[torch.Tensor], sr: int, fade_seconds: float = 0.03,

@@ -48,7 +48,7 @@ registers them so `modal_ingest_wave.py` can call them. Deploy **with the R2 env
 vars exported** so the mount resolves:
 
 ```bash
-for m in prepare tokenize melody auto_tag transcribe structure \
+for m in prepare tokenize melody stems auto_tag transcribe structure tempo \
          pack_cache wave_cleanup phonemize key_detect; do
     modal deploy diskrot/modal_$m.py
 done
@@ -72,7 +72,7 @@ rclone copy ./downloads/wave_17 r2:nano-audio/waves/wave_17/
 modal run --detach diskrot/modal_ingest_wave.py --wave-id 17
 ```
 
-Runs `prepare → tokenize → melody → auto_tag → transcribe → structure →
+Runs `prepare → tokenize → melody → stems → auto_tag → transcribe → structure →
 pack_append → cleanup → phonemize → key_detect`, each blocking until done (so
 only one GPU stage runs at a time — respects a 50-GPU cap automatically).
 Resumable: a re-run with the same `--wave-id` skips stages already marked done in

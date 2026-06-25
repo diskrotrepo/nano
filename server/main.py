@@ -10,6 +10,7 @@ Endpoints:
     POST /cover          re-render a hummed melody (chroma) in the prompt's timbre
     POST /infill         fill the gap between two clips → [before | middle | after]
     POST /stem           remove/isolate stems via Demucs (no model — any ckpt)
+    POST /addstem        generate a NEW stem that fits a song (stem-trained ckpt)
 
     /generate, /extend accept optional text (tags), lyrics, gender, bpm, key,
 vocal-presence, and style_audio conditioning (gender/bpm/key/vocals ride the
@@ -959,8 +960,8 @@ async def stem_endpoint(
       `keep=vocals` -> a-cappella, `keep=drums` -> drums only.
 
     Stem names: drums, bass, other, vocals (aliases like `vox` fold in).
-    Generating a brand-new stem (the complementary "add" direction) needs a
-    stem-conditioned checkpoint and is not this endpoint.
+    Generating a brand-new stem (the complementary "add" direction) is the
+    separate `/addstem` endpoint, which needs a stem-conditioned checkpoint.
     """
     _get_engine(model)
     assert engine is not None
@@ -982,3 +983,67 @@ async def stem_endpoint(
         raise HTTPException(400, str(e))
     _save_output(body, mime, "stem", "+".join(keep_set))
     return Response(content=body, media_type=mime)
+
+
+@app.post("/addstem")
+async def addstem_endpoint(
+    audio: UploadFile = File(...),
+    target_stem: str = Form("bass"),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form(""),
+    per_cb_top_k: str = Form(""),
+    per_cb_top_p: str = Form(""),
+    cfg_scale: float = Form(3.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    negative_prompt: str = Form(""),
+    stem_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(0.0),
+    output: str = Form("mix"),
+    sweeten: bool = Form(True),
+    model: str = Form(""),
+) -> Response:
+    """Generate a NEW stem that fits an existing song — the generative inverse of
+    `/stem`'s removal.
+
+    Upload a song, pick `target_stem` (drums / bass / vocals / other) and describe
+    the vibe in `prompt` (e.g. "funky 70s warbly bassline"). The song is
+    Demucs-separated; the model conditions on its OTHER stems + the prompt and
+    generates the target stem. `output=mix` (default) returns the song with the new
+    stem summed in; `output=stem` returns the isolated generated stem. `stem_cfg_scale`
+    (>0) pushes how tightly the new stem fits the song, independent of `cfg_scale`.
+
+    `lyrics` applies ONLY when `target_stem=vocals` — the model sings those words
+    (same `[marker]` + phoneme syntax as /generate) over the song's other stems;
+    `lyric_cfg_scale` (>0) pushes diction. Ignored for drums/bass/other.
+
+    Requires a checkpoint trained with stem conditioning (use_stem_conditioning) and
+    the `demucs` package.
+    """
+    _get_engine(model)
+    assert engine is not None
+    data = await audio.read()
+    if not data:
+        raise HTTPException(400, "empty audio upload")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    try:
+        body, mime = engine.add_stem(
+            data,
+            target_stem=target_stem,
+            temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+            top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+            top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+            cfg_scale=cfg_scale,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
+            negative_text=negative_prompt.strip() or None,
+            stem_cfg_scale=stem_cfg_scale or None,
+            lyric_cfg_scale=lyric_cfg_scale or None,
+            output=(output or "mix").strip().lower(),
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    _save_output(body, mime, "addstem", f"{target_stem}: {prompt}")
+    return Response(content=body, media_type=mime, headers=sweet_headers)

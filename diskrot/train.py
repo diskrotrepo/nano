@@ -84,6 +84,17 @@ class TrainConfig:
     # co-reordered melody, so this trades directly against lyric/melody training
     # — keep it modest since singing is the headline objective.
     fim_prob: float = 0.0
+    # Fraction of training batches run in "stem-add" mode (the /addstem path). Only
+    # active when model.use_stem_conditioning is True AND the pack carries stems. On
+    # a stem-add batch the decoder TARGET is one isolated stem and the conditioning
+    # is the song's OTHER stems (+ the target-stem caption via the tag path); lyrics
+    # and melody are dropped (they describe the full song, not the isolated stem).
+    # Trades against full-song training, so keep it modest.
+    stem_prob: float = 0.0
+    # On a stem-add batch, each of the 3 conditioning (accompaniment) stems is kept
+    # with this probability and otherwise masked to the learned null — so the model
+    # is robust to a song that's missing some stems at inference time.
+    stem_cond_keep_prob: float = 0.7
 
     seed: int = 42
 
@@ -870,7 +881,10 @@ def _evaluate(
         use_lyrics = cfg.model.use_lyric_conditioning
         use_melody = cfg.model.use_melody_conditioning
         losses, per_cb_sums = [], None
-        for i, (batch, tags, lyric_ids, lyric_mask, melody) in enumerate(loader):
+        # Val measures full-song loss; the stem axis (if any) stays off here — the
+        # model's _stem_add(None) adds the learned null, so a stem-trained model is
+        # evaluated in its plain full-song regime. Trailing stem fields are ignored.
+        for i, (batch, tags, lyric_ids, lyric_mask, melody, *_stem) in enumerate(loader):
             if i >= n_batches:
                 break
             # int16 on host (P3 — saves ~24 GB shared RAM at the production
@@ -1111,7 +1125,16 @@ def train_run(
             # so the in-step embedding lookup is local. Chunking a long
             # description into <=77-token windows lets the decoder cross-attend to
             # the whole thing instead of CLAP's truncated single pooled vector.
-            unique_descs = sorted(set(train_ds._tags.values()) | set(val_ds._tags.values()))
+            # Include the per-stem captions (the /addstem target-stem tags) so a
+            # stem-add batch's swapped-in tag hits the cache like any description.
+            _stem_cap_strs = {
+                c
+                for ds in (train_ds, val_ds)
+                for caps in getattr(ds, "_stem_caps", {}).values()
+                for c in caps if c
+            }
+            unique_descs = sorted(
+                set(train_ds._tags.values()) | set(val_ds._tags.values()) | _stem_cap_strs)
             text_encoder._ensure_clap()
             for desc in unique_descs:
                 chunk_index[desc] = text_encoder.chunk_text(desc)
@@ -1316,19 +1339,20 @@ def train_run(
     while step < cfg.steps:
         t_io = time.time()
         try:
-            batch, tags, lyric_ids, lyric_mask, melody = next(train_iter)
+            batch, tags, lyric_ids, lyric_mask, melody, stems_cpu, stem_present_cpu, stem_caps_cpu = next(train_iter)
         except StopIteration:
             epoch += 1
             if use_ddp and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
-            batch, tags, lyric_ids, lyric_mask, melody = next(train_iter)
+            batch, tags, lyric_ids, lyric_mask, melody, stems_cpu, stem_present_cpu, stem_caps_cpu = next(train_iter)
         dataloader_wait_s += time.time() - t_io
 
         # int16 on host (P3 — saves ~24 GB shared RAM). Cast to int64 on
         # GPU because nn.Embedding's index_select kernel requires int64.
         batch = batch.to(cfg.device, non_blocking=True).long()
         mel_dev = melody.to(cfg.device, non_blocking=True) if melody is not None else None
+        T_seg = batch.shape[-1]  # un-delayed crop length (for zeroed stem cond shape)
 
         # Fill-in-the-middle: with prob fim_prob reorder this batch into the
         # infill layout `prefix <SUF> suffix <MID> middle` (frame-domain reorder
@@ -1340,6 +1364,50 @@ def train_run(
             batch, mel_dev = fim_reorder_batch(
                 batch, mel_dev, cfg.model.suf_id, cfg.model.mid_id, _rng
             )
+
+        # Stem-add: with prob stem_prob, swap the decoder TARGET to ONE isolated
+        # stem and condition on the song's OTHER stems (the /addstem path). A
+        # whole-batch mode like FIM, mutually exclusive with it; only fires when
+        # every song in the batch has real stems (else the target would be a
+        # zero-filled non-stem). Picks one target stem type for the whole batch.
+        do_stem = (
+            cfg.model.use_stem_conditioning and not do_fim
+            and stems_cpu is not None
+            and bool(stem_present_cpu.all())
+            and _rng.random() < cfg.stem_prob
+        )
+        stem_tokens = stem_types = stem_present = target_stem_type = None
+        stem_target_is_vocals = False
+        if do_stem:
+            from model.stem_encoder import STEM_TYPE_TO_ID
+            stems_dev = stems_cpu.to(cfg.device, non_blocking=True).long()  # [B,n,K,T]
+            Bc, n_stems = stems_dev.shape[0], stems_dev.shape[1]
+            target_t = _rng.randrange(n_stems)
+            # The vocals stem IS the sung words, so a vocals-target stem-add KEEPS the
+            # lyric stream (the model learns to sing the supplied words over the
+            # accompaniment); drums/bass/other drop lyrics (instrumental, no words).
+            stem_target_is_vocals = (target_t == STEM_TYPE_TO_ID["vocals"])
+            batch = stems_dev[:, target_t]  # [B,K,T] -> the new decoder target
+            cond_idx = [j for j in range(n_stems) if j != target_t]
+            stem_tokens = stems_dev[:, cond_idx]  # [B,S,K,T]
+            stem_types = torch.tensor(
+                cond_idx, device=cfg.device, dtype=torch.long).unsqueeze(0).expand(Bc, -1)
+            target_stem_type = torch.full(
+                (Bc,), target_t, device=cfg.device, dtype=torch.long)
+            # Random-subset mask the conditioning stems for robustness.
+            stem_present = (
+                torch.rand(Bc, len(cond_idx), device=cfg.device) < cfg.stem_cond_keep_prob
+            ).float()
+            # Steer the target stem via ITS caption (tags.json ``stems`` field, in
+            # STEM_TYPES order). Falls back per-sample to the full-song description
+            # when a per-stem caption is missing, so steering improves as the
+            # captioner emits per-stem captions without blocking training now.
+            tags = list(tags)
+            for i in range(len(tags)):
+                caps = stem_caps_cpu[i] if stem_caps_cpu is not None else ()
+                if caps and target_t < len(caps) and caps[target_t]:
+                    tags[i] = caps[target_t]
+
         inputs, targets = build_train_inputs(batch, pad_id)
 
         # Tag + lyric + melody conditioning, each dropped INDEPENDENTLY for
@@ -1392,13 +1460,43 @@ def train_run(
         if cfg.model.use_lyric_conditioning:
             l_ids = lyric_ids.to(cfg.device, non_blocking=True)
             l_mask = lyric_mask.to(cfg.device, non_blocking=True)
-            lyric_drop = do_fim or _rng.random() < cfg.cfg_dropout
+            # On a stem-add batch the target is an isolated stem — lyrics describe
+            # the full song, so drop them (like FIM), EXCEPT a vocals-target batch:
+            # the vocal stem sings the song's words, so it keeps the lyric stream so
+            # /addstem target=vocals can sing supplied lyrics.
+            stem_drop_lyrics = do_stem and not stem_target_is_vocals
+            lyric_drop = do_fim or stem_drop_lyrics or _rng.random() < cfg.cfg_dropout
             lyric_keep = keep_zero if lyric_drop else keep_one
         mel = melody_keep = None
         if cfg.model.use_melody_conditioning and mel_dev is not None:
             mel = mel_dev
-            melody_keep = (keep_zero if _rng.random() < cfg.cfg_dropout
+            # Drop melody on stem-add batches too (the full-song chroma doesn't
+            # match the isolated target stem); the encoder still runs (keep=0).
+            melody_keep = (keep_zero if (do_stem or _rng.random() < cfg.cfg_dropout)
                            else keep_one)
+
+        # Stem-add conditioning for the model. On a stem-add batch these are the
+        # real accompaniment + target; otherwise — when use_stem_conditioning is on
+        # — pass ZEROED fixed-shape args + stem_keep=0 so the StemEncoder still runs
+        # (params get grad every step → DDP find_unused_parameters=False) but adds
+        # the learned null. Static shapes across both → one compiled graph.
+        m_stem_tokens = m_stem_types = m_stem_present = None
+        m_target_stem = m_stem_keep = None
+        if cfg.model.use_stem_conditioning:
+            if do_stem:
+                m_stem_tokens, m_stem_types = stem_tokens, stem_types
+                m_stem_present = stem_present
+                m_target_stem = target_stem_type
+                m_stem_keep = (keep_zero if _rng.random() < cfg.cfg_dropout else keep_one)
+            else:
+                S = cfg.model.n_stem_types - 1
+                Kc = cfg.model.n_codebooks
+                m_stem_tokens = torch.zeros(
+                    (B_in, S, Kc, T_seg), device=cfg.device, dtype=torch.long)
+                m_stem_types = torch.zeros((B_in, S), device=cfg.device, dtype=torch.long)
+                m_stem_present = torch.zeros((B_in, S), device=cfg.device)
+                m_target_stem = torch.zeros((B_in,), device=cfg.device, dtype=torch.long)
+                m_stem_keep = keep_zero
 
         for g in optim.param_groups:
             g["lr"] = _cosine_lr(step, cfg)
@@ -1406,7 +1504,10 @@ def train_run(
         with torch.amp.autocast(cfg.device, dtype=torch.bfloat16, enabled=amp_enabled):
             logits = model(inputs, text_emb=text_emb, text_kv_mask=text_kv_mask,
                            lyric_ids=l_ids, lyric_mask=l_mask, lyric_keep=lyric_keep,
-                           melody=mel, melody_keep=melody_keep)
+                           melody=mel, melody_keep=melody_keep,
+                           stem_tokens=m_stem_tokens, stem_types=m_stem_types,
+                           stem_present=m_stem_present, target_stem_type=m_target_stem,
+                           stem_keep=m_stem_keep)
             if teacher is not None:
                 # Teacher forward: identical inputs + conditioning (lyric/melody
                 # ids and keep gates are model-agnostic; only the tag projection
@@ -1415,7 +1516,11 @@ def train_run(
                     t_logits = teacher(inputs, text_emb=text_emb_teacher,
                                        text_kv_mask=text_kv_mask, lyric_ids=l_ids,
                                        lyric_mask=l_mask, lyric_keep=lyric_keep,
-                                       melody=mel, melody_keep=melody_keep)
+                                       melody=mel, melody_keep=melody_keep,
+                                       stem_tokens=m_stem_tokens, stem_types=m_stem_types,
+                                       stem_present=m_stem_present,
+                                       target_stem_type=m_target_stem,
+                                       stem_keep=m_stem_keep)
                 loss, ce_term, kd_term, per_cb = _distill_loss(
                     logits, t_logits, targets, pad_id, cfg.distill_tau, cfg.distill_alpha)
             else:

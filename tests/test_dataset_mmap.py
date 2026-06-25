@@ -35,7 +35,7 @@ def test_from_mmap_yields_int16_tensor_with_correct_shape(synth_tokens_dir):
     assert len(train) + len(val) == 6
     assert 1 <= len(val) < 6
     assert len(train) >= 1
-    tokens, tag, lyric_ids, _melody = train[0]
+    tokens, tag, lyric_ids, _melody, *_ = train[0]
     assert isinstance(tokens, torch.Tensor)
     assert tokens.dtype == torch.int16
     assert tokens.shape == (9, 400)

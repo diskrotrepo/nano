@@ -24,6 +24,7 @@ calibrated with a small ``--limit`` Modal run before a full pass.
 from __future__ import annotations
 
 import os
+import re
 
 import numpy as np
 
@@ -33,8 +34,13 @@ import numpy as np
 SAMPLE_RATE = 16_000
 WINDOW_SECONDS = 30
 MAX_WINDOWS = 4           # up to ~120 s of audio spread across the track
-MAX_NEW_TOKENS = 512      # ~380 words; trimmed to MAX_CHARS below
-MAX_CHARS = 3000          # the chunked-CLAP tag path's design target
+# Headroom for the description (~350 words) + the GENDER line + the four per-stem
+# lines (one sentence each). Was 512 (description+gender only); the stem block adds
+# ~120 tokens, so bump it or the last STEM lines get truncated (→ empty → the train
+# loop falls back to the song caption for that stem, but we want all four).
+MAX_NEW_TOKENS = 700
+MAX_CHARS = 3000          # the chunked-CLAP tag path's design target (description)
+MAX_STEM_CHARS = 400      # per-stem caption cap (one sentence; the /addstem tag)
 
 DEFAULT_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 
@@ -44,7 +50,20 @@ DEFAULT_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 # new model) and you want a --redo to redo everything. NOTE: diskrot/modal_auto_tag.py
 # duplicates this literal (its slim orchestrator image can't import this module) —
 # keep the two in sync.
-CAPTIONER_MARKER = "audio_llm_v3"
+# v4: the caption now carries a trailing vocal GENDER tag, parsed into a separate
+# tags.json ``gender`` field — the audio-LLM replaces the F0-on-Demucs gender
+# estimate, so transcribe no longer runs Demucs. A --redo upgrades v3 -> v4 to
+# populate gender (old v3 entries fall back to the lyrics-entry gender meanwhile).
+# v5: after the GENDER line the caption now emits four per-stem lines
+# (DRUMS/BASS/VOCALS/OTHER), parsed into a ``stems`` dict in tags.json — the
+# /addstem target-stem tag source (so "add a bassline" is steered by the song's
+# own bass description). A --redo upgrades v4 -> v5; until a song is re-captioned,
+# stem-add training falls back to its full-song description.
+CAPTIONER_MARKER = "audio_llm_v5"
+
+# The four per-stem caption keys, in model.stem_encoder.STEM_TYPES order (kept as a
+# literal so this module needn't import torch via stem_encoder; tests guard parity).
+STEM_CAPTION_KEYS = ("drums", "bass", "vocals", "other")
 
 _CAPTION_INSTRUCTION = """You are an expert music annotator. The audio contains one or more excerpts from the same track, presented in order. Listen to all of it before writing.
 Write ONE rich, information-dense description of the music as flowing prose. In separate short sentences, cover each of the following where audible:
@@ -68,10 +87,23 @@ Do NOT comment on recording quality unless it is an intentional production choic
 
 FORMAT — follow exactly:
 
-Output the description and nothing else. No preamble ("Here is," "Sure," "This track"), no title, no closing remark, no meta-commentary.
-Plain prose only. No markdown, no bullet points, no headings, no numbered lists, no bold.
+Output the description, then the single GENDER tag, then the four STEM lines specified below, and nothing else. No preamble ("Here is," "Sure," "This track"), no title, no closing remark, no meta-commentary.
+Plain prose only for the description. No markdown, no bullet points, no headings, no numbered lists, no bold.
 Do not name the dimensions you are covering (do not write "The vocals:" or "Genre:"). Weave them into continuous prose.
 Length: 150–350 words. One paragraph.
+
+After the paragraph — and only after it — output the lead vocal's gender on its own line, exactly one of:
+GENDER: male
+GENDER: female
+GENDER: instrumental
+Judge the MOST PROMINENT sung voice; if voices of both genders trade off, pick the lead. Use "instrumental" only when there is no singing at all.
+
+After the GENDER line — and only after it — output exactly FOUR more lines, one per instrument family, in THIS order and format (uppercase label, a colon, then ONE vivid concrete sentence describing only that family's sound — its instrument(s), tone, and movement — written as a standalone production note a musician could follow to recreate it):
+DRUMS: <the drums and percussion>
+BASS: <the bass line and low end>
+VOCALS: <the lead and backing vocals — voice type and delivery; write exactly the single word none if there is no singing>
+OTHER: <the harmony and lead melodic instruments — everything that is not drums, bass, or vocals>
+Each of these four lines is one sentence under the same no-hedging, no-invented-lyrics rules as the paragraph. These four lines plus the GENDER line are the sole exceptions to "nothing else".
 
 Begin the description now with a concrete observation about the sound."""
 
@@ -124,6 +156,84 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+# The captioner is prompted to end with a "GENDER: male|female|instrumental" line.
+# Match it (colon OR dash, case/space-insensitive) and split it off the prose. The
+# colon/dash requirement keeps incidental prose like "gender-bending vocals" from
+# matching.
+_GENDER_TAG_RE = re.compile(
+    r"\bGENDER\s*[:\-]\s*(male|female|man|woman|boy|girl|instrumental|none|unknown|m|f)\b",
+    re.IGNORECASE,
+)
+_MALE_LABELS = frozenset({"male", "man", "boy", "m"})
+_FEMALE_LABELS = frozenset({"female", "woman", "girl", "f"})
+
+
+def parse_gender(text: str) -> tuple[str, str | None]:
+    """Split the trailing ``GENDER: <label>`` tag off the caption.
+
+    Returns ``(description_without_the_tag, canonical_gender)`` where
+    ``canonical_gender`` is ``"male"``/``"female"`` or ``None`` (instrumental /
+    unknown / absent / unrecognized -> None, so the dataset sees
+    ``<unknown_gender>``). This is the audio-LLM vocal-gender source that replaces
+    the F0-on-Demucs estimate; ``gender_label_to_id`` in model/lyric_encoder.py
+    maps the string to the marker id at train/inference."""
+    if not text:
+        return "", None
+    m = _GENDER_TAG_RE.search(text)
+    if not m:
+        return text, None
+    desc = text[:m.start()].strip()
+    label = m.group(1).lower()
+    if label in _MALE_LABELS:
+        return desc, "male"
+    if label in _FEMALE_LABELS:
+        return desc, "female"
+    return desc, None  # instrumental / none / unknown
+
+
+# The four per-stem lines the captioner emits after GENDER. Tolerant of a leading
+# bullet/space and colon-OR-dash; one line each. The captured sentence is the
+# /addstem target-stem tag.
+_STEM_LINE_RE = re.compile(
+    r"(?im)^[\s>*\-]*(DRUMS|BASS|VOCALS|OTHER)\s*[:\-]\s*(.+?)\s*$"
+)
+# A stem line whose value is one of these (the "no such stem" sentinel) is dropped,
+# so the train loop falls back to the song description for that stem.
+_STEM_EMPTY_VALUES = frozenset({
+    "none", "n/a", "na", "nan", "instrumental", "absent", "silent", "silence", "-",
+})
+
+
+def parse_stems(text: str) -> tuple[str, dict[str, str]]:
+    """Split the trailing per-stem ``DRUMS:/BASS:/VOCALS:/OTHER:`` lines off a caption.
+
+    Returns ``(text_without_those_lines, {stem_name: caption})`` keyed by
+    ``STEM_CAPTION_KEYS``. Robust to missing/extra/reordered lines and markdown
+    bullets — an absent or sentinel ("none"/"instrumental"/…) value is omitted, so a
+    malformed block degrades to fewer (or zero) per-stem captions rather than
+    garbage. Run this BEFORE ``parse_gender`` (it strips its lines from the raw
+    text first, leaving ``description … GENDER: …`` for the gender parser)."""
+    if not text:
+        return "", {}
+    stems: dict[str, str] = {}
+    spans: list[tuple[int, int]] = []
+    for m in _STEM_LINE_RE.finditer(text):
+        name = m.group(1).lower()
+        if name not in STEM_CAPTION_KEYS or name in stems:
+            continue  # first occurrence wins; ignore unknown labels
+        value = " ".join(m.group(2).split())
+        spans.append((m.start(), m.end()))
+        if value.strip().strip(".").lower() in _STEM_EMPTY_VALUES or not value:
+            continue  # sentinel / empty -> no caption for this stem
+        if len(value) > MAX_STEM_CHARS:
+            value = value[:MAX_STEM_CHARS].rsplit(" ", 1)[0]
+        stems[name] = value.strip()
+    # Remove the matched lines from the text (back-to-front to keep offsets valid).
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + text[end:]
+    return text, stems
+
+
 def _build_conversation(windows: list[np.ndarray]) -> list[dict]:
     """The chat conversation shared by both backends so the templated prompt is
     byte-identical: the song's audio windows (in order) then the caption
@@ -166,7 +276,24 @@ class AudioLLMCaptioner:
         return _clean(text)
 
     def caption(self, windows: list[np.ndarray], sr: int = SAMPLE_RATE) -> str:
-        """Caption ONE song from its (already-extracted) audio windows."""
+        """Caption ONE song from its windows (description only; gender stripped)."""
+        return self.caption_with_gender(windows, sr=sr)[0]
+
+    def caption_with_gender(
+        self, windows: list[np.ndarray], sr: int = SAMPLE_RATE
+    ) -> tuple[str, str | None]:
+        """Caption ONE song; return ``(description, vocal_gender)`` (stems dropped)."""
+        d, g, _stems = self.caption_with_gender_and_stems(windows, sr=sr)
+        return d, g
+
+    def caption_with_gender_and_stems(
+        self, windows: list[np.ndarray], sr: int = SAMPLE_RATE
+    ) -> tuple[str, str | None, dict[str, str]]:
+        """Caption ONE song; return ``(description, vocal_gender, stems)``. Gender is
+        the audio-LLM's male/female/instrumental judgment (the F0-on-Demucs
+        replacement); ``stems`` is the per-stem caption dict (DRUMS/BASS/VOCALS/OTHER
+        → one sentence each, in STEM_CAPTION_KEYS order), the /addstem target-stem
+        tag source. Both are parsed off the trailing tag lines."""
         import torch
 
         self._ensure_model()
@@ -186,7 +313,10 @@ class AudioLLMCaptioner:
         caption = self._processor.batch_decode(
             new_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
         )[0]
-        return self._clean(caption)
+        # parse_stems first (strips its lines), then parse_gender on the remainder.
+        rest, stems = parse_stems(caption)
+        desc, gender = parse_gender(rest)
+        return self._clean(desc), gender, stems
 
     def caption_path(self, path: str) -> str:
         """Convenience: window a file off disk, then caption it."""
@@ -217,13 +347,14 @@ class VLLMAudioCaptioner:
         from vllm import LLM, SamplingParams
 
         self._processor = AutoProcessor.from_pretrained(self._model_name)
-        # max_model_len holds MAX_WINDOWS*~750 audio tokens + prompt + MAX_NEW_TOKENS
-        # (4096 fits the 4-window/512-token default). gpu_memory_utilization governs
-        # the KV cache — lower it / max_num_seqs / max_model_len if init OOMs.
+        # max_model_len holds MAX_WINDOWS*~750 audio tokens + prompt + MAX_NEW_TOKENS.
+        # Bumped 4096 -> 5120: MAX_NEW_TOKENS grew to 700 (the v5 per-stem block), so
+        # 3000 audio + ~400 prompt + 700 output no longer fits 4096. gpu_memory_utilization
+        # governs the KV cache — lower it / max_num_seqs / max_model_len if init OOMs.
         self._llm = LLM(
             model=self._model_name,
             dtype="float16",
-            max_model_len=int(os.environ.get("NANO_VLLM_MAX_MODEL_LEN", "4096")),
+            max_model_len=int(os.environ.get("NANO_VLLM_MAX_MODEL_LEN", "5120")),
             max_num_seqs=int(os.environ.get("NANO_VLLM_MAX_NUM_SEQS", "32")),
             limit_mm_per_prompt={"audio": MAX_WINDOWS},
             gpu_memory_utilization=float(
@@ -236,9 +367,24 @@ class VLLMAudioCaptioner:
     def caption_many(
         self, windows_per_song: list[list[np.ndarray]], sr: int = SAMPLE_RATE
     ) -> list[str]:
+        """Caption MANY songs in one vLLM batch — descriptions only (gender stripped)."""
+        return [d for d, _g in self.caption_many_with_gender(windows_per_song, sr=sr)]
+
+    def caption_many_with_gender(
+        self, windows_per_song: list[list[np.ndarray]], sr: int = SAMPLE_RATE
+    ) -> list[tuple[str, str | None]]:
+        """Caption MANY songs in one vLLM batch; ``(description, gender)`` per song
+        (stems dropped). See ``caption_many_with_gender_and_stems``."""
+        return [(d, g) for d, g, _s
+                in self.caption_many_with_gender_and_stems(windows_per_song, sr=sr)]
+
+    def caption_many_with_gender_and_stems(
+        self, windows_per_song: list[list[np.ndarray]], sr: int = SAMPLE_RATE
+    ) -> list[tuple[str, str | None, dict[str, str]]]:
         """Caption MANY songs in one vLLM batch (continuous batching). Takes one
-        window-list per song; returns one cleaned caption per song, in order
-        (vLLM preserves request order)."""
+        window-list per song; returns one ``(description, vocal_gender, stems)`` per
+        song, in order (vLLM preserves request order). Gender + the per-stem caption
+        dict are parsed off the trailing tag lines the captioner emits."""
         self._ensure_model()
         requests = []
         for windows in windows_per_song:
@@ -251,13 +397,32 @@ class VLLMAudioCaptioner:
                 "multi_modal_data": {"audio": [(w, sr) for w in windows]},
             })
         outputs = self._llm.generate(requests, self._sampling)
-        return [_clean(o.outputs[0].text) for o in outputs]
+        result: list[tuple[str, str | None, dict[str, str]]] = []
+        for o in outputs:
+            rest, stems = parse_stems(o.outputs[0].text)
+            desc, gender = parse_gender(rest)
+            result.append((_clean(desc), gender, stems))
+        return result
 
     def caption(self, windows: list[np.ndarray], sr: int = SAMPLE_RATE) -> str:
         """Caption ONE song (delegates to the batched path) so the single-song
         callers (diskrot/auto_tag.py, caption_path) work unchanged on either
         backend."""
         return self.caption_many([windows], sr=sr)[0]
+
+    def caption_with_gender(
+        self, windows: list[np.ndarray], sr: int = SAMPLE_RATE
+    ) -> tuple[str, str | None]:
+        """Single-song ``(description, vocal_gender)`` — backend-parity with the
+        HF captioner so the Modal worker's non-batched fallback works on either."""
+        return self.caption_many_with_gender([windows], sr=sr)[0]
+
+    def caption_with_gender_and_stems(
+        self, windows: list[np.ndarray], sr: int = SAMPLE_RATE
+    ) -> tuple[str, str | None, dict[str, str]]:
+        """Single-song ``(description, vocal_gender, stems)`` — backend-parity with
+        the HF captioner."""
+        return self.caption_many_with_gender_and_stems([windows], sr=sr)[0]
 
     def caption_path(self, path: str) -> str:
         """Convenience: window a file off disk, then caption it."""

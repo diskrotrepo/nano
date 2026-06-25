@@ -106,12 +106,16 @@ class GPTConfig:
     use_melody_conditioning: bool = False
     melody_n_bins: int = 12
     melody_enc_layers: int = 2
-    # Generative stem conditioning (the /addstem path) — a token-domain axis: a
-    # StemEncoder embeds a SOURCE stem's full codec tokens [B,K,T] (+ a stem-type
-    # id) and the decoder ADDS the result per-frame at the cb0 anchor, exactly like
-    # melody but full-fidelity (token-domain, not a lossy feature). Lets the model
-    # generate a full mix built around a given stem. Off by default (checkpoint-
-    # incompatible new submodule); enabled in a fresh v9 start with the stem cache.
+    # Generative stem conditioning (the /addstem path) — a token-domain axis for
+    # "add a stem to an existing song". On a stem-add training batch the decoder's
+    # TARGET is one isolated stem's tokens; the conditioning is the song's OTHER
+    # stems (the accompaniment): a StemEncoder embeds each conditioning stem's full
+    # codec tokens [B,K,T] (+ a stem-type id), _stem_add SUMS them, adds a
+    # target-type embedding (which stem to generate), and the decoder ADDS the
+    # result per-frame at the cb0 anchor — exactly like melody but full-fidelity
+    # (token-domain). Lets a user upload a song and generate e.g. a new bassline
+    # that fits it. Off by default (checkpoint-incompatible new submodule); enabled
+    # in a fresh v9 start with the stem cache (packed_NNN.stem.bin sidecar).
     use_stem_conditioning: bool = False
     stem_enc_layers: int = 2
     n_stem_types: int = 4  # drums/bass/vocals/other (model/stem_encoder.STEM_TYPES)
@@ -561,6 +565,107 @@ class NanoAudioGPT(nn.Module):
             full[:, offset:end, :] = enc[:, :end - offset, :]
         return full
 
+    def _encode_stem_accompaniment(
+        self,
+        stem_tokens: torch.Tensor,
+        stem_types: torch.Tensor,
+        stem_present: torch.Tensor,
+        target_stem_type: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum the encoded conditioning stems + the target-type embedding -> [B,Tc,D].
+
+        stem_tokens [B,S,K,T] (S conditioning stems), stem_types [B,S] long,
+        stem_present [B,S] float 0/1 (absent slots contribute 0), target_stem_type
+        [B] long. ALL S slots are encoded every call (so every embedding table gets
+        grad — DDP-safe); an absent slot is masked to a zero contribution by its
+        present bit. The target-type embedding is added once, broadcast per-frame.
+        """
+        B, S = stem_tokens.shape[0], stem_tokens.shape[1]
+        se = self.stem_encoder
+        acc = None
+        for s in range(S):
+            enc = se.encode_stem(stem_tokens[:, s], stem_types[:, s])  # [B, Tc, D]
+            term = stem_present[:, s].view(B, 1, 1) * enc
+            acc = term if acc is None else acc + term
+        acc = acc + se.target_type_emb(target_stem_type).unsqueeze(1)  # [B, Tc, D]
+        return acc
+
+    def _stem_add(
+        self,
+        stem_tokens: torch.Tensor | None,
+        stem_types: torch.Tensor | None,
+        stem_present: torch.Tensor | None,
+        target_stem_type: torch.Tensor | None,
+        stem_emb: torch.Tensor | None,
+        B: int,
+        T: int,
+        start_pos: int,
+        keep: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The per-frame stem term added to the decoder input, shape [B, T, D].
+
+        Mirrors ``_melody_add``. Three sources, in precedence order:
+        - ``stem_emb`` (pre-built full delayed-length [B, seq, D], from
+          ``encode_stem_delayed``): sliced for the prefill / KV-cached decode step.
+        - ``stem_tokens`` (training path, start_pos=0): the S accompaniment stems are
+          encoded + summed HERE (so DDP syncs the encoder grads), the target-type is
+          added, then null-padded to T (the K-1 delay tail) or truncated.
+        - neither (stem axis off for this sample): the learned null, so the model
+          always receives a stem signal — train and inference agree that "no stem"
+          means the null, not the absence of any add.
+
+        ``keep`` is the CFG-dropout / stem-add-mode gate: keep=0 -> exactly the null
+        (the unconditional / non-stem-add state) while the encoder still ran, so one
+        compiled graph serves both and no parameter is ever DDP-"unused".
+        """
+        se = self.stem_encoder
+        if stem_emb is not None:
+            if input_pos is not None:
+                return stem_emb[:, input_pos, :]
+            return stem_emb[:, start_pos:start_pos + T, :]
+        if stem_tokens is not None:
+            acc = self._encode_stem_accompaniment(
+                stem_tokens, stem_types, stem_present, target_stem_type
+            )
+            Tc = acc.shape[1]
+            if Tc < T:
+                acc = torch.cat([acc, se.null_emb(B, T - Tc)], dim=1)
+            elif Tc > T:
+                acc = acc[:, :T, :]
+            if keep is not None:
+                acc = keep * acc + (1 - keep) * se.null_emb(B, T)
+            return acc
+        return se.null_emb(B, T)
+
+    def encode_stem_delayed(
+        self,
+        stem_tokens: torch.Tensor,
+        stem_types: torch.Tensor,
+        stem_present: torch.Tensor,
+        target_stem_type: torch.Tensor,
+        seq_len: int,
+        offset: int = 0,
+    ) -> torch.Tensor:
+        """Encode the accompaniment stems ONCE into a full delayed-length [B,seq,D].
+
+        The summed accompaniment (+ target-type) is placed at delayed positions
+        ``[offset, offset+Tc)`` (offset = prompt length, so the stem lines up with
+        the NEW frames at the cb0 anchor); every other position is the learned null.
+        Used by ``generate`` to encode the fully-known stems once and reuse the
+        result across all decode steps via the ``[start_pos:start_pos+T]`` slice
+        (the CFG baseline is the plain ``null_emb``)."""
+        B = stem_tokens.shape[0]
+        acc = self._encode_stem_accompaniment(
+            stem_tokens, stem_types, stem_present, target_stem_type
+        )  # [B, Tc, D]
+        Tc = acc.shape[1]
+        full = self.stem_encoder.null_emb(B, seq_len).clone()  # [B, seq_len, D]
+        end = min(offset + Tc, seq_len)
+        if end > offset:
+            full[:, offset:end, :] = acc[:, :end - offset, :]
+        return full
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -576,6 +681,12 @@ class NanoAudioGPT(nn.Module):
         melody: torch.Tensor | None = None,
         melody_emb: torch.Tensor | None = None,
         melody_keep: torch.Tensor | None = None,
+        stem_tokens: torch.Tensor | None = None,
+        stem_types: torch.Tensor | None = None,
+        stem_present: torch.Tensor | None = None,
+        target_stem_type: torch.Tensor | None = None,
+        stem_emb: torch.Tensor | None = None,
+        stem_keep: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
@@ -604,7 +715,16 @@ class NanoAudioGPT(nn.Module):
         melody_emb: pre-built full delayed-length melody term [B, seq, D] (from
             encode_melody_delayed). Used on the generate path to encode once and
             slice per decode step. Takes precedence over ``melody``.
-        lyric_keep / melody_keep: optional 0/1 scalar tensors — the train-time
+        stem_tokens/stem_types/stem_present/target_stem_type: the stem-add training
+            inputs — S accompaniment stems [B,S,K,T] + their stem-type ids [B,S] +
+            a present mask [B,S] (0 = absent slot) + the target stem id [B]. Encoded
+            + summed INSIDE this forward (DDP grad-sync) and added per-frame. On a
+            normal (non-stem-add) batch these are passed zeroed with stem_keep=0 so
+            the encoder still runs but contributes the null.
+        stem_emb: pre-built full delayed-length stem term [B, seq, D] (from
+            encode_stem_delayed). Used on the generate path. Takes precedence over
+            ``stem_tokens``.
+        lyric_keep / melody_keep / stem_keep: optional 0/1 scalar tensors — the train-time
             CFG-dropout gates. The encoders ALWAYS run and the contribution is
             multiplied by keep (0 -> exactly the unconditional state: zero lyric
             cond / the melody null), so torch.compile sees ONE graph per stream
@@ -641,6 +761,13 @@ class NanoAudioGPT(nn.Module):
         if self.cfg.use_melody_conditioning:
             x = x + self._melody_add(melody, melody_emb, B, T, start_pos,
                                      keep=melody_keep, input_pos=input_pos)
+        # Stem-add conditioning: the summed accompaniment stems + target-type, added
+        # at the same cb0 anchor as melody (delayed position p ↔ frame p). On the
+        # training path stem_tokens are encoded here; on decode stem_emb is sliced.
+        if self.cfg.use_stem_conditioning:
+            x = x + self._stem_add(stem_tokens, stem_types, stem_present,
+                                   target_stem_type, stem_emb, B, T, start_pos,
+                                   keep=stem_keep, input_pos=input_pos)
         x = self.drop(x)
 
         # RoPE positions: the CUDA-graph decode path indexes by the TENSOR
@@ -695,6 +822,11 @@ class NanoAudioGPT(nn.Module):
         lyric_cfg_scale: float | None = None,
         melody: torch.Tensor | None = None,
         melody_cfg_scale: float | None = None,
+        stem_tokens: torch.Tensor | None = None,
+        stem_types: torch.Tensor | None = None,
+        stem_present: torch.Tensor | None = None,
+        target_stem_type: torch.Tensor | None = None,
+        stem_cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """Continue a prompt, or generate unconditionally when prompt is None.
 
@@ -714,6 +846,14 @@ class NanoAudioGPT(nn.Module):
             its OWN scale via an extra composed stream — analogous to
             lyric_cfg_scale, nesting after it (tags → lyrics → melody). When None,
             melody is guided jointly with the rest by cfg_scale (one fewer pass).
+        stem_tokens/stem_types/stem_present/target_stem_type: the /addstem inputs —
+            S accompaniment stems [B,S,K,T] + their stem-type ids [B,S] + a present
+            mask [B,S] + the target stem id [B]. Encoded ONCE into a delayed-length
+            term (placed at the new-frame positions, learned-null elsewhere) and
+            reused across decode steps; the CFG baseline is the learned null.
+        stem_cfg_scale: when set (and stems are given), guide the stem axis with its
+            OWN scale via an extra composed stream, nesting last (tags → lyrics →
+            melody → stem). When None, the stem axis is guided jointly by cfg_scale.
         lyric_ids/lyric_mask: [B, L] phoneme ids + bool mask for the lyric
             conditioning stream. Encoded once and reused across decode steps.
         lyric_ids_neg/lyric_mask_neg: optional *negative* lyric stream for the
@@ -763,6 +903,9 @@ class NanoAudioGPT(nn.Module):
             lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
             lyric_cfg_scale=lyric_cfg_scale,
             melody=melody, melody_cfg_scale=melody_cfg_scale,
+            stem_tokens=stem_tokens, stem_types=stem_types,
+            stem_present=stem_present, target_stem_type=target_stem_type,
+            stem_cfg_scale=stem_cfg_scale,
         ))
         new = (
             torch.cat(chunks, dim=-1) if chunks
@@ -818,6 +961,11 @@ class NanoAudioGPT(nn.Module):
         lyric_cfg_scale: float | None = None,
         melody: torch.Tensor | None = None,
         melody_cfg_scale: float | None = None,
+        stem_tokens: torch.Tensor | None = None,
+        stem_types: torch.Tensor | None = None,
+        stem_present: torch.Tensor | None = None,
+        target_stem_type: torch.Tensor | None = None,
+        stem_cfg_scale: float | None = None,
         emit_every: int = 256,
         first_emit: int | None = None,
     ) -> Iterator[torch.Tensor]:
@@ -912,9 +1060,24 @@ class NanoAudioGPT(nn.Module):
                     if melody is not None else mel_neg
                 )
 
+            # Encode the accompaniment stems ONCE into a delayed-length term (placed
+            # at the new-frame positions), reused across decode steps. The CFG
+            # baseline is the learned null (no target-type, like the other axes drop
+            # their cond entirely). See encode_stem_delayed / _stem_add.
+            stem_pos = stem_neg = None
+            has_stem = self.cfg.use_stem_conditioning and stem_tokens is not None
+            if self.cfg.use_stem_conditioning:
+                stem_neg = self.stem_encoder.null_emb(B, T_delay)  # [B, T_delay, D]
+                stem_pos = (
+                    self.encode_stem_delayed(
+                        stem_tokens, stem_types, stem_present, target_stem_type,
+                        T_delay, offset=T_prompt,
+                    ) if stem_tokens is not None else stem_neg
+                )
+
             has_cond = any(
                 v is not None for v in (text_emb, text_emb_neg, lyric_pos, lyric_neg)
-            ) or has_melody
+            ) or has_melody or has_stem
             composed_lyric = (
                 lyric_cfg_scale is not None and lyric_cfg_scale != 1.0
                 and lyric_pos is not None
@@ -923,24 +1086,33 @@ class NanoAudioGPT(nn.Module):
                 melody_cfg_scale is not None and melody_cfg_scale != 1.0
                 and has_melody
             )
-            use_cfg = (cfg_scale != 1.0 and has_cond) or composed_lyric or composed_melody
+            composed_stem = (
+                stem_cfg_scale is not None and stem_cfg_scale != 1.0
+                and has_stem
+            )
+            use_cfg = (
+                (cfg_scale != 1.0 and has_cond)
+                or composed_lyric or composed_melody or composed_stem
+            )
 
             # Guidance as an ordered list of stages from the CFG baseline to the
             # fully-conditioned state. Each consecutive pair contributes
             # scale_i * (stage_{i+1} - stage_i); axes WITHOUT their own scale are
             # folded into the cfg_scale (tags) step so they're still guided with no
-            # extra forward pass. Nesting order is tags → lyrics → melody.
+            # extra forward pass. Nesting order is tags → lyrics → melody → stem.
             #   logits = stages[0] + Σ scales[i] * (stages[i+1] - stages[i])
-            # Each stage is a full conditioning state {text, lemb, lkv, mel} with
-            # its own KV cache.
+            # Each stage is a full conditioning state {text, lemb, lkv, mel, stem}
+            # with its own KV cache.
             full = {"text": text_emb, "tkv": text_kv_mask,
-                    "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
+                    "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos,
+                    "stem": stem_pos}
             if not use_cfg:
                 stages = [full]
                 scales: list[float] = []
             else:
                 off = {"text": text_emb_neg, "tkv": text_kv_mask_neg,
-                       "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
+                       "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg,
+                       "stem": stem_neg}
                 # The cfg (tags) step turns on everything that isn't separately
                 # composed; composed axes start off and are switched on later.
                 tags_on = dict(full)
@@ -948,6 +1120,8 @@ class NanoAudioGPT(nn.Module):
                     tags_on["lemb"], tags_on["lkv"] = lyric_neg, lyric_kv_neg
                 if composed_melody:
                     tags_on["mel"] = mel_neg
+                if composed_stem:
+                    tags_on["stem"] = stem_neg
                 stages = [off, tags_on]
                 scales = [cfg_scale]
                 if composed_lyric:
@@ -960,6 +1134,11 @@ class NanoAudioGPT(nn.Module):
                     mel_on["mel"] = mel_pos
                     stages.append(mel_on)
                     scales.append(melody_cfg_scale)
+                if composed_stem:
+                    stem_on = dict(stages[-1])
+                    stem_on["stem"] = stem_pos
+                    stages.append(stem_on)
+                    scales.append(stem_cfg_scale)
             for s in stages:
                 s["caches"] = _make_caches()
 
@@ -983,7 +1162,7 @@ class NanoAudioGPT(nn.Module):
                             inp, kv_caches=s["caches"], start_pos=start,
                             text_emb=s["text"], text_kv_mask=s["tkv"],
                             lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
-                            melody_emb=s["mel"],
+                            melody_emb=s["mel"], stem_emb=s["stem"],
                             input_pos=input_pos, attn_mask=attn_mask,
                         )
                     except Exception as e:  # noqa: BLE001 — compile/cudagraph fallback
@@ -997,7 +1176,7 @@ class NanoAudioGPT(nn.Module):
                             inp, kv_caches=s["caches"], start_pos=start,
                             text_emb=s["text"], text_kv_mask=s["tkv"],
                             lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
-                            melody_emb=s["mel"],
+                            melody_emb=s["mel"], stem_emb=s["stem"],
                             input_pos=input_pos, attn_mask=attn_mask,
                         )
                     # Clone: under CUDA graphs the compiled forward's output is a

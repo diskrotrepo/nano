@@ -17,9 +17,11 @@ import types
 import numpy as np
 
 from model.audio_llm_captioner import (
+    CAPTIONER_MARKER,
     MAX_CHARS,
     MAX_WINDOWS,
     SAMPLE_RATE,
+    STEM_CAPTION_KEYS,
     WINDOW_SECONDS,
     AudioLLMCaptioner,
     VLLMAudioCaptioner,
@@ -28,6 +30,8 @@ from model.audio_llm_captioner import (
     _clean,
     load_captioner,
     load_song_windows,
+    parse_gender,
+    parse_stems,
 )
 
 
@@ -108,6 +112,35 @@ def test_clean_handles_empty_and_none():
     assert _clean(None) == ""
 
 
+# --------------------------------- parse_gender ------------------------------
+# The captioner emits a trailing "GENDER: male|female|instrumental" tag; parse_gender
+# splits it off into a canonical label (the vocal-gender source that replaced the
+# F0-on-Demucs estimate) and returns the description with the tag stripped.
+
+def test_parse_gender_canonical_and_strips_tag():
+    desc, g = parse_gender("Soaring synthpop with bright vocals.\nGENDER: female")
+    assert g == "female"
+    assert "GENDER" not in desc.upper() and desc.endswith("vocals.")
+
+
+def test_parse_gender_male_and_dash_and_case_insensitive():
+    assert parse_gender("Gritty blues.\n\nGENDER: male")[1] == "male"
+    assert parse_gender("Lo-fi beat.\ngender - m")[1] == "male"
+    assert parse_gender("Choir.\nGENDER:   Female  ")[1] == "female"
+
+
+def test_parse_gender_instrumental_and_missing_are_none():
+    assert parse_gender("Ambient drone, no singing.\nGENDER: instrumental")[1] is None
+    assert parse_gender("No tag at all.")[1] is None
+    assert parse_gender("")[1] is None
+
+
+def test_parse_gender_does_not_false_match_prose():
+    # "gender-bending" must not be read as a gender tag (no colon/dash + label).
+    desc, g = parse_gender("A gender-bending art-pop number with no marker")
+    assert g is None and desc == "A gender-bending art-pop number with no marker"
+
+
 # ----------------------------- _build_conversation ---------------------------
 
 def test_build_conversation_audio_count_and_instruction():
@@ -150,3 +183,78 @@ def test_both_backends_expose_single_song_contract():
     for cls in (AudioLLMCaptioner, VLLMAudioCaptioner):
         inst = cls()
         assert hasattr(inst, "caption") and hasattr(inst, "caption_path")
+
+
+def test_both_backends_expose_gender_and_stems_contract():
+    # auto_tag / the Modal worker call the *_with_gender_and_stems APIs.
+    for cls in (AudioLLMCaptioner, VLLMAudioCaptioner):
+        inst = cls()
+        assert hasattr(inst, "caption_with_gender_and_stems")
+    assert hasattr(VLLMAudioCaptioner(), "caption_many_with_gender_and_stems")
+
+
+# --------------------------------- parse_stems -------------------------------
+# v5: after GENDER the captioner emits DRUMS:/BASS:/VOCALS:/OTHER: lines, parsed
+# into the per-stem caption dict (the /addstem target-stem tag source).
+
+_FULL = (
+    "A bright synthpop number with shimmering pads and a driving pulse.\n"
+    "GENDER: female\n"
+    "DRUMS: punchy four-on-the-floor kit with crisp closed hats.\n"
+    "BASS: a round analog synth bass walking in syncopated octaves.\n"
+    "VOCALS: an airy female lead, breathy and double-tracked.\n"
+    "OTHER: glassy electric piano and a soaring string pad."
+)
+
+
+def test_parse_stems_extracts_all_four_in_order():
+    rest, stems = parse_stems(_FULL)
+    assert set(stems) == set(STEM_CAPTION_KEYS)
+    assert "analog synth bass" in stems["bass"]
+    assert "four-on-the-floor" in stems["drums"]
+    # The stem lines are stripped; the description + GENDER line survive for
+    # parse_gender (run next in the real pipeline).
+    assert "DRUMS:" not in rest and "BASS:" not in rest
+    desc, gender = parse_gender(rest)
+    assert gender == "female"
+    assert "shimmering pads" in desc and "GENDER" not in desc
+
+
+def test_parse_stems_drops_none_sentinel():
+    text = ("Ambient instrumental drone.\nGENDER: instrumental\n"
+            "DRUMS: none\nBASS: a deep sustained sine swell.\n"
+            "VOCALS: none\nOTHER: bowed metallic textures.")
+    _rest, stems = parse_stems(text)
+    assert "drums" not in stems and "vocals" not in stems  # sentinels dropped
+    assert "bass" in stems and "other" in stems
+
+
+def test_parse_stems_tolerates_missing_and_markdown_and_reorder():
+    text = ("Lo-fi beat.\nGENDER: male\n"
+            "- BASS: woody upright bass.\n"
+            "* DRUMS - brushed jazz kit.")  # reordered, bullets, dash, 2 of 4
+    _rest, stems = parse_stems(text)
+    assert set(stems) == {"bass", "drums"}
+    assert "upright bass" in stems["bass"]
+
+
+def test_parse_stems_empty_and_absent():
+    assert parse_stems("")[1] == {}
+    assert parse_stems("No stem lines here at all.")[1] == {}
+
+
+def test_stem_caption_keys_match_stem_types():
+    # The tags.json stems dict is keyed by STEM_CAPTION_KEYS; the dataset reads it
+    # in STEM_TYPES order — a drift would silently misroute per-stem captions.
+    from model.stem_encoder import STEM_TYPES
+    assert tuple(STEM_CAPTION_KEYS) == tuple(STEM_TYPES)
+
+
+def test_captioner_marker_literal_matches_modal_auto_tag():
+    # modal_auto_tag.py duplicates the marker literal (slim image can't import this
+    # module); they MUST agree or --redo skips/redoes the wrong entries.
+    import re
+    src = (importlib_path := __import__("pathlib").Path(
+        "diskrot/modal_auto_tag.py")).read_text()
+    m = re.search(r'CAPTIONER_MARKER\s*=\s*"([^"]+)"', src)
+    assert m and m.group(1) == CAPTIONER_MARKER

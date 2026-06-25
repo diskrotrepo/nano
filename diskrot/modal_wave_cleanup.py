@@ -34,17 +34,19 @@ image = (
 
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
+stems_vol = modal.Volume.from_name("nano-stems", create_if_missing=True)
 corpus_vol = corpus_mount(read_only=False)  # R2 bucket; only mounted for --drop-mp3
 
 
 @app.function(
     image=image,
     timeout=60 * 60,
-    volumes={"/tokens": tokens_vol, "/melody": melody_vol, "/corpus": corpus_vol},
+    volumes={"/tokens": tokens_vol, "/melody": melody_vol, "/stems": stems_vol,
+             "/corpus": corpus_vol},
 )
 def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) -> int:
-    """Delete wave ``wave_id``'s ``.pt`` (+ ``.mel.npy``, optionally raw ``.mp3``)
-    and remove the now-empty wave dirs. Returns the number of files deleted."""
+    """Delete wave ``wave_id``'s ``.pt`` (+ ``.mel.npy`` + ``.stems.npy``, optionally
+    raw ``.mp3``) and remove the now-empty wave dirs. Returns files deleted."""
     from pathlib import Path
 
     from diskrot.pack_cache import SHARD_INDEX_NAME
@@ -52,6 +54,7 @@ def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) ->
     sub = f"waves/wave_{wave_id}"
     pt_dir = Path("/tokens") / sub
     mel_dir = Path("/melody") / sub
+    stem_dir = Path("/stems") / sub
     mp3_dir = Path("/corpus") / sub
 
     # Safety: never discard intermediates that were never folded into shards.
@@ -66,22 +69,24 @@ def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) ->
 
     pts = list(pt_dir.glob("*.pt"))
     mels = list(mel_dir.glob("*.mel.npy"))
+    stems = list(stem_dir.glob("*.stems.npy"))
     mp3s = list(mp3_dir.glob("*.mp3")) if drop_mp3 else []
-    print(f"[cleanup wave {wave_id}] {len(pts)} .pt, {len(mels)} .mel.npy"
+    print(f"[cleanup wave {wave_id}] {len(pts)} .pt, {len(mels)} .mel.npy, "
+          f"{len(stems)} .stems.npy"
           + (f", {len(mp3s)} .mp3" if drop_mp3 else "")
           + ("" if apply else "  — DRY RUN (pass --apply to delete)"), flush=True)
     if not apply:
         return 0
 
     deleted = 0
-    for p in pts + mels + mp3s:
+    for p in pts + mels + stems + mp3s:
         try:
             p.unlink()
             deleted += 1
         except FileNotFoundError:
             pass  # idempotent: already gone
     # Best-effort: drop the now-empty wave dirs so they don't linger as inodes.
-    dirs = [pt_dir, mel_dir] + ([mp3_dir] if drop_mp3 else [])
+    dirs = [pt_dir, mel_dir, stem_dir] + ([mp3_dir] if drop_mp3 else [])
     for d in dirs:
         try:
             if d.exists() and not any(d.iterdir()):
@@ -90,6 +95,7 @@ def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) ->
             pass
     tokens_vol.commit()
     melody_vol.commit()
+    stems_vol.commit()
     # corpus is an R2 CloudBucketMount: --drop-mp3 unlinks flush through the mount, no commit().
     print(f"[cleanup wave {wave_id}] deleted {deleted} files — inodes reclaimed",
           flush=True)

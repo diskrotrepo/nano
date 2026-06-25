@@ -1,4 +1,8 @@
-"""Modal entrypoint for lyrics transcription (Demucs + Whisper).
+"""Modal entrypoint for lyrics transcription (Whisper on the raw mix).
+
+Demucs-free: large-v3-turbo + VAD transcribes the mono mix directly (separation is
+a no-op-to-worse ASR input per arXiv:2506.15514) and vocal gender comes from the
+audio-LLM captioner (tags.json), so there is no vocal-isolation or F0 pass.
 
 Uses multiple GPU containers in parallel via Modal's class pattern.
 
@@ -33,18 +37,15 @@ image = (
         "numpy>=1.26",
         "tqdm>=4.66",
         "soundfile>=0.12",
-        "demucs",
         "faster-whisper",
     )
     .run_commands("pip install 'protobuf>=4'")
-    # Cache the Demucs htdemucs weights into the image layer. MUST be run_commands
-    # (a pure shell step), NOT run_function: a build-time run_function imports this
-    # module to find the callable, but `diskrot` is only added by the
-    # add_local_python_source below (copy=False → absent at build time), so the
-    # top-level `from diskrot...` import fails with ModuleNotFoundError.
-    .run_commands(
-        "python -c \"from demucs.pretrained import get_model; get_model('htdemucs')\""
-    )
+    # Demucs is gone from transcribe: Whisper runs on the raw mix (large-v3-turbo +
+    # VAD makes separation a no-op-to-worse ASR input, arXiv:2506.15514) and vocal
+    # gender comes from the audio-LLM captioner, so there is nothing left to isolate.
+    # Dropping the demucs dep + the htdemucs weight bake also frees the VRAM that
+    # capped @modal.concurrent at 2 — see the class below. (torch stays: it's a
+    # top-level import in diskrot.transcribe_lyrics.)
     .add_local_python_source("model", "diskrot")
 )
 
@@ -55,9 +56,9 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 @app.cls(
     image=image,
     gpu="L4",
-    # 4 cores so the two @modal.concurrent inputs' CPU work (ffmpeg decode,
-    # 44.1→16k resample, Silero VAD, the pyin gender Viterbi) doesn't contend —
-    # same pattern as the structure sibling stage.
+    # 4 cores so the concurrent inputs' CPU work (ffmpeg decode, 44.1→16k resample,
+    # Silero VAD) doesn't contend — same pattern as the structure sibling stage.
+    # (The pyin gender Viterbi is gone — gender comes from the audio-LLM captioner.)
     cpu=4.0,
     timeout=60 * 60,
     max_containers=50,
@@ -69,12 +70,13 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-# Two inputs per container overlaps one song's GPU work (Demucs/Whisper) with the
-# other's GPU-idle CPU tail (resample/VAD/pyin), raising L4 utilization at no FLOP
-# cost. Capped at 2: the structure sibling found 4 ballooned the neural step
-# ~4s→20s from GPU contention; htdemucs activations on full-length tracks are the
-# VRAM driver, so 2 concurrent long tracks is the safe ceiling on the L4's 24 GB.
-@modal.concurrent(max_inputs=2)
+# Concurrent inputs per container overlap one song's GPU work (Whisper) with the
+# others' GPU-idle CPU tails (ffmpeg decode + 44.1→16k resample), raising L4
+# utilization at no FLOP cost. Raised 2→4 now that Demucs is gone: htdemucs
+# activations on full-length tracks were the VRAM driver that capped it at 2;
+# large-v3-turbo alone (4 decoder layers, float16) is light enough that 4 concurrent
+# tracks fit the L4's 24 GB. Raise further if utilization still has headroom.
+@modal.concurrent(max_inputs=4)
 class Transcriber:
     @modal.enter()
     def load_models(self):
@@ -89,18 +91,15 @@ class Transcriber:
         import torch._dynamo.external_utils  # noqa: F401  (third observed lazy-import poison, 2026-06-11)
         import librosa
 
+        # Warm the one librosa kernel the Demucs-free path still hits (44.1→16k
+        # resample). pyin is no longer warmed — the F0 gender estimate is gone
+        # (gender now comes from the audio-LLM captioner).
         librosa.resample(np.zeros(1600, dtype=np.float32), orig_sr=44100, target_sr=16000)
-        librosa.pyin(np.zeros(8000, dtype=np.float32), sr=16000, fmin=65.0, fmax=1047.0)
 
-        from demucs.apply import apply_model
-        from demucs.pretrained import get_model
         from faster_whisper import WhisperModel
 
-        self.demucs_model = get_model("htdemucs")
-        self.demucs_model.to("cuda")
-        self.demucs_model.eval()
-        self.apply_fn = apply_model
-        # large-v3-turbo: 4 decoder layers vs 32, ~4-6x faster ASR at near-identical
+        # No Demucs: Whisper runs on the raw mix (see the image comment / class
+        # docstring). large-v3-turbo: 4 decoder layers vs 32, ~4-6x faster ASR at near-identical
         # transcription quality. The first ~30k songs were done with large-v3; the
         # transcript mix is fine for training data.
         self.whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
@@ -132,23 +131,19 @@ class Transcriber:
         self.consecutive_failures = 0
 
     @modal.method()
-    def transcribe_file(self, mp3_name: str, skip_demucs: bool = False) -> tuple[str, dict | None, str | None]:
+    def transcribe_file(self, mp3_name: str) -> tuple[str, dict | None, str | None]:
         """Transcribe a single file. Returns (stem, result_or_None, error_or_None).
 
-        ``skip_demucs`` runs Whisper on the raw mix (keeping a short Demucs-lite
-        clip for the gender F0) — the transcribe-cost lever; see
-        transcribe_lyrics._prepare_transcribe_audio. Passed per-run via the
-        orchestrator's .map(kwargs=...) so no redeploy / modal.parameter is needed
-        (the class still carries no parameter fields, keeping it clear of the
-        PEP 563 modal.parameter pitfall)."""
-        from diskrot.transcribe_lyrics import _prepare_transcribe_audio, _transcribe
+        Demucs-free: Whisper runs on the raw mono mix and gender is not estimated
+        here (it comes from the audio-LLM captioner / tags.json). large-v3-turbo +
+        VAD on the mix is an equal-or-better ASR input (arXiv:2506.15514)."""
+        from diskrot.transcribe_lyrics import _load_mix_mono, _transcribe
 
         mp3_path = Path("/corpus") / mp3_name
         key = mp3_path.stem
         try:
-            asr_vocals, gender_vocals = _prepare_transcribe_audio(
-                self.demucs_model, self.apply_fn, mp3_path, "cuda", skip_demucs=skip_demucs)
-            result = _transcribe(self.whisper_model, asr_vocals, gender_vocals)
+            mix_mono = _load_mix_mono(mp3_path)
+            result = _transcribe(self.whisper_model, mix_mono, estimate_gender=False)
             with self._fail_lock:
                 self.consecutive_failures = 0
             return (key, result, None)
@@ -355,7 +350,7 @@ def _release_lock() -> None:
     nonpreemptible=True,
 )
 def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
-                redo_missing_language: bool = False, skip_demucs: bool = False):
+                redo_missing_language: bool = False):
     """Dispatch transcription and merge results into the sharded lyrics dir.
     ``wave_id`` scopes the pass to /corpus/waves/wave_<id>. ``redo_missing_language``
     additionally re-transcribes legacy entries that lack a ``language`` field.
@@ -412,8 +407,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                 return
             prev_pending = len(pending)
             print(f"sweep {sweep}: {len(pending)} pending, dispatching in "
-                  f"chunks of {chunk_size} (flush_every={flush_every}"
-                  f"{', SKIP-DEMUCS: Whisper on raw mix' if skip_demucs else ''})...")
+                  f"chunks of {chunk_size} (flush_every={flush_every}; "
+                  f"Demucs-free: Whisper on raw mix)...")
 
             n_seen = n_errors = n_inband = 0
             # n_inband: per-file errors (returned, not raised) — these stay
@@ -433,8 +428,7 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                 # file stays pending (not in the shards) and is re-queued by
                 # the next sweep.
                 for result in transcriber.transcribe_file.map(
-                    chunk, kwargs={"skip_demucs": skip_demucs},
-                    order_outputs=False, return_exceptions=True
+                    chunk, order_outputs=False, return_exceptions=True
                 ):
                     n_seen += 1
                     if isinstance(result, Exception):
@@ -476,7 +470,7 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
 
 @app.local_entrypoint()
 def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
-         redo_missing_language: bool = False, skip_demucs: bool = False):
+         redo_missing_language: bool = False):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are
@@ -485,15 +479,13 @@ def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
     --wave-id N scopes transcription to /corpus/waves/wave_N.
     --redo-missing-language re-transcribes legacy entries lacking a ``language``
     field (the forced-English 128k) — auto-detect overwrites them.
-    --skip-demucs runs Whisper on the raw mix (Demucs only on a short gender
-    clip) — the ~25-37%-of-wave cost lever. Gate it by running ONE wave with it
-    on, then `modal run diskrot/modal_lyrics_stats.py --wave-id <id>` to confirm
-    the instrumental %, word count, gender and language stats match the
-    Demucs-transcribed corpus before keeping it for the rest.
+
+    Transcribe is Demucs-free: Whisper runs on the raw mix (large-v3-turbo + VAD
+    is an equal-or-better ASR input, arXiv:2506.15514) and vocal gender comes from
+    the audio-LLM captioner (tags.json), so there is no separation step or F0 pass.
     """
     call = orchestrate.spawn(flush_every, chunk_size, wave_id=wave_id,
-                             redo_missing_language=redo_missing_language,
-                             skip_demucs=skip_demucs)
+                             redo_missing_language=redo_missing_language)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

@@ -182,6 +182,17 @@ def _prepare_transcribe_audio(
     return stem, None
 
 
+def _load_mix_mono(audio_path: str | Path) -> np.ndarray:
+    """Raw mono mix @44100Hz — the ASR input for the Demucs-free transcribe path.
+
+    The Modal transcribe stage runs Whisper directly on this (no vocal isolation):
+    large-v3-turbo + VAD on the mix is an equal-or-better ASR input (arXiv:2506.15514),
+    and vocal gender now comes from the audio-LLM captioner, so there is nothing left
+    for Demucs to do in transcribe. (The Demucs helpers above are kept for the server
+    /stem path and the lyric-WER eval scripts, which still isolate vocals.)"""
+    return _ffmpeg_load_stereo(audio_path, 44100).mean(axis=0)
+
+
 # Vocal-gender labeling (F0 heuristic) ----------------------------------------
 # Median voiced pitch of the isolated vocal stem splits male vs female robustly
 # enough for a conditioning marker: male singing F0 clusters well below female.
@@ -226,16 +237,20 @@ def estimate_vocal_gender(vocals: np.ndarray, sr: int) -> str | None:
 
 
 def _transcribe(whisper_model, asr_vocals: np.ndarray,
-                gender_vocals: np.ndarray | None = None) -> dict | None:
-    """Transcribe ``asr_vocals`` (mono @44100Hz). Returns {text, words, gender, ...} or None.
+                gender_vocals: np.ndarray | None = None,
+                estimate_gender: bool = True) -> dict | None:
+    """Transcribe ``asr_vocals`` (mono @44100Hz). Returns {text, words, ...} or None.
 
     ``asr_vocals`` is what Whisper sees — the isolated vocal stem (normal path) or
-    the raw mix (skip-Demucs path). ``gender_vocals`` is the clean vocal signal for
-    the F0 gender estimate; when None the ASR signal IS the stem and is reused (no
-    second resample). ``gender`` is the F0-estimated vocal gender ("male"/"female"
-    /None); it rides in the same per-song entry the dataset reads, so the gender
-    marker is wired with no extra store. None entries (instrumental) carry no
-    gender at all."""
+    the raw mix (Demucs-free path). ``gender_vocals`` is the clean vocal signal for
+    the legacy F0 gender estimate; when None the ASR signal IS the stem and is
+    reused (no second resample).
+
+    ``estimate_gender=False`` (the v9 Modal path) skips the F0 gender estimate
+    entirely — vocal gender now comes from the audio-LLM captioner, so transcribe
+    runs Whisper-on-mix with no Demucs. The output dict then omits ``gender`` and
+    the dataset sources it from tags.json. ``estimate_gender=True`` (default) keeps
+    the legacy F0 ``gender`` field for any caller still on the Demucs path."""
     # faster-whisper expects 16kHz
     import librosa
 
@@ -267,22 +282,24 @@ def _transcribe(whisper_model, asr_vocals: np.ndarray,
     if not full_text:
         return None
 
-    # Gender F0 on a CLEAN vocal signal at 16 kHz (Nyquist 8 kHz >> vocal F0;
-    # cheaper than 44.1): the reused ASR stem (normal path) or the separate
-    # Demucs-lite clip (skip-Demucs path, where vocals_16k is the raw mix and
-    # would give a bass/drum-polluted median).
-    gender_16k = vocals_16k if gender_vocals is None else librosa.resample(
-        gender_vocals, orig_sr=44100, target_sr=16000)
-    gender = estimate_vocal_gender(gender_16k, sr=16000)
     avg_logprob = round(sum(seg_logprobs) / len(seg_logprobs), 4) if seg_logprobs else None
-    return {
+    result = {
         "text": full_text,
         "words": words,
-        "gender": gender,
         "language": info.language,
         "language_probability": round(info.language_probability, 4),
         "avg_logprob": avg_logprob,
     }
+    if estimate_gender:
+        # Legacy F0 path: gender on a CLEAN vocal signal at 16 kHz (Nyquist 8 kHz >>
+        # vocal F0; cheaper than 44.1) — the reused ASR stem (normal path) or the
+        # separate Demucs-lite clip (where vocals_16k is the raw mix and would give a
+        # bass/drum-polluted median). The v9 Modal path passes estimate_gender=False
+        # and gets gender from the audio-LLM captioner instead.
+        gender_16k = vocals_16k if gender_vocals is None else librosa.resample(
+            gender_vocals, orig_sr=44100, target_sr=16000)
+        result["gender"] = estimate_vocal_gender(gender_16k, sr=16000)
+    return result
 
 
 def _flush_shards(lyrics_dir: Path, lyrics: dict, dirty: set[int]) -> None:

@@ -83,6 +83,18 @@ _MEL_DTYPE = np.float16
 _MEL_BYTES_PER_ELEM = 2
 _MEL_EXT = ".mel.npy"  # per-song chroma file (NOT *.pt — keeps the token glob clean)
 
+# Parallel stem-token sidecar (the /addstem path), written at the SAME per-song
+# offsets as the token .bin. Per song the 4 stems (drums/bass/vocals/other) are
+# stored as int16 codes shaped [_N_STEMS, n_codebooks, T] and flattened into
+# [_N_STEMS * n_codebooks, total_T] in the .stem.bin. Unlike melody, a zero token
+# is a VALID code, so a missing song cannot be encoded by zeros alone — each
+# shard's meta carries a per-song ``stem_present`` bool list (False = no real
+# stems → the dataset masks that song out of stem-add training).
+_N_STEMS = 4  # len(model.stem_encoder.STEM_TYPES); the stem-type axis order
+_STEM_DTYPE = np.int16
+_STEM_BYTES_PER_ELEM = 2
+_STEM_EXT = ".stems.npy"  # per-song stem-token file (must match diskrot.stems / modal_stems)
+
 
 def _shard_bin_name(shard_id: int) -> str:
     return f"{SHARD_PREFIX}{shard_id:03d}.bin"
@@ -90,6 +102,10 @@ def _shard_bin_name(shard_id: int) -> str:
 
 def _shard_mel_bin_name(shard_id: int) -> str:
     return f"{SHARD_PREFIX}{shard_id:03d}.mel.bin"
+
+
+def _shard_stem_bin_name(shard_id: int) -> str:
+    return f"{SHARD_PREFIX}{shard_id:03d}.stem.bin"
 
 
 def _shard_meta_name(shard_id: int) -> str:
@@ -102,6 +118,7 @@ def _shard_is_valid(
     expected_names: list[str],
     n_codebooks: int | None,
     expect_melody: bool = False,
+    expect_stems: bool = False,
 ) -> dict | None:
     """Return the shard's loaded meta dict iff it is complete-and-valid on disk,
     else None (caller rebuilds).
@@ -162,6 +179,23 @@ def _shard_is_valid(
         if not mel_bin.exists():
             return None
         if mel_bin.stat().st_size != _N_CHROMA * int(total_T) * _MEL_BYTES_PER_ELEM:
+            return None
+    # 10. stem sidecar (only when this pack is producing one): the .stem.bin must
+    # exist, be flagged in the meta with a per-song present list of the right
+    # length, and be size-consistent. Membership mirrors the token .bin.
+    if expect_stems:
+        if not meta.get("has_stems"):
+            return None
+        present = meta.get("stem_present")
+        if not isinstance(present, list) or len(present) != len(names):
+            return None
+        stem_bin = out_dir / _shard_stem_bin_name(shard_id)
+        if not stem_bin.exists():
+            return None
+        expected_stem_bytes = (
+            _N_STEMS * int(meta_k) * int(total_T) * _STEM_BYTES_PER_ELEM
+        )
+        if stem_bin.stat().st_size != expected_stem_bytes:
             return None
     return meta
 
@@ -243,6 +277,57 @@ def _load_shard_chroma(
     return mel_arrays, n_missing
 
 
+def _load_shard_stems(
+    member_files: list[Path],
+    offsets: list[int],
+    stem_cache_dir: Path,
+    n_codebooks: int,
+    n_workers: int,
+) -> tuple[list[np.ndarray], list[bool], int]:
+    """Load one shard's per-song stem tokens, aligned to ``offsets``.
+
+    Each song's ``<name>.stems.npy`` is ``[_N_STEMS, n_codebooks, n_frames]`` int16.
+    Membership stays identical to the token .bin: a missing/mismatched stem file is
+    ZERO-filled and flagged absent in the returned ``present`` list (a zero token is
+    a valid code, so absence MUST be carried explicitly, not inferred from zeros).
+    Returns ``(stem_arrays, present, n_missing)`` — each array
+    ``[_N_STEMS * n_codebooks, frames]`` ready to blit into the .stem.bin.
+    """
+    frame_counts = [offsets[j + 1] - offsets[j] for j in range(len(member_files))]
+
+    def _load_stem(arg: "tuple[Path, int]") -> "np.ndarray | None":
+        path, n_frames = arg
+        sp = stem_cache_dir / (path.stem + _STEM_EXT)
+        try:
+            if not sp.exists():
+                return None
+            arr = np.load(sp)
+        except OSError:
+            return None
+        except Exception:  # noqa: BLE001 — any other load failure = missing
+            return None
+        if (arr.ndim != 3 or arr.shape[0] != _N_STEMS
+                or arr.shape[1] != n_codebooks or arr.shape[2] != n_frames):
+            return None
+        return np.ascontiguousarray(arr, dtype=_STEM_DTYPE)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        loaded = list(ex.map(_load_stem, zip(member_files, frame_counts)))
+    stem_arrays: list[np.ndarray] = []
+    present: list[bool] = []
+    n_missing = 0
+    for j, arr in enumerate(loaded):
+        if arr is None:
+            n_missing += 1
+            arr = np.zeros((_N_STEMS, n_codebooks, frame_counts[j]), dtype=_STEM_DTYPE)
+            present.append(False)
+        else:
+            present.append(True)
+        # Flatten the stem-type axis into the codebook axis for the .stem.bin.
+        stem_arrays.append(arr.reshape(_N_STEMS * n_codebooks, frame_counts[j]))
+    return stem_arrays, present, n_missing
+
+
 def _write_shard_files(
     out_dir: Path,
     shard_id: int,
@@ -252,11 +337,14 @@ def _write_shard_files(
     shard_names: list[str],
     mel_arrays: "list[np.ndarray] | None",
     pack_melody: bool,
+    stem_arrays: "list[np.ndarray] | None" = None,
+    stem_present: "list[bool] | None" = None,
+    pack_stems: bool = False,
 ) -> None:
-    """Write a shard's token .bin, optional .mel.bin, then its .json meta — each
-    via temp + atomic ``os.replace``, the .json LAST as the commit marker that
-    ``_shard_is_valid`` keys on. Shared by ``pack_append`` (and mirrors ``pack``'s
-    inline writer) so both produce a byte-identical layout.
+    """Write a shard's token .bin, optional .mel.bin / .stem.bin, then its .json meta
+    — each via temp + atomic ``os.replace``, the .json LAST as the commit marker
+    that ``_shard_is_valid`` keys on. Shared by ``pack_append`` (and mirrors
+    ``pack``'s inline writer) so both produce a byte-identical layout.
     """
     shard_total_T = offsets[-1]
     bin_path = out_dir / _shard_bin_name(shard_id)
@@ -286,6 +374,20 @@ def _write_shard_files(
         finally:
             del mm_mel
         os.replace(mel_tmp, mel_bin_path)
+    if stem_arrays is not None:
+        stem_bin_path = out_dir / _shard_stem_bin_name(shard_id)
+        stem_tmp = out_dir / (_shard_stem_bin_name(shard_id) + ".tmp")
+        mm_stem = np.memmap(
+            stem_tmp, dtype=_STEM_DTYPE, mode="w+",
+            shape=(_N_STEMS * int(n_codebooks), int(shard_total_T)),
+        )
+        try:
+            for j, arr in enumerate(stem_arrays):
+                mm_stem[:, offsets[j]:offsets[j + 1]] = arr
+            mm_stem.flush()
+        finally:
+            del mm_stem
+        os.replace(stem_tmp, stem_bin_path)
     meta = {
         "format_version": FORMAT_VERSION,
         "shard_id": shard_id,
@@ -296,6 +398,9 @@ def _write_shard_files(
         "names": shard_names,
         "has_melody": pack_melody,
         "n_chroma": _N_CHROMA if pack_melody else 0,
+        "has_stems": pack_stems,
+        "n_stems": _N_STEMS if pack_stems else 0,
+        "stem_present": (stem_present if pack_stems else None),
     }
     meta_path = out_dir / _shard_meta_name(shard_id)
     meta_tmp = out_dir / (_shard_meta_name(shard_id) + ".tmp")
@@ -312,6 +417,7 @@ def pack_append(
     verbose: bool = True,
     commit_cb: Callable[[], None] | None = None,
     mel_cache_dir: str | Path | None = None,
+    stem_cache_dir: str | Path | None = None,
 ) -> Path:
     """Append one wave's ``*.pt`` to an existing ``packed/`` dir as NEW shards.
 
@@ -343,9 +449,12 @@ def pack_append(
     out_dir.mkdir(parents=True, exist_ok=True)
     mel_cache_dir = Path(mel_cache_dir) if mel_cache_dir is not None else None
     pack_melody = mel_cache_dir is not None
+    stem_cache_dir = Path(stem_cache_dir) if stem_cache_dir is not None else None
+    pack_stems = stem_cache_dir is not None
 
     files = sorted(
-        p for p in wave_dir.glob("*.pt") if not p.name.endswith(_MEL_EXT)
+        p for p in wave_dir.glob("*.pt")
+        if not (p.name.endswith(_MEL_EXT) or p.name.endswith(_STEM_EXT))
     )
     if not files:
         raise FileNotFoundError(f"no .pt files in {wave_dir}")
@@ -370,12 +479,26 @@ def pack_append(
                 "the global has_melody flag inconsistent. Omit mel_cache_dir."
             )
         has_melody = existing_has_melody
+        existing_has_stems = bool(existing_index.get("has_stems", False))
+        if existing_has_stems and not pack_stems:
+            raise ValueError(
+                "existing pack has has_stems=True — pass stem_cache_dir so the "
+                "appended shards carry stems (missing songs are zero-filled + "
+                "flagged absent)."
+            )
+        if pack_stems and not existing_has_stems:
+            raise ValueError(
+                "existing pack has has_stems=False — appending stems would make "
+                "the global has_stems flag inconsistent. Omit stem_cache_dir."
+            )
+        has_stems = existing_has_stems
     else:
         base_shard_id = 0
         existing_shards = []
         n_codebooks = None  # resolved from the wave's first tensor (cold start)
         n_songs_prior = 0
         has_melody = pack_melody
+        has_stems = pack_stems
 
     if verbose:
         print(f"[pack-append] {len(files)} files in {wave_dir} -> shards "
@@ -407,6 +530,7 @@ def pack_append(
     n_new_songs = 0
     n_skipped = 0
     n_mel_missing = 0
+    n_stem_missing = 0
     corrupt_files: list[str] = []
 
     for local_shard in range(n_new_shards):
@@ -419,7 +543,8 @@ def pack_append(
 
         # Resume: skip a new shard already complete-and-valid on disk.
         existing = _shard_is_valid(
-            out_dir, shard_id, expected_names, n_codebooks, expect_melody=pack_melody,
+            out_dir, shard_id, expected_names, n_codebooks,
+            expect_melody=pack_melody, expect_stems=pack_stems,
         )
         if existing is not None:
             if n_codebooks is None:
@@ -473,12 +598,20 @@ def pack_append(
             mel_arrays, shard_mel_missing = _load_shard_chroma(
                 member_files, offsets, mel_cache_dir, n_workers)
             n_mel_missing += shard_mel_missing
+        stem_arrays = stem_present = None
+        if pack_stems:
+            stem_arrays, stem_present, shard_stem_missing = _load_shard_stems(
+                member_files, offsets, stem_cache_dir, n_codebooks, n_workers)
+            n_stem_missing += shard_stem_missing
         _write_shard_files(
             out_dir, shard_id, tensors, offsets, n_codebooks,
-            expected_names, mel_arrays, pack_melody)
+            expected_names, mel_arrays, pack_melody,
+            stem_arrays=stem_arrays, stem_present=stem_present, pack_stems=pack_stems)
         del tensors
         if mel_arrays is not None:
             del mel_arrays
+        if stem_arrays is not None:
+            del stem_arrays
         new_entries.append({
             "shard_id": shard_id,
             "n_songs": len(member_files),
@@ -507,6 +640,8 @@ def pack_append(
         "shards": merged_shards,
         "has_melody": has_melody,
         "n_chroma": _N_CHROMA if has_melody else 0,
+        "has_stems": has_stems,
+        "n_stems": _N_STEMS if has_stems else 0,
     }
     index_tmp = out_dir / (SHARD_INDEX_NAME + ".tmp")
     with open(index_tmp, "w") as f:
@@ -548,6 +683,7 @@ def pack(
     verbose: bool = True,
     commit_cb: Callable[[], None] | None = None,
     mel_cache_dir: str | Path | None = None,
+    stem_cache_dir: str | Path | None = None,
 ) -> Path:
     """Single-pass per-shard parallel pack of every ``*.pt`` in ``cache_dir``.
 
@@ -581,11 +717,15 @@ def pack(
     mel_cache_dir = Path(mel_cache_dir) if mel_cache_dir is not None else None
     pack_melody = mel_cache_dir is not None
     n_mel_missing = 0  # per-song chroma absent/mismatched -> zero-filled (counted)
+    stem_cache_dir = Path(stem_cache_dir) if stem_cache_dir is not None else None
+    pack_stems = stem_cache_dir is not None
+    n_stem_missing = 0  # per-song stems absent/mismatched -> zero-filled + flagged absent
 
-    # Exclude the chroma sidecars from the token glob (they also end in ".pt"-free
-    # ".mel.npy", but guard defensively in case a future ext collides).
+    # Exclude the chroma/stem sidecars from the token glob (defensive — they live on
+    # their own volumes, but guard in case a future layout co-locates them).
     files = sorted(
-        p for p in cache_dir.glob("*.pt") if not p.name.endswith(_MEL_EXT)
+        p for p in cache_dir.glob("*.pt")
+        if not (p.name.endswith(_MEL_EXT) or p.name.endswith(_STEM_EXT))
     )
     if not files:
         raise FileNotFoundError(f"no .pt files in {cache_dir}")
@@ -646,7 +786,8 @@ def pack(
 
         # ---- Resume: skip a shard already complete-and-valid on disk ----
         existing = _shard_is_valid(
-            out_dir, shard_id, expected_names, n_codebooks, expect_melody=pack_melody,
+            out_dir, shard_id, expected_names, n_codebooks,
+            expect_melody=pack_melody, expect_stems=pack_stems,
         )
         if existing is not None:
             if n_codebooks is None:
@@ -756,6 +897,17 @@ def pack(
                     arr = np.zeros((_N_CHROMA, frame_counts[j]), dtype=_MEL_DTYPE)
                 mel_arrays.append(arr)
 
+        # ---- Load this shard's per-song stem tokens (if packing stems) ----
+        # Membership stays identical to the token .bin: a missing/mismatched stem
+        # file is zero-filled AND flagged absent in stem_present (a zero token is a
+        # valid code, so absence must be carried explicitly, never inferred).
+        stem_arrays: list[np.ndarray] | None = None
+        stem_present: list[bool] | None = None
+        if pack_stems:
+            stem_arrays, stem_present, shard_stem_missing = _load_shard_stems(
+                member_files, offsets, stem_cache_dir, int(n_codebooks), n_workers)
+            n_stem_missing += shard_stem_missing
+
         # Write the .bin to a temp path, then atomically rename. A preemption
         # mid-blit leaves only the .tmp (ignored on resume), never a partial
         # packed_NNN.bin that could look valid.
@@ -795,6 +947,23 @@ def pack(
             del mel_arrays
             os.replace(mel_tmp, mel_bin_path)
 
+        # ---- Parallel stem .bin at the SAME offsets (temp + atomic rename) ----
+        if stem_arrays is not None:
+            stem_bin_path = out_dir / _shard_stem_bin_name(shard_id)
+            stem_tmp = out_dir / (_shard_stem_bin_name(shard_id) + ".tmp")
+            mm_stem = np.memmap(
+                stem_tmp, dtype=_STEM_DTYPE, mode="w+",
+                shape=(_N_STEMS * int(n_codebooks), int(shard_total_T)),
+            )
+            try:
+                for j, arr in enumerate(stem_arrays):
+                    mm_stem[:, offsets[j]:offsets[j + 1]] = arr
+                mm_stem.flush()
+            finally:
+                del mm_stem
+            del stem_arrays
+            os.replace(stem_tmp, stem_bin_path)
+
         # Sidecar metadata for this shard, written LAST (after the .bin is in
         # place) via temp + atomic rename — its presence is the commit marker
         # that _shard_is_valid keys on.
@@ -808,6 +977,9 @@ def pack(
             "names": shard_names,
             "has_melody": pack_melody,
             "n_chroma": _N_CHROMA if pack_melody else 0,
+            "has_stems": pack_stems,
+            "n_stems": _N_STEMS if pack_stems else 0,
+            "stem_present": (stem_present if pack_stems else None),
         }
         meta_path = out_dir / _shard_meta_name(shard_id)
         meta_tmp = out_dir / (_shard_meta_name(shard_id) + ".tmp")
@@ -871,6 +1043,13 @@ def pack(
                   f"— zero-filled (still packed, treated as 'no melody')", flush=True)
         else:
             print("[pack] melody: chroma packed for all songs", flush=True)
+    if pack_stems and verbose:
+        if n_stem_missing:
+            print(f"[pack] stems: {n_stem_missing} song(s) had no/mismatched stems "
+                  f"— zero-filled + flagged absent (skipped as stem-add targets)",
+                  flush=True)
+        else:
+            print("[pack] stems: stems packed for all songs", flush=True)
 
     index_payload = {
         "format_version": FORMAT_VERSION,
@@ -881,6 +1060,8 @@ def pack(
         "shards": index_entries,
         "has_melody": pack_melody,
         "n_chroma": _N_CHROMA if pack_melody else 0,
+        "has_stems": pack_stems,
+        "n_stems": _N_STEMS if pack_stems else 0,
     }
     index_tmp = out_dir / (SHARD_INDEX_NAME + ".tmp")
     with open(index_tmp, "w") as f:
@@ -951,6 +1132,26 @@ def open_shard_mel_mmap(out_dir: str | Path, shard_id: int) -> tuple[np.memmap, 
     return mm, meta
 
 
+def open_shard_stem_mmap(out_dir: str | Path, shard_id: int) -> tuple[np.memmap, dict]:
+    """Open shard ``shard_id``'s parallel stem sidecar as a read-only ``np.memmap``
+    of shape [_N_STEMS * n_codebooks, total_T] int16, at the SAME per-song offsets
+    as the token bin. The dataset reshapes a crop to [_N_STEMS, n_codebooks, T] and
+    consults ``meta["stem_present"]`` for which songs have real stems. Raises if the
+    shard was packed without stems."""
+    out_dir = Path(out_dir)
+    meta = load_shard_meta(out_dir, shard_id)
+    if not meta.get("has_stems"):
+        raise FileNotFoundError(
+            f"shard {shard_id:03d} has no stem sidecar — repack with stem_cache_dir"
+        )
+    mm = np.memmap(
+        out_dir / _shard_stem_bin_name(shard_id),
+        dtype=_STEM_DTYPE, mode="r",
+        shape=(_N_STEMS * int(meta["n_codebooks"]), int(meta["total_T"])),
+    )
+    return mm, meta
+
+
 def iter_all_names(out_dir: str | Path) -> Iterable[tuple[int, int, str, int]]:
     """Yield ``(shard_id, local_idx, name, n_frames)`` for every song across
     all shards, in deterministic shard order. Lets the dataset build a global
@@ -980,6 +1181,10 @@ if __name__ == "__main__":
     p.add_argument("--mel-cache-dir", type=str, default=None,
                    help="dir of per-song <name>.mel.npy chroma (from diskrot.melody / "
                         "modal_melody); when set, packs a parallel packed_NNN.mel.bin")
+    p.add_argument("--stem-cache-dir", type=str, default=None,
+                   help="dir of per-song <name>.stems.npy stem tokens (from "
+                        "diskrot.stems / modal_stems); when set, packs a parallel "
+                        "packed_NNN.stem.bin for the /addstem path")
     p.add_argument("--append", action="store_true",
                    help="append --cache-dir's .pt as NEW shards to --out-dir's "
                         "existing pack (merge the index), instead of a full repack")
@@ -989,7 +1194,8 @@ if __name__ == "__main__":
             raise SystemExit("--append requires --out-dir (the existing packed/ dir)")
         pack_append(args.cache_dir, args.out_dir,
                     shard_target_songs=args.shard_target_songs,
-                    mel_cache_dir=args.mel_cache_dir)
+                    mel_cache_dir=args.mel_cache_dir,
+                    stem_cache_dir=args.stem_cache_dir)
     else:
         pack(args.cache_dir, args.out_dir, shard_target_songs=args.shard_target_songs,
-             mel_cache_dir=args.mel_cache_dir)
+             mel_cache_dir=args.mel_cache_dir, stem_cache_dir=args.stem_cache_dir)

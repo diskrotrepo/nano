@@ -133,7 +133,7 @@ def eval_ablation(
         return total.item()
 
     with torch.no_grad():
-        for i, (batch, tags, lyric_ids, lyric_mask) in enumerate(loader):
+        for i, (batch, tags, lyric_ids, lyric_mask, *_) in enumerate(loader):
             if i >= n_batches:
                 break
             n_seen += lyric_ids.shape[0]

@@ -1,25 +1,27 @@
 """Token-domain stem encoder for generative stem conditioning (the /addstem path).
 
-The generative inverse of the Demucs ``/stem`` removal: given a SOURCE stem (e.g.
-a drum loop) the model generates a full mix built around it. Unlike melody (a
-lossy 12-bin chroma) this conditions on the source stem's FULL SpectroStream
-tokens — same fidelity the model itself works in — so no audio information is
-thrown away (the user picked token-domain over a per-frame feature for exactly
-this reason).
+The generative inverse of the Demucs ``/stem`` removal: given an EXISTING song the
+model generates a NEW isolated target stem (e.g. "add a bassline") that fits it.
+The conditioning is the song's OTHER stems (the accompaniment) and a per-stem text
+caption; the decoder's prediction target is the isolated target stem's tokens.
+Unlike melody (a lossy 12-bin chroma) this conditions on the accompaniment stems'
+FULL SpectroStream tokens — same fidelity the model itself works in — so no audio
+information is thrown away (token-domain over a per-frame feature, by choice).
 
-Like melody, the source stem is dense + frame-aligned with the target, so it is
-conditioned **additively**: this module embeds the source-stem tokens ``[B, K, T]``
-(one embedding table per codebook, summed — mirroring the decoder's own input
-path), runs a small bidirectional Conv1d stack for temporal context, adds a
-learned **stem-type** embedding (which stem is being conditioned on:
-drums/bass/vocals/other), and ``NanoAudioGPT`` adds the result to the per-frame
-token-sum input at the cb0 anchor (delayed position p <-> frame p), exactly like
-``MelodyEncoder``.
+Like melody, each conditioning stem is dense + frame-aligned with the target, so it
+is conditioned **additively**: this module embeds a stem's tokens ``[B, K, T]`` (one
+embedding table per codebook, summed — mirroring the decoder's own input path), runs
+a small bidirectional Conv1d stack for temporal context, and adds a learned
+**stem-type** embedding labelling WHICH stem this is (drums/bass/vocals/other). The
+decoder (``NanoAudioGPT._stem_add``) SUMS the encoded accompaniment stems, adds a
+separate **target-type** embedding (``target_type_emb``, WHICH stem to generate),
+and adds the result to the per-frame token-sum input at the cb0 anchor (delayed
+position p <-> frame p), exactly like ``MelodyEncoder``.
 
-A learned **null** stands in for "stem dropped" (classifier-free guidance) and the
-unconditional baseline — it must be learned, not zeros (an all-pad source-stem is
-a valid input). Lives INSIDE ``NanoAudioGPT`` so DDP syncs its grads and it
-saves/restores with the model state_dict.
+A learned **null** stands in for "stem axis dropped" (classifier-free guidance) and
+the unconditional baseline — it must be learned, not zeros (a zero token is a valid
+code, so zeros can't mean "no conditioning"). Lives INSIDE ``NanoAudioGPT`` so DDP
+syncs its grads and it saves/restores with the model state_dict.
 """
 from __future__ import annotations
 
@@ -27,20 +29,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Demucs' 4 stems; the order is the stem-type id and is checkpoint-baked.
+# Canonical stem-type ids — index IS the embedding id and is checkpoint-baked.
+# NOTE: this is NOT Demucs' source order (which is drums, bass, OTHER, VOCALS) —
+# vocals/other are swapped here, so every producer/consumer MUST map by NAME via
+# STEM_TYPE_TO_ID, never by Demucs' positional index.
 STEM_TYPES: tuple[str, ...] = ("drums", "bass", "vocals", "other")
 N_STEM_TYPES = len(STEM_TYPES)
 STEM_TYPE_TO_ID: dict[str, int] = {s: i for i, s in enumerate(STEM_TYPES)}
 
 
 class StemEncoder(nn.Module):
-    """Encode source-stem tokens ``[B, K, T]`` (+ a stem-type id) -> ``[B, T, d_model]``.
+    """Encode one stem's tokens ``[B, K, T]`` (+ a stem-type id) -> ``[B, T, d_model]``.
 
     Per-codebook embeddings (summed) -> GELU -> ``n_layers`` residual Conv1d(k=3)
-    blocks with RMSNorm -> out_proj, plus a learned per-stem-type embedding. The
-    convs are bidirectional (the whole source stem is known up front), like
+    blocks with RMSNorm -> out_proj, plus a learned per-stem-type embedding
+    (``stem_type_emb``, labelling which conditioning stem this is). The convs are
+    bidirectional (the whole stem is known up front), like
     ``MelodyEncoder``/``LyricEncoder``. ``ln_final`` is zero-gamma-gated so the
     encoded stem is an additive no-op at init and fades in as it learns.
+
+    A SECOND embedding, ``target_type_emb``, labels which stem the decoder should
+    GENERATE; it is NOT used inside ``encode_stem`` (which encodes a *conditioning*
+    stem) — the decoder's ``_stem_add`` looks it up and adds it once after summing
+    the encoded accompaniment stems. Keep the two tables distinct.
     """
 
     def __init__(
@@ -59,7 +70,12 @@ class StemEncoder(nn.Module):
         self.tok_embeds = nn.ModuleList(
             [nn.Embedding(vocab_with_pad, d_model) for _ in range(n_codebooks)]
         )
+        # Labels each CONDITIONING stem (which of the accompaniment stems this is).
         self.stem_type_emb = nn.Embedding(n_stem_types, d_model)
+        # Labels which stem the decoder should GENERATE (the target). Added once by
+        # _stem_add after summing the encoded accompaniment — distinct from
+        # stem_type_emb so "condition on drums" and "generate drums" don't collide.
+        self.target_type_emb = nn.Embedding(n_stem_types, d_model)
         self.convs = nn.ModuleList(
             [nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, bias=False)
              for _ in range(n_layers)]

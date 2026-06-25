@@ -21,9 +21,10 @@ different thing, and each can be left blank.
 | **Tags** | `prompt` | The *vibe* — genre, instrumentation, mood, production | A natural-language caption → split into ≤77-token chunks → frozen CLAP → a *sequence* of pooled vectors the decoder cross-attends to |
 | **Lyrics + markers** | `lyrics` (+ `gender`/`bpm`) | The *words to sing* and per-song attributes (gender, tempo, key, vocals, section) | A phoneme sequence the decoder cross-attends to |
 | **Melody** | `melody_audio` (`/cover`) | The *contour* — the tune to follow | A time-aligned chromagram added per-frame |
+| **Stem** | `audio` + `target_stem` (`/addstem`) | A *new stem to add* to an existing song (e.g. a bassline) | The song's other stems' codec tokens, added per-frame |
 
 Each axis drops independently for classifier-free guidance, so `cfg_scale` (and the
-optional `lyric_cfg_scale` / `melody_cfg_scale`) pushes adherence on each axis on its own.
+optional `lyric_cfg_scale` / `melody_cfg_scale` / `stem_cfg_scale`) pushes adherence on each axis on its own.
 
 ---
 
@@ -375,6 +376,25 @@ prompt:        warm analog synth pads, steady groove, smooth transition
 
 ---
 
+### `/addstem` — add a stem to a song *(needs a stem-trained checkpoint)*
+
+Give it a finished song and a stem to add; it generates a NEW isolated stem that
+fits, steered by `prompt`. The generative inverse of `/stem` (which only removes).
+
+```
+audio:          my_song.mp3
+target_stem:    bass            # drums | bass | vocals | other
+prompt:         funky 70s warbly synth bassline, syncopated, round low end
+output:         mix             # mix = song + new stem | stem = the new stem alone
+stem_cfg_scale: 4               # >0: push the new stem to fit the song tighter
+```
+*Why:* the model Demucs-separates your upload, conditions on its OTHER stems +
+`prompt`, and renders the target. `prompt` describes the *stem* you want (not the
+whole song); lyrics/melody are unused. Use `output=stem` to get the raw stem to
+mix yourself, or `output=mix` (default) for the song with it layered in.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -385,7 +405,8 @@ prompt:        warm analog synth pads, steady groove, smooth transition
 | Key marker ignored | `[m]`/`[f]` are **gender**. Use `[c major]`, `[f minor]`, etc. for keys. |
 | Tags / lyrics cross-contaminating | Fixed — tags (`prompt`) and lyrics (`lyrics`) are separate fields now (no `". "` join/split), so a multi-sentence prose `prompt` stays entirely in the tags slot. |
 | Gender/tempo marker mid-song does nothing | Those are **prefix-only** — move them to the start of `lyrics`. Only section markers work inline. |
-| `/cover` or `/infill` returns HTTP 400 | The served checkpoint wasn't trained for that axis (`use_melody_conditioning` / `use_fim`). |
+| `/cover`, `/infill`, or `/addstem` returns HTTP 400 | The served checkpoint wasn't trained for that axis (`use_melody_conditioning` / `use_fim` / `use_stem_conditioning`). |
+| `/addstem` prompt steers the stem weakly | Songs captioned before `CAPTIONER_MARKER` v5 have no per-stem caption (training falls back to the song caption) — re-run `auto_tag --redo` to backfill; meanwhile raise `stem_cfg_scale` and be specific in `prompt`. |
 
 ---
 
@@ -443,4 +464,12 @@ curl -X POST http://localhost:8000/cover \
   -F prompt="expressive solo violin, warm tone, legato phrasing" \
   -F melody_cfg_scale=2.0 \
   --output cover.mp3
+
+# Add a bassline to an existing song (needs a stem-trained checkpoint)
+curl -X POST http://localhost:8000/addstem \
+  -F audio=@my_song.mp3 \
+  -F target_stem=bass \
+  -F prompt="funky 70s warbly synth bassline, syncopated, round low end" \
+  -F stem_cfg_scale=4.0 -F output=mix \
+  --output with_bass.mp3
 ```

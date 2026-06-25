@@ -41,7 +41,11 @@ _CAPTION_MODEL = "Qwen/Qwen2-Audio-7B-Instruct"
 # --redo-missing-language transcribe pass uses. MUST match
 # model.audio_llm_captioner.CAPTIONER_MARKER (duplicated as a literal because the
 # slim orchestrator image can't import that numpy-heavy module).
-CAPTIONER_MARKER = "audio_llm_v3"
+# v4: caption entries now carry a ``gender`` field (the audio-LLM's vocal-gender
+# judgment, replacing the F0-on-Demucs estimate); a --redo upgrades v3 -> v4.
+# v5: entries now also carry a ``stems`` dict (per-stem captions for /addstem); a
+# --redo upgrades v4 -> v5.
+CAPTIONER_MARKER = "audio_llm_v5"
 
 
 def _is_current(entry) -> bool:
@@ -150,12 +154,19 @@ class Captioner:
         ok = [(stem, w) for (stem, w, err) in decoded if err is None]
         if not ok:
             return out
-        if hasattr(self.model, "caption_many"):
+        # The captioner emits a trailing GENDER tag + four per-stem lines; the
+        # *_with_gender_and_stems APIs parse them so tags.json carries
+        # {description, gender, stems, captioner}. Gender is the audio-LLM's
+        # male/female judgment (None = instrumental); stems is the per-stem caption
+        # dict for /addstem (empty until a song is captioned at v5).
+        if hasattr(self.model, "caption_many_with_gender_and_stems"):
             try:
-                caps = self.model.caption_many([w for (_s, w) in ok])
+                triples = self.model.caption_many_with_gender_and_stems(
+                    [w for (_s, w) in ok])
                 out.extend(
-                    (stem, {"description": d, "captioner": CAPTIONER_MARKER}, None)
-                    for (stem, _w), d in zip(ok, caps)
+                    (stem, {"description": d, "gender": g, "stems": s,
+                            "captioner": CAPTIONER_MARKER}, None)
+                    for (stem, _w), (d, g, s) in zip(ok, triples)
                 )
             except Exception as e:
                 # A whole-batch generation failure must not crash the element —
@@ -165,8 +176,8 @@ class Captioner:
         else:
             for stem, w in ok:
                 try:
-                    d = self.model.caption(w)
-                    out.append((stem, {"description": d,
+                    d, g, s = self.model.caption_with_gender_and_stems(w)
+                    out.append((stem, {"description": d, "gender": g, "stems": s,
                                        "captioner": CAPTIONER_MARKER}, None))
                 except Exception as e:
                     out.append((stem, None, str(e)[:200]))

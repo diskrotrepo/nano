@@ -3,7 +3,7 @@
 Runs ONE wave end-to-end by calling each deployed stage's workhorse function in
 sequence:
 
-    prepare -> tokenize -> melody -> auto_tag -> transcribe -> structure
+    prepare -> tokenize -> melody -> stems -> auto_tag -> transcribe -> structure
             -> pack_append -> cleanup -> phonemize -> key_detect
 
 Each call blocks until that stage's full pass returns, so only one stage runs at
@@ -16,7 +16,7 @@ registers them). Set the R2 env (``NANO_AUDIO_BUCKET`` / ``NANO_AUDIO_ENDPOINT``
 + the ``r2-creds`` secret) in the shell you DEPLOY from — the mount is fixed at
 deploy time::
 
-    for m in prepare tokenize melody auto_tag transcribe structure tempo \
+    for m in prepare tokenize melody stems auto_tag transcribe structure tempo \
              pack_cache wave_cleanup phonemize key_detect; do
         modal deploy diskrot/modal_$m.py
     done
@@ -35,6 +35,15 @@ stage (~28% of wave cost) on only a deterministic fraction of songs; the rest
 fall back to <no_section> at train time. The cheap dense tempo stage runs at
 full coverage so <tempo_*> markers stay 100% (the dataset prefers tempo.json
 over the structure bpm) — keep with_tempo on whenever structure is sampled.
+COST: --stems-sample-pct (default 50) runs the expensive stems stage (Demucs +
+4x codec encode, GPU) on only a deterministic fraction; non-sampled songs are
+flagged absent by the packer's present mask and skipped as /addstem targets, so
+coverage degrades gracefully (stem_prob=0.15 means only ~15% of train batches use
+stems anyway). The stems salt is independent of structure's, so the two samples
+don't overlap-correlate.
+COST: transcribe is Demucs-free (Whisper on the raw mix; vocal gender comes from
+the audio-LLM captioner), so the transcribe stage no longer pays htdemucs vocal
+isolation — the dominant former transcribe cost.
 """
 from __future__ import annotations
 
@@ -57,11 +66,13 @@ def ingest_wave(
     min_seconds: int = 20,
     tokenize_batch: int = 8,
     with_melody: bool = True,
+    with_stems: bool = True,
     with_tags: bool = True,
     with_lyrics: bool = True,
     with_structure: bool = True,
     with_tempo: bool = True,
     structure_sample_pct: int = 50,
+    stems_sample_pct: int = 50,
     drop_mp3: bool = False,
 ):
     import os
@@ -107,6 +118,14 @@ def ingest_wave(
         min_seconds=min_seconds, batch_size=tokenize_batch, wave_id=wave_id)
     if with_melody:
         run("melody", "nano-melody", "orchestrate", wave_id=wave_id)
+    if with_stems:
+        # Demucs all 4 stems + codec-tokenize each -> nano-stems (the /addstem
+        # conditioning). GPU stage; needs the .pt frame count, so after tokenize,
+        # before pack (which folds the stem sidecar in). sample_pct<100 runs it on
+        # only a deterministic fraction (cost lever) — non-sampled songs are flagged
+        # absent by the packer's present mask and skipped as stem-add targets.
+        run("stems", "nano-stems", "orchestrate",
+            wave_id=wave_id, sample_pct=stems_sample_pct)
     if with_tags:
         # batch_size=256 (auto_tag's own default), NOT 16: each .map element is
         # run as ONE vLLM continuous batch, internally pipelined in
@@ -116,6 +135,9 @@ def ingest_wave(
         run("auto_tag", "nano-auto-tag", "run_auto_tag",
             batch_size=256, flush_every_batches=4, wave_id=wave_id)
     if with_lyrics:
+        # Transcribe is Demucs-free: Whisper runs on the raw mix and vocal gender
+        # comes from the audio-LLM captioner (auto_tag, above), so there is no
+        # separation step. Resume-by-skip on carried-over waves.
         run("transcribe", "nano-transcribe", "orchestrate", wave_id=wave_id)
     if with_structure:
         # sample_pct<100 runs allin1 (the ~28%-of-wave structure stage) on only a
@@ -145,20 +167,24 @@ def main(
     min_seconds: int = 20,
     tokenize_batch: int = 8,
     with_melody: bool = True,
+    with_stems: bool = True,
     with_tags: bool = True,
     with_lyrics: bool = True,
     with_structure: bool = True,
     with_tempo: bool = True,
     structure_sample_pct: int = 50,
+    stems_sample_pct: int = 50,
     drop_mp3: bool = False,
 ):
     if not wave_id:
         raise SystemExit("--wave-id is required (e.g. --wave-id 17)")
     fc = ingest_wave.spawn(
         wave_id=wave_id, min_seconds=min_seconds, tokenize_batch=tokenize_batch,
-        with_melody=with_melody, with_tags=with_tags, with_lyrics=with_lyrics,
+        with_melody=with_melody, with_stems=with_stems, with_tags=with_tags,
+        with_lyrics=with_lyrics,
         with_structure=with_structure, with_tempo=with_tempo,
-        structure_sample_pct=structure_sample_pct, drop_mp3=drop_mp3,
+        structure_sample_pct=structure_sample_pct,
+        stems_sample_pct=stems_sample_pct, drop_mp3=drop_mp3,
     )
     print(f"wave {wave_id} ingest launched (detached) — function call id: {fc.object_id}")
     print("monitor: modal app logs nano-ingest-wave")

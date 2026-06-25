@@ -1,28 +1,18 @@
-"""One-command lyrics-stats diff — the gate for the skip-Demucs experiment.
+"""One-command lyrics-stats snapshot / wave-vs-rest diff (read-only).
 
-Run ONE wave through transcribe with skip-Demucs on::
+    modal run diskrot/modal_lyrics_stats.py                 # whole-corpus snapshot
+    modal run diskrot/modal_lyrics_stats.py --wave-id base_0  # one wave vs the rest
 
-    modal run --detach diskrot/modal_transcribe.py --wave-id base_0 --skip-demucs
+Prints aggregate lyrics stats: instrumental rate, median/mean word count, vocal-
+gender split, top languages, median ``avg_logprob`` (Whisper confidence), and the
+``filter_lyrics`` hallucination-flag rate. Useful as a health check on a wave's
+transcripts or a baseline corpus snapshot.
 
-then diff that wave's transcripts against the rest of the corpus (which was
-transcribed with full Demucs)::
+Transcribe is Demucs-free now (Whisper on the raw mix) and **vocal gender comes
+from the audio-LLM captioner (tags.json)**, not the lyrics entries — so the gender
+split is joined from tags.json here (legacy lyrics-entry gender is a fallback).
 
-    modal run diskrot/modal_lyrics_stats.py --wave-id base_0
-
-It prints the wave's aggregate lyrics stats side-by-side with the REST of the
-corpus: instrumental rate, median/mean word count, gender split, top languages,
-median ``avg_logprob`` (Whisper confidence), and the ``filter_lyrics``
-hallucination-flag rate. The decision is a visual match:
-
-* instrumental % jumps in the wave        -> raw-mix LOST vocals (BAD, keep Demucs)
-* median word count collapses             -> raw-mix mangled dense mixes  (BAD)
-* hallucination-flag rate jumps           -> raw-mix invented words       (BAD)
-* avg_logprob drifts a little lower        -> expected & harmless (the floor is ~off)
-* gender None-rate jumps                   -> the Demucs-lite clip is missing vocals
-* everything matches                       -> skip-Demucs is safe; keep it for all waves
-
-Read-only: never writes the volume. With no --wave-id it just prints the
-whole-corpus stats (a baseline snapshot).
+Read-only: never writes the volume.
 """
 from __future__ import annotations
 
@@ -40,29 +30,55 @@ corpus_vol = corpus_mount()  # R2 audio bucket — only to resolve a wave's stem
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 
-def _group_stats(entries: dict) -> dict:
-    """Aggregate stats for a {stem: entry_or_None} slice of the lyrics dir."""
+def _load_tag_gender(tokens_dir: str = "/tokens") -> dict:
+    """{stem: 'male'|'female'} from the audio-LLM captioner's per-song ``gender``
+    field in tags.json (single file) or tags/ (shard dir). Torch-free so it runs on
+    this stage's slim image; mirrors diskrot.dataset._load_tag_gender."""
+    import json
+    from pathlib import Path
+
+    td = Path(tokens_dir) / "tags"
+    tf = Path(tokens_dir) / "tags.json"
+    if td.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(td, "tags")
+    elif tf.exists():
+        raw = json.loads(tf.read_text())
+    else:
+        return {}
+    return {k: v["gender"] for k, v in raw.items()
+            if isinstance(v, dict) and v.get("gender") in ("male", "female")}
+
+
+def _group_stats(entries: dict, tag_gender: dict | None = None) -> dict:
+    """Aggregate stats for a {stem: entry_or_None} slice of the lyrics dir.
+
+    ``tag_gender`` is the {stem: 'male'|'female'} map from tags.json (the audio-LLM
+    captioner's vocal-gender judgment) — the gender split is read from it first,
+    with the legacy lyrics-entry ``gender`` field as a fallback for pre-v4 corpora.
+    """
     import statistics
     from collections import Counter
 
     from diskrot.filter_lyrics import hallucination_reason
     from diskrot.transcribe_lyrics import is_valid_word
 
+    tag_gender = tag_gender or {}
     n = len(entries)
     n_none = sum(1 for v in entries.values() if v is None)
-    dicts = [v for v in entries.values() if isinstance(v, dict)]
+    items = [(k, v) for k, v in entries.items() if isinstance(v, dict)]
 
     word_counts = []
     n_with_words = n_flagged = n_lang = n_logprob = 0
     genders: Counter = Counter()
     langs: Counter = Counter()
     logprobs = []
-    for v in dicts:
+    for k, v in items:
         nw = sum(1 for w in (v.get("words") or ()) if is_valid_word(w))
         if nw > 0:
             n_with_words += 1
             word_counts.append(nw)
-            genders[v.get("gender") or "none"] += 1
+            genders[tag_gender.get(k) or v.get("gender") or "none"] += 1
             lang = v.get("language")
             if lang:
                 n_lang += 1
@@ -78,7 +94,7 @@ def _group_stats(entries: dict) -> dict:
         return f"{(100.0 * x / d):.1f}%" if d else "—"
 
     # "instrumental" at train time = None OR transcribed-but-wordless dict.
-    n_wordless = len(dicts) - n_with_words
+    n_wordless = len(items) - n_with_words
     n_instrumental = n_none + n_wordless
     return {
         "present": n,
@@ -86,7 +102,7 @@ def _group_stats(entries: dict) -> dict:
         "with_words_rate": pct(n_with_words, n),
         "median_words": f"{statistics.median(word_counts):.0f}" if word_counts else "—",
         "mean_words": f"{statistics.mean(word_counts):.0f}" if word_counts else "—",
-        "halluc_flag_rate": pct(n_flagged, len(dicts)),
+        "halluc_flag_rate": pct(n_flagged, len(items)),
         "gender_male": pct(genders.get("male", 0), n_with_words),
         "gender_female": pct(genders.get("female", 0), n_with_words),
         "gender_none": pct(genders.get("none", 0), n_with_words),
@@ -120,17 +136,18 @@ _ROWS = [
     timeout=30 * 60,
 )
 def stats(wave_id: str = "") -> None:
-    from pathlib import Path
-
     from diskrot.transcribe_lyrics import load_lyrics_shards
 
     lyrics = load_lyrics_shards("/tokens/lyrics")
     if not lyrics:
         print("no lyrics/ shards found on /tokens")
         return
+    # Vocal gender is sourced from the audio-LLM captions (tags.json), not the
+    # lyrics entries. Missing -> lyrics-entry fallback inside _group_stats.
+    tag_gender = _load_tag_gender()
 
     if not wave_id:
-        g = _group_stats(lyrics)
+        g = _group_stats(lyrics, tag_gender)
         print(f"\nWHOLE CORPUS — {len(lyrics):,} entries\n" + "-" * 40)
         for key, label in _ROWS:
             print(f"  {label:<26} {g[key]}")
@@ -144,16 +161,15 @@ def stats(wave_id: str = "") -> None:
               f"— has it been transcribed? (transcribe skips already-done stems)")
         return
 
-    gw, gr = _group_stats(in_wave), _group_stats(rest)
-    print(f"\nwave {wave_id} (skip-Demucs?) vs REST of corpus (full Demucs)")
+    gw, gr = _group_stats(in_wave, tag_gender), _group_stats(rest, tag_gender)
+    print(f"\nwave {wave_id} vs REST of corpus")
     print(f"  wave: {len(in_wave):,} entries   rest: {len(rest):,} entries\n")
     print(f"  {'metric':<26} {'wave_' + wave_id:>18} {'rest':>18}")
     print("  " + "-" * 64)
     for key, label in _ROWS:
         print(f"  {label:<26} {str(gw[key]):>18} {str(gr[key]):>18}")
     print("\n  Read: a higher instrumental %, lower median word count, or higher\n"
-          "  halluc-flag % in the wave column is raw-mix degradation. A slightly\n"
-          "  lower avg_logprob is expected and harmless (the filter floor is ~off).")
+          "  halluc-flag % in the wave column flags transcript trouble for that wave.")
 
 
 @app.local_entrypoint()

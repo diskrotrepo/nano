@@ -35,6 +35,9 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 # modal_melody.py for why. Read-only here; only the packed .mel.bin output lands
 # back on nano-tokens alongside the token shards.
 melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
+# Per-song stem-token sidecars (<name>.stems.npy) live on their own volume too —
+# see modal_stems.py. Read-only here; the packed .stem.bin lands on nano-tokens.
+stems_vol = modal.Volume.from_name("nano-stems", create_if_missing=True)
 
 
 @app.function(
@@ -54,9 +57,12 @@ melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
     # the last committed shard rather than rebuilding from scratch.
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
-    volumes={"/tokens": tokens_vol, "/melody": melody_vol},
+    volumes={"/tokens": tokens_vol, "/melody": melody_vol, "/stems": stems_vol},
 )
-def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True):
+def pack_remote(
+    shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True,
+    stems: bool = True,
+):
     from pathlib import Path
 
     from diskrot.pack_cache import pack
@@ -75,6 +81,17 @@ def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bo
             print("[pack] melody: no *.mel.npy found on nano-melody — packing tokens "
                   "only (run modal_melody.py first to add melody conditioning)", flush=True)
 
+    # Same for the parallel stem sidecar (packed_NNN.stem.bin) from modal_stems.py.
+    stem_cache_dir = None
+    if stems:
+        has_any = next(Path("/stems").glob("*.stems.npy"), None) is not None
+        if has_any:
+            stem_cache_dir = "/stems"
+            print("[pack] stems: stem sidecars found — packing parallel .stem.bin", flush=True)
+        else:
+            print("[pack] stems: no *.stems.npy found on nano-stems — packing without "
+                  "stems (run modal_stems.py first to add /addstem conditioning)", flush=True)
+
     out_dir = pack(
         "/tokens",
         shard_target_songs=shard_target_songs,
@@ -84,6 +101,7 @@ def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bo
         # stays modal-free; the volume commit is injected here.
         commit_cb=tokens_vol.commit,
         mel_cache_dir=mel_cache_dir,
+        stem_cache_dir=stem_cache_dir,
     )
     tokens_vol.commit()  # idempotent safety net if commit_cb was a no-op
     print(f"[done] packed shards live at {out_dir}", flush=True)
@@ -98,11 +116,11 @@ def pack_remote(shard_target_songs: int = 5_000, n_workers: int = 16, melody: bo
     timeout=60 * 60 * 18,
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
-    volumes={"/tokens": tokens_vol, "/melody": melody_vol},
+    volumes={"/tokens": tokens_vol, "/melody": melody_vol, "/stems": stems_vol},
 )
 def pack_append_remote(
     wave_id: str, shard_target_songs: int = 5_000, n_workers: int = 16,
-    melody: bool = True,
+    melody: bool = True, stems: bool = True,
 ):
     """Append one wave's tokens (``/tokens/waves/wave_<id>/*.pt``) as NEW shards
     to the existing ``/tokens/packed`` — leaving every prior shard untouched (see
@@ -133,6 +151,22 @@ def pack_append_remote(
         print(f"[pack-append] melody on — chroma from {wave_mel_dir} "
               f"(missing songs zero-filled)", flush=True)
 
+    # Same gate for stems: match the existing pack's has_stems when a pack exists,
+    # else fall back to whether this wave actually has stem sidecars.
+    existing_has_stems = None
+    if (packed_dir / SHARD_INDEX_NAME).exists():
+        existing_has_stems = bool(load_shard_index(packed_dir).get("has_stems", False))
+    wave_stem_dir = f"/stems/waves/wave_{wave_id}"
+    wave_has_stems = next(Path(wave_stem_dir).glob("*.stems.npy"), None) is not None
+    want_stems = (
+        existing_has_stems if existing_has_stems is not None
+        else (stems and wave_has_stems)
+    )
+    stem_cache_dir = wave_stem_dir if want_stems else None
+    if want_stems:
+        print(f"[pack-append] stems on — stem tokens from {wave_stem_dir} "
+              f"(missing songs zero-filled + flagged absent)", flush=True)
+
     out_dir = pack_append(
         wave_dir,
         "/tokens/packed",
@@ -141,6 +175,7 @@ def pack_append_remote(
         verbose=True,
         commit_cb=tokens_vol.commit,
         mel_cache_dir=mel_cache_dir,
+        stem_cache_dir=stem_cache_dir,
     )
     tokens_vol.commit()  # idempotent safety net if commit_cb was a no-op
     print(f"[done] appended wave {wave_id} -> {out_dir}", flush=True)
@@ -149,14 +184,14 @@ def pack_append_remote(
 @app.local_entrypoint()
 def main(
     shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True,
-    append: bool = False, wave_id: str = "",
+    stems: bool = True, append: bool = False, wave_id: str = "",
 ):
     if append:
         if not wave_id:
             raise SystemExit("--append requires --wave-id (e.g. --wave-id 17)")
         fc = pack_append_remote.spawn(
             wave_id=wave_id, shard_target_songs=shard_target_songs,
-            n_workers=n_workers, melody=melody,
+            n_workers=n_workers, melody=melody, stems=stems,
         )
         print(f"pack-append launched (detached) for wave {wave_id} "
               f"-- function call id: {fc.object_id}")
@@ -166,6 +201,7 @@ def main(
         shard_target_songs=shard_target_songs,
         n_workers=n_workers,
         melody=melody,
+        stems=stems,
     )
     print(f"pack launched (detached) -- function call id: {fc.object_id}")
     print("monitor with: modal app logs nano-pack")

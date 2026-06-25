@@ -83,7 +83,7 @@ def test_skips_too_short_files(synth_tokens_dir):
 def test_getitem_shape_and_dtype(synth_tokens_dir):
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=1000))
     ds = TokenDataset(tokens_dir, segment_frames=300)
-    tokens, tags, lyric_ids, _melody = ds[0]
+    tokens, tags, lyric_ids, _melody, *_ = ds[0]
     assert tokens.shape == (9, 300)
     # int16 stays int16 on host (saves ~24 GB shared RAM at production scale).
     # Training loop casts to int64 via .long() after .to(device) — see
@@ -358,7 +358,7 @@ def test_collate_lyrics_pads_and_masks(synth_tokens_dir):
         (torch.zeros(9, 300, dtype=torch.int16), "tagB",
          torch.tensor([BOS_PHONEME_ID], dtype=torch.long), None),
     ]
-    tokens, tags, ids, mask, _melody = collate_lyrics(batch)
+    tokens, tags, ids, mask, _melody, *_ = collate_lyrics(batch)
     assert tokens.shape == (2, 9, 300)
     assert tags == ["tagA", "tagB"]
     assert ids.shape == (2, 3)

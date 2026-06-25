@@ -236,6 +236,17 @@ DEFAULTS = {
     # swapped onto this checkpoint anyway.
     "use_fim": False,
     "fim_prob": 0.0,
+    # Generative stem conditioning (the /addstem path): add a stem to an existing
+    # song. On a stem-add batch the decoder TARGET is one isolated stem and the
+    # conditioning is the song's OTHER stems (+ the target-stem caption via tags);
+    # lyrics/melody drop. Needs the packed stem sidecar (modal_stems -> pack with
+    # stem_cache_dir). A new submodule (StemEncoder), so it's checkpoint-incompatible
+    # — it rides the v9 fresh start. ON for v9. ``stem_prob`` is the fraction of
+    # batches run in stem-add mode (trades against full-song training).
+    "use_stem_conditioning": True,
+    "stem_enc_layers": 2,
+    "n_stem_types": 4,
+    "stem_prob": 0.15,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 4 (global 32 on 8 ranks)
 
@@ -248,6 +259,7 @@ def _build_cfg_kwargs(
     use_ema: bool = DEFAULTS["use_ema"],
     ema_decay: float = DEFAULTS["ema_decay"],
     fim_prob: float = DEFAULTS["fim_prob"],
+    stem_prob: float = DEFAULTS["stem_prob"],
     wandb_project: str | None = None, wandb_run_name: str | None = None,
     init_from: str = "",
     lora: bool = False,
@@ -280,6 +292,7 @@ def _build_cfg_kwargs(
 
     return dict(
         fim_prob=fim_prob,
+        stem_prob=stem_prob,
         cache_dir=root,
         ckpt_dir=f"/ckpts/{ckpt_subdir}",
         device="cuda",
@@ -329,6 +342,9 @@ def _build_model_cfg(
     melody_n_bins: int = DEFAULTS["melody_n_bins"],
     melody_enc_layers: int = DEFAULTS["melody_enc_layers"],
     use_fim: bool = DEFAULTS["use_fim"],
+    use_stem_conditioning: bool = DEFAULTS["use_stem_conditioning"],
+    stem_enc_layers: int = DEFAULTS["stem_enc_layers"],
+    n_stem_types: int = DEFAULTS["n_stem_types"],
     use_qk_norm: bool = DEFAULTS["use_qk_norm"],
     use_lyric_qk_norm: bool = DEFAULTS["use_lyric_qk_norm"],
 ):
@@ -343,6 +359,9 @@ def _build_model_cfg(
         use_lyric_conditioning=text_conditioned,
         use_melody_conditioning=text_conditioned,
         use_fim=use_fim,
+        use_stem_conditioning=use_stem_conditioning,
+        stem_enc_layers=stem_enc_layers,
+        n_stem_types=n_stem_types,
         n_codebooks=n_codebooks,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
         d_ff=d_ff, dropout=dropout,
@@ -779,7 +798,13 @@ def train_remote_multi(
 
         from model.text_encoder import chunk_text_ids
 
-        unique_descs = sorted(set(shared_bundle["tags"].values()))
+        # Include per-stem captions (the /addstem target-stem tags) so a stem-add
+        # batch's swapped-in tag hits the precomputed cache like any description.
+        _stem_cap_strs = {
+            c for caps in shared_bundle.get("stem_caps", {}).values()
+            for c in caps if c
+        }
+        unique_descs = sorted(set(shared_bundle["tags"].values()) | _stem_cap_strs)
         _tok = AutoTokenizer.from_pretrained("gpt2")
         chunk_index = {d: chunk_text_ids(_tok, d) for d in unique_descs}
         unique_chunks = sorted({c for chunks in chunk_index.values() for c in chunks})

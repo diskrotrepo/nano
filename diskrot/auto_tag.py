@@ -51,18 +51,22 @@ def _load_audio_clip(path: str | Path, sr: int, duration: int) -> np.ndarray:
     return audio.astype(np.float32)
 
 
-def _caption_one(model, kind: str, mp3: Path, device: str) -> str:
-    """Caption a single song with whichever captioner is active."""
+def _caption_one(
+    model, kind: str, mp3: Path, device: str
+) -> tuple[str, str | None, dict[str, str]]:
+    """Caption a single song -> ``(description, gender, stems)`` with whichever
+    captioner is active. The legacy BART captioner has no gender/stem output, so it
+    returns ``(desc, None, {})``; the audio-LLM emits all three."""
     if kind == "bart":
         from model.captioner import DURATION, SAMPLE_RATE
 
         audio = _load_audio_clip(mp3, SAMPLE_RATE, DURATION)
         audio_t = torch.from_numpy(audio).unsqueeze(0).to(device)
-        return model.generate(audio_t, num_beams=5)[0]
-    # audio-LLM (whole-song windows)
+        return model.generate(audio_t, num_beams=5)[0], None, {}
+    # audio-LLM (whole-song windows): description + gender + per-stem captions.
     from model.audio_llm_captioner import load_song_windows
 
-    return model.caption(load_song_windows(str(mp3)))
+    return model.caption_with_gender_and_stems(load_song_windows(str(mp3)))
 
 
 def caption_corpus(
@@ -120,14 +124,19 @@ def caption_corpus(
             pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
             continue
         try:
-            description = _caption_one(model, kind, mp3, device)
+            description, gender, stems = _caption_one(model, kind, mp3, device)
         except Exception as e:
             tqdm.write(f"FAILED {mp3.name}: {e}")
             n_failed += 1
             pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
             continue
 
-        tags[key] = {"description": description, "captioner": marker}
+        entry = {"description": description, "captioner": marker}
+        if gender is not None:
+            entry["gender"] = gender
+        if stems:
+            entry["stems"] = stems
+        tags[key] = entry
         n_done += 1
         pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
 
