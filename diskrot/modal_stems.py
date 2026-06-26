@@ -114,12 +114,46 @@ if _IS_SS:
                 "HF_HOME": "/cache/hf",
                 "HF_HUB_CACHE": "/cache/hf",
                 "XDG_CACHE_HOME": "/cache",
+                # Demucs weights load via torch.hub, NOT HF — point its cache at a
+                # baked, UNMOUNTED dir (/cache isn't mounted on the SS path,
+                # _cache_vol is None) so the build-time prefetch below survives to
+                # runtime. Set at .env so it's present for BOTH the bake step and
+                # the @enter get_model() call.
+                "TORCH_HOME": "/cache/torch",
             }
+        )
+        # Bake the SpectroStream SavedModels (encoder/decoder/quantizer from
+        # google/magenta-realtime) into the image so containers don't re-fetch
+        # them from HF on every cold-start (the "Downloading from hf:
+        # savedmodels/ssv2_48k_stereo/..." tax + the A100-idle burned doing it in
+        # @enter). Constructing the codec is the EXACT runtime fetch path, so it
+        # populates the same HF cache (HF_HOME=/cache/hf, set just above) the
+        # codec reads at runtime. Force CPU: the builder has no GPU and we only
+        # need the download, not a placed model. depth is a runtime RVQ slice and
+        # doesn't change the fetched files. NOTE: because the weights now live at
+        # the image's /cache/hf, we must NOT mount the nano-ss-cache volume at
+        # /cache below — a volume mount would shadow the baked dir → re-download.
+        .run_commands(
+            "JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES=-1 TF_CPP_MIN_LOG_LEVEL=2 "
+            "python -c 'from magenta_rt import spectrostream; "
+            "spectrostream.SpectroStream(max_rvq_depth=32)'"
+        )
+        # Bake the Demucs htdemucs checkpoint into the image's torch.hub cache
+        # (TORCH_HOME=/cache/torch, set above) so 50 containers don't each fetch
+        # it at cold start — load_demucs/get_model("htdemucs") in @enter reads the
+        # exact same cache. get_model downloads + builds on CPU, so force-hide the
+        # GPU at build (the builder has none anyway).
+        .run_commands(
+            "CUDA_VISIBLE_DEVICES=-1 python -c "
+            "'from demucs.pretrained import get_model; get_model(\"htdemucs\")'"
         )
         .add_local_python_source("model", "diskrot")
     )
     _GPU = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
-    _cache_vol = modal.Volume.from_name("nano-ss-cache", create_if_missing=True)
+    # SS codec weights baked into the image (above) → no runtime cache volume
+    # (mounting one at /cache would shadow the baked /cache/hf and re-trigger the
+    # per-cold-start HF download this bake exists to kill).
+    _cache_vol = None
 else:
     # DAC path (local/legacy): CUDA torch carries both DAC and Demucs, like transcribe.
     image = (
@@ -134,7 +168,16 @@ else:
             "soundfile>=0.12", "demucs>=4.0",
         )
         .run_commands("pip install 'protobuf>=4'")
-        .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+        .env({
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            # Bake Demucs into the torch.hub cache (UNMOUNTED on this path) so
+            # containers don't re-fetch htdemucs per cold start; matches the SS path.
+            "TORCH_HOME": "/root/.cache/torch",
+        })
+        .run_commands(
+            "CUDA_VISIBLE_DEVICES=-1 python -c "
+            "'from demucs.pretrained import get_model; get_model(\"htdemucs\")'"
+        )
         .add_local_python_source("model", "diskrot")
     )
     _GPU = "L4"
@@ -212,7 +255,22 @@ class StemExtractor:
             except Exception as e:  # noqa: BLE001 — one bad file must not kill the batch
                 print(f"FAILED {name}: {type(e).__name__}: {str(e)[:120]}", flush=True)
                 n_failed += 1
-        stems_vol.commit()
+        # One commit per batch (each container writes independent .stems.npy, so
+        # commits never conflict). Retry a transient DataLossError ("failed to
+        # publish commit to server") so a storage blip doesn't fail the whole
+        # ~100-song batch and bubble up through orchestrate's .map() — that would
+        # waste up to a batch of EXPENSIVE Demucs separations (redone next run).
+        # Mirrors modal_tokenize / auto_tag / transcribe (the "fan-out commit
+        # crash-storm" footgun); this stage was the one fan-out still missing it.
+        for attempt in range(3):
+            try:
+                stems_vol.commit()
+                break
+            except modal.exception.DataLossError as e:
+                if attempt == 2:
+                    raise
+                print(f"commit failed ({e}); retry {attempt + 1}/2", flush=True)
+                time.sleep(2.0 * (attempt + 1))
         return (n_done, n_missing, n_failed)
 
 

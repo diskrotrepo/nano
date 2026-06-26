@@ -52,8 +52,9 @@ if _IS_SS:
     # SpectroStream: TF/JAX codec (the codec compute is TensorFlow on GPU), so
     # torch is CPU-only (just tensor plumbing in model.codec) to avoid contending
     # with JAX/TF for CUDA. NANO_SS_DEPTH=32 = the stored RVQ depth (the model
-    # slices to 24). HF weights cache on nano-ss-cache so 50 containers don't each
-    # re-download. pyloudnorm powers the loudness-norm in tokenize._load_audio.
+    # slices to 24). The SpectroStream SavedModels are baked into the image at
+    # build (the prefetch run_commands below) so containers don't re-download them
+    # per cold-start. pyloudnorm powers the loudness-norm in tokenize._load_audio.
     image = (
         modal.Image.from_registry(_MAGENTA_GPU_IMAGE)
         .apt_install("ffmpeg", "libsndfile1")
@@ -77,7 +78,8 @@ if _IS_SS:
                 "GRPC_VERBOSITY": "ERROR",
                 "GLOG_minloglevel": "2",
                 # Kill the per-cold-start huggingface_hub SavedModel download
-                # progress-bar redraws (the weights cache on nano-ss-cache anyway).
+                # progress-bar redraws (belt-and-suspenders: the SavedModels are
+                # baked into the image at build, so there is nothing to download).
                 "HF_HUB_DISABLE_PROGRESS_BARS": "1",
                 "HF_HUB_DISABLE_TELEMETRY": "1",
                 "HF_HOME": "/cache/hf",
@@ -85,10 +87,29 @@ if _IS_SS:
                 "XDG_CACHE_HOME": "/cache",
             }
         )
+        # Bake the SpectroStream SavedModels (encoder/decoder/quantizer from
+        # google/magenta-realtime) into the image so containers don't re-fetch
+        # them from HF on every cold-start (the "Downloading from hf:
+        # savedmodels/ssv2_48k_stereo/..." tax). Constructing the codec is the
+        # EXACT runtime fetch path, so it populates the same HF cache
+        # (HF_HOME=/cache/hf, set just above) the codec reads at runtime. Force
+        # CPU: the builder has no GPU and we only need the download, not a placed
+        # model. depth is a runtime RVQ slice and doesn't change the fetched
+        # files. NOTE: the weights now live at the image's /cache/hf, so we must
+        # NOT mount the nano-ss-cache volume at /cache below — a mount would
+        # shadow the baked dir → re-download.
+        .run_commands(
+            "JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES=-1 TF_CPP_MIN_LOG_LEVEL=2 "
+            "python -c 'from magenta_rt import spectrostream; "
+            "spectrostream.SpectroStream(max_rvq_depth=32)'"
+        )
         .add_local_python_source("model", "diskrot")
     )
     _GPU = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
-    _cache_vol = modal.Volume.from_name("nano-ss-cache", create_if_missing=True)
+    # SS codec weights baked into the image (above) → no runtime cache volume
+    # (mounting one at /cache would shadow the baked /cache/hf and re-trigger the
+    # per-cold-start HF download this bake exists to kill).
+    _cache_vol = None
 else:
     image = (
         modal.Image.debian_slim(python_version="3.12")
