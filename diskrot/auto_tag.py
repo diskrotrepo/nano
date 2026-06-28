@@ -69,6 +69,17 @@ def _caption_one(
     return model.caption_with_gender_and_stems(load_song_windows(str(mp3)))
 
 
+def _atomic_write_json(out_path: Path, obj: object) -> None:
+    """Write JSON via temp + os.replace so a kill mid-write can't truncate the
+    target. tags.json is loaded WHOLE at train startup, so a partial write is a
+    hard startup failure — every sibling stage (key_detect, transcribe, ...) writes
+    this way; auto_tag was the lone bare-write."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, out_path)
+
+
 def caption_corpus(
     corpus_dir: str | Path,
     out_path: str | Path,
@@ -141,13 +152,11 @@ def caption_corpus(
         pbar.set_postfix(done=n_done, skip=n_skipped, fail=n_failed)
 
         if n_done % flush_every == 0:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(tags, indent=2))
+            _atomic_write_json(out_path, tags)
             if flush_callback is not None:
                 flush_callback()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(tags, indent=2))
+    _atomic_write_json(out_path, tags)
     print(f"\ncaptioned: {n_done}  skipped: {n_skipped}  failed: {n_failed}")
     print(f"saved -> {out_path}")
 

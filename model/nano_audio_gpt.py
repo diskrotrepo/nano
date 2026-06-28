@@ -32,6 +32,33 @@ class StaticLayerKVCache:
         self.pos = 0
 
 
+class CrossKVCache:
+    """Cached projected (+ qk-normed) K/V for ONE cross-attention over a FIXED
+    conditioning sequence (tags or lyrics).
+
+    Cross-attention K/V depend only on `cond`, which is encoded once at prefill and
+    never changes across decode steps — yet `kv_proj(cond)` was being recomputed in
+    every block on every step. For a long lyric stream (up to 512 phonemes) that
+    recompute dominates per-token decode. Computing it once at prefill and reusing
+    it makes the cached value byte-identical to the recompute (k_norm is
+    position-independent, so the stored K is post-norm). One cache per (CFG-stage,
+    block, stream) — stages must NOT share caches (each has its own cond)."""
+    __slots__ = ('k', 'v')
+
+    def __init__(self):
+        self.k: torch.Tensor | None = None
+        self.v: torch.Tensor | None = None
+
+
+class BlockCrossKV:
+    """The two cross-attention caches for one decoder block (tag + lyric streams)."""
+    __slots__ = ('text', 'lyric')
+
+    def __init__(self):
+        self.text = CrossKVCache()
+        self.lyric = CrossKVCache()
+
+
 class RotaryEmbedding(nn.Module):
     """Precomputed RoPE cos/sin tables, shared across all attention layers.
 
@@ -276,6 +303,7 @@ class CrossAttention(nn.Module):
 
     def forward(
         self, x: torch.Tensor, cond: torch.Tensor, kv_mask: torch.Tensor | None = None,
+        kv_cache: "CrossKVCache | None" = None,
     ) -> torch.Tensor:
         """x: [B, T, D] audio hidden states, cond: [B, T_cond, D] text embeddings.
 
@@ -285,16 +313,31 @@ class CrossAttention(nn.Module):
         each query row has at least one un-masked key (a fully -inf row makes
         SDPA's softmax produce NaN); the lyric path ensures this by always
         keeping the BOS phoneme valid.
+
+        kv_cache: optional CrossKVCache. `cond` is fixed across decode steps, so the
+        projected (+ k-normed) K/V are computed once at prefill (when the cache is
+        empty) and reused on every subsequent step — skipping kv_proj(cond), the
+        dominant per-token decode cost when `cond` is long. None on the training /
+        full-sequence path (one forward, already amortized).
         """
         B, T, D = x.shape
-        T_c = cond.shape[1]
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k, v = self.kv_proj(cond).split(D, dim=-1)
-        k = k.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
         if self.q_norm is not None:
             q = self.q_norm(q)
-            k = self.k_norm(k)
+        if kv_cache is not None and kv_cache.k is not None:
+            k, v = kv_cache.k, kv_cache.v
+        else:
+            T_c = cond.shape[1]
+            k, v = self.kv_proj(cond).split(D, dim=-1)
+            k = k.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
+            v = v.view(B, T_c, self.n_heads, self.head_dim).transpose(1, 2)
+            # k_norm is position-independent, so caching the post-norm K is exactly
+            # the value a recompute would produce.
+            if self.k_norm is not None:
+                k = self.k_norm(k)
+            if kv_cache is not None:
+                kv_cache.k = k
+                kv_cache.v = v
         # The tag mask is built outside autocast (float32); cast to the (possibly
         # bf16) query dtype so SDPA's flash/mem-efficient kernels accept it. A
         # no-op for the lyric mask, which is already built in the compute dtype.
@@ -373,6 +416,7 @@ class Block(nn.Module):
         lyric_kv_mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
+        cross_kv: "BlockCrossKV | None" = None,
     ) -> tuple[torch.Tensor, KVCache | None]:
         if cache is None and self.training and self.use_gradient_checkpointing:
             x = checkpoint(
@@ -387,9 +431,15 @@ class Block(nn.Module):
         )
         x = x + attn_out
         if self.has_cross_attn and text_emb is not None:
-            x = x + self.cross_attn(self.ln_cross(x), text_emb, kv_mask=text_kv_mask)
+            x = x + self.cross_attn(
+                self.ln_cross(x), text_emb, kv_mask=text_kv_mask,
+                kv_cache=cross_kv.text if cross_kv is not None else None,
+            )
         if self.has_lyric_attn and lyric_emb is not None:
-            x = x + self.lyric_attn(self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask)
+            x = x + self.lyric_attn(
+                self.ln_lyric(x), lyric_emb, kv_mask=lyric_kv_mask,
+                kv_cache=cross_kv.lyric if cross_kv is not None else None,
+            )
         x = x + self.mlp(self.ln2(x))
         return x, new_cache
 
@@ -403,6 +453,10 @@ class NanoAudioGPT(nn.Module):
         # _generate_stream routes each decode step through it so CUDA graphs apply;
         # the eager self.forward is the fallback (identical results, just slower).
         self._compiled_forward = None
+        # Cross-attention K/V caching during generate (see CrossKVCache). On by
+        # default; an A/B handle for the benchmark / byte-identity test to fall back
+        # to the recompute path. Never affects training (cache is generate-only).
+        self._use_cross_kv_cache = True
         self.tok_embeds = nn.ModuleList(
             [nn.Embedding(cfg.vocab_with_pad, cfg.d_model) for _ in range(cfg.n_codebooks)]
         )
@@ -689,6 +743,7 @@ class NanoAudioGPT(nn.Module):
         stem_keep: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
+        cross_kv_caches: "list[BlockCrossKV] | None" = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
@@ -786,6 +841,7 @@ class NanoAudioGPT(nn.Module):
                 x, cos, sin, cache=cache, text_emb=text_emb, text_kv_mask=text_kv_mask,
                 lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask,
                 input_pos=input_pos, attn_mask=attn_mask,
+                cross_kv=cross_kv_caches[i] if cross_kv_caches is not None else None,
             )
             new_caches.append(new_cache)
         x = self.ln_final(x)
@@ -1039,6 +1095,19 @@ class NanoAudioGPT(nn.Module):
                     caches.append(StaticLayerKVCache(k, v))
                 return caches
 
+            # Per-stage cross-attention K/V caches (one BlockCrossKV per layer).
+            # Filled lazily on the eager prefill forward, then reused on every decode
+            # step so kv_proj(cond) is never recomputed. None when there's no cross
+            # conditioning, or when the cache is disabled (A/B benchmark handle).
+            has_cross = (
+                self.cfg.use_text_conditioning or self.cfg.use_lyric_conditioning
+            )
+
+            def _make_cross_kv() -> "list[BlockCrossKV] | None":
+                if not (has_cross and self._use_cross_kv_cache):
+                    return None
+                return [BlockCrossKV() for _ in range(self.cfg.n_layers)]
+
             # Encode lyric streams ONCE (the encoder is ~100M params — encoding
             # per decode step would dominate cost). Reused across all steps.
             lyric_pos = lyric_kv_pos = None
@@ -1141,6 +1210,7 @@ class NanoAudioGPT(nn.Module):
                     scales.append(stem_cfg_scale)
             for s in stages:
                 s["caches"] = _make_caches()
+                s["cross_kv"] = _make_cross_kv()
 
             # Mutable holder so a runtime compile/cudagraph failure can disable the
             # compiled path mid-generation and fall back to eager (identical
@@ -1164,6 +1234,7 @@ class NanoAudioGPT(nn.Module):
                             lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
                             melody_emb=s["mel"], stem_emb=s["stem"],
                             input_pos=input_pos, attn_mask=attn_mask,
+                            cross_kv_caches=s["cross_kv"],
                         )
                     except Exception as e:  # noqa: BLE001 — compile/cudagraph fallback
                         if not use_compiled:
@@ -1178,6 +1249,7 @@ class NanoAudioGPT(nn.Module):
                             lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
                             melody_emb=s["mel"], stem_emb=s["stem"],
                             input_pos=input_pos, attn_mask=attn_mask,
+                            cross_kv_caches=s["cross_kv"],
                         )
                     # Clone: under CUDA graphs the compiled forward's output is a
                     # reused static buffer, so two sequential CFG-stage calls would

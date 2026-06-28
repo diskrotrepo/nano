@@ -284,8 +284,13 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
           f"of ~{batch_size} across up to {MAX_CONTAINERS} containers...", flush=True)
 
     def flush() -> None:
+        # Atomic write (temp + os.replace): tags.json is loaded WHOLE at train
+        # startup, and a kill mid-write (preemption is routine on Modal) would
+        # otherwise truncate it. The volume commit below persists the replaced file.
         tags_path.parent.mkdir(parents=True, exist_ok=True)
-        tags_path.write_text(json.dumps(existing, indent=2))
+        tmp = tags_path.with_suffix(tags_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(existing, indent=2))
+        os.replace(tmp, tags_path)
         # Retry a transient DataLossError so a storage blip on the periodic
         # flush doesn't crash the orchestrator and trigger a full rescan +
         # fleet re-spawn.
