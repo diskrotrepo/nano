@@ -59,6 +59,9 @@ app = modal.App("nano-prepare")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")  # ffprobe ships with ffmpeg
+    # numpy backs the optional --quality-gate signal metrics (audio_quality); the
+    # decode itself goes through the ffmpeg binary above, so no librosa/soundfile.
+    .pip_install("numpy")
     # Required for `modal deploy` (used by the ingest orchestrator's from_name
     # lookup): unlike `modal run`, deploy does NOT auto-mount the entrypoint's
     # package, so the top-level `from diskrot...` import below would fail with
@@ -92,8 +95,12 @@ MANIFEST_PATH = "/tokens/prepare_manifest.json"
 )
 class Validator:
     @modal.method()
-    def validate_batch(self, names: list[str]) -> list[dict]:
-        """ffprobe + sha256 each file. No mutations, no commits."""
+    def validate_batch(self, names: list[str], quality_gate: bool = False) -> list[dict]:
+        """ffprobe + sha256 each file. No mutations, no commits.
+
+        ``quality_gate``: additionally decode each otherwise-ok file (via ffmpeg)
+        and run the content-quality metrics — flags hard-clipped, mostly-silent,
+        dead, and very-low-bitrate files as ``low_quality`` (deleted on --apply)."""
         import hashlib
         import json
         import subprocess
@@ -164,6 +171,22 @@ class Validator:
                 size_bytes=size_bytes,
                 sha256=sha,
             )
+
+            # Content quality gate (opt-in). Only assess files that would otherwise
+            # be kept — undecodable/too_short/too_long already lose, no point
+            # decoding them. A decode failure inside assess_file yields an empty
+            # array → "ok" (we don't second-guess a file ffprobe accepted).
+            if quality_gate and status == "ok":
+                from diskrot.audio_quality import assess_file
+                try:
+                    q = assess_file(path, bit_rate=bit_rate)
+                    entry["quality"] = q.metrics
+                    if q.status == "low_quality":
+                        entry["status"] = "low_quality"
+                        entry["quality_reasons"] = q.reasons
+                except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+                    entry["quality_error"] = str(e)[:200]
+
             results.append(entry)
         return results
 
@@ -244,15 +267,13 @@ def _build_report(
     kept = [v for v in files.values() if v.get("status") == "ok"]
     counts = {
         "undecodable": 0, "too_short": 0, "duplicate": 0, "too_long": 0,
+        "low_quality": 0,
     }
     for v in files.values():
         s = v.get("status")
         if s in counts:
             counts[s] += 1
-    total_marked = (
-        counts["undecodable"] + counts["too_short"]
-        + counts["duplicate"] + counts["too_long"]
-    )
+    total_marked = sum(counts.values())
 
     durations = sorted(v["duration_s"] for v in kept if v.get("duration_s"))
 
@@ -297,7 +318,8 @@ def _build_report(
         f"(undecodable {counts['undecodable']:,} · "
         f"too_short {counts['too_short']:,} · "
         f"duplicate {counts['duplicate']:,} · "
-        f"too_long {counts['too_long']:,})"
+        f"too_long {counts['too_long']:,} · "
+        f"low_quality {counts['low_quality']:,})"
     )
     if durations:
         lines.append(
@@ -339,13 +361,16 @@ def run_prepare(
     apply: bool = False,
     batch_size: int = 64,
     wave_id: str = "",
+    quality_gate: bool = False,
 ):
     """Full prepare pass: list pending, validate across CPU containers, dedup,
     re-classify, then (if --apply) delete undecodable / too_short / duplicate /
-    too_long files. Designed to be `.spawn()`-ed from the local entrypoint so
-    the user can launch and walk away — progress and the dry-run report stream
-    to this orchestrator's container logs. ``wave_id`` scopes the pass to
-    /corpus/waves/wave_<id> (the dedup manifest stays global)."""
+    too_long / low_quality files. Designed to be `.spawn()`-ed from the local
+    entrypoint so the user can launch and walk away — progress and the dry-run
+    report stream to this orchestrator's container logs. ``wave_id`` scopes the
+    pass to /corpus/waves/wave_<id> (the dedup manifest stays global).
+    ``quality_gate`` turns on the content-quality metrics (decode + clip/silence/
+    bitrate checks) — opt-in because the decode is real CPU work per file."""
     from datetime import datetime, timezone
 
     pending, manifest, all_names = list_pending.remote(wave_id=wave_id)
@@ -370,7 +395,11 @@ def run_prepare(
         # counter (and manifest checkpointing) while the other 20 containers sat
         # idle but billing. With it off, completed batches yield immediately and
         # preemptions become invisible.
-        for batch in Validator().validate_batch.map(chunks, order_outputs=False):
+        if quality_gate:
+            print("  quality gate ON — decoding each file for clip/silence/bitrate checks")
+        for batch in Validator().validate_batch.map(
+            chunks, kwargs={"quality_gate": quality_gate}, order_outputs=False
+        ):
             for entry in batch:
                 manifest["files"][entry["stem"]] = entry
             n_done += len(batch)
@@ -427,7 +456,8 @@ def run_prepare(
     on_disk = set(all_names)
     deletion_names = [
         v["name"] for v in manifest["files"].values()
-        if v.get("status") in ("undecodable", "too_short", "duplicate", "too_long")
+        if v.get("status") in (
+            "undecodable", "too_short", "duplicate", "too_long", "low_quality")
         and v["name"] in on_disk
     ]
 
@@ -450,6 +480,7 @@ def main(
     apply: bool = False,
     batch_size: int = 64,
     wave_id: str = "",
+    quality_gate: bool = False,
 ):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
@@ -457,7 +488,9 @@ def main(
     # validation report and progress stream to the orchestrator's logs (watch
     # below), not this terminal — unlike the old inline entrypoint.
     # --wave-id N scopes prepare to /corpus/waves/wave_N.
-    fc = run_prepare.spawn(apply=apply, batch_size=batch_size, wave_id=wave_id)
+    fc = run_prepare.spawn(
+        apply=apply, batch_size=batch_size, wave_id=wave_id, quality_gate=quality_gate,
+    )
     mode = "apply" if apply else "dry-run"
     print(f"prepare launched (detached, {mode}) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "

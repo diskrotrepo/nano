@@ -3,21 +3,37 @@
 Runs ONE wave end-to-end by calling each deployed stage's workhorse function in
 sequence:
 
-    prepare -> tokenize -> melody -> stems -> auto_tag -> transcribe -> structure
+    prepare(+quality-gate) -> audio_dedup -> tokenize -> melody -> stems -> auto_tag
+            -> transcribe -> filter_lyrics -> align_lyrics -> structure -> tempo
             -> pack_append -> cleanup -> phonemize -> key_detect
 
 Each call blocks until that stage's full pass returns, so only one stage runs at
 a time — which means at most one GPU fan-out is ever active and a 50-GPU account
 cap is respected automatically (no extra throttling needed).
 
+Data-quality stages (raise the training floor, all toggleable):
+  - ``--with-quality-gate`` (default on): prepare also decodes each file and drops
+    clipped/silent/dead/low-bitrate audio (cheap CPU, folds into prepare).
+  - ``--with-dedup`` (default on): acoustic near-duplicate removal (chromaprint +
+    SimHash) after prepare, before tokenize — catches re-uploads SHA-256 misses
+    (cheap CPU). Deletes the non-keeper copies, like prepare.
+  - ``--with-filter`` (default on): null Whisper-hallucinated lyric entries
+    ("Thanks for watching" etc.) after transcribe, before align/phonemize — a cheap
+    global shard sweep so junk trains as <instrumental>, not <vocals>+garbage.
+  - ``--with-align`` (default ON; disable with ``--no-with-align``): forced-align
+    lyric word timestamps after the filter (torchaudio MMS_FA; ``--align-use-demucs``
+    for vocal-isolated, sharper but costlier). The one added GPU stage (L4) — it runs
+    every wave by default; turn it off per wave if you need to save the GPU cost.
+
 PREREQUISITE — deploy the stage apps once so they can be looked up by name
 (``modal run`` apps are ephemeral and can't be looked up; ``modal deploy``
 registers them). Set the R2 env (``NANO_AUDIO_BUCKET`` / ``NANO_AUDIO_ENDPOINT``,
 + the ``r2-creds`` secret) in the shell you DEPLOY from — the mount is fixed at
-deploy time::
+deploy time. RE-DEPLOY ``prepare`` after this change (its ``quality_gate`` param is
+new), and deploy the two new apps (``audio_dedup``, ``align_lyrics``)::
 
-    for m in prepare tokenize melody stems auto_tag transcribe structure tempo \
-             pack_cache wave_cleanup phonemize key_detect; do
+    for m in prepare audio_dedup tokenize melody stems auto_tag transcribe filter_lyrics \
+             align_lyrics structure tempo pack_cache wave_cleanup phonemize key_detect; do
         modal deploy diskrot/modal_$m.py
     done
 
@@ -71,6 +87,11 @@ def ingest_wave(
     with_lyrics: bool = True,
     with_structure: bool = True,
     with_tempo: bool = True,
+    with_quality_gate: bool = True,
+    with_dedup: bool = True,
+    with_filter: bool = True,
+    with_align: bool = True,
+    align_use_demucs: bool = False,
     structure_sample_pct: int = 50,
     stems_sample_pct: int = 50,
     drop_mp3: bool = False,
@@ -113,7 +134,15 @@ def ingest_wave(
         print(f"[wave {wave_id}] <<< {stage} done", flush=True)
 
     # CPU/GPU stages serialized by the blocking .remote() calls above.
-    run("prepare", "nano-prepare", "run_prepare", apply=True, wave_id=wave_id)
+    # prepare: validate/dedupe/length-drop (+ optional content quality gate). The
+    # quality gate decodes each file (clip/silence/bitrate) and drops garbage.
+    run("prepare", "nano-prepare", "run_prepare",
+        apply=True, wave_id=wave_id, quality_gate=with_quality_gate)
+    if with_dedup:
+        # Acoustic near-dup removal BEFORE tokenize so we never tokenize a re-upload
+        # SHA-256 missed. Deletes the non-keeper copies (apply=True), like prepare.
+        # The fingerprint manifest is global, so cross-wave dups are caught too.
+        run("audio_dedup", "nano-audio-dedup", "run_dedup", apply=True, wave_id=wave_id)
     run("tokenize", "nano-tokenize", "run_tokenize",
         min_seconds=min_seconds, batch_size=tokenize_batch, wave_id=wave_id)
     if with_melody:
@@ -139,6 +168,18 @@ def ingest_wave(
         # comes from the audio-LLM captioner (auto_tag, above), so there is no
         # separation step. Resume-by-skip on carried-over waves.
         run("transcribe", "nano-transcribe", "orchestrate", wave_id=wave_id)
+        if with_filter:
+            # Null Whisper-hallucinated lyric entries (global shard sweep, cheap CPU,
+            # idempotent) BEFORE align/phonemize so junk trains as <instrumental>, not
+            # <vocals>+garbage, and alignment doesn't spend GPU on entries it'll null.
+            # transcribe is fully done here (sequential), so no race with its flush.
+            run("filter_lyrics", "nano-filter-lyrics", "filter_remote", apply=True)
+        if with_align:
+            # Forced-align lyric word timestamps (GPU, L4). Refinement-only — any
+            # failure keeps the original Whisper timestamp, so it never regresses.
+            # After the filter (skips nulled entries); idempotent (aligned stamp).
+            run("align_lyrics", "nano-align-lyrics", "run_align",
+                apply=True, wave_id=wave_id, use_demucs=align_use_demucs)
     if with_structure:
         # sample_pct<100 runs allin1 (the ~28%-of-wave structure stage) on only a
         # deterministic fraction; non-sampled songs fall back to <no_section>.
@@ -172,6 +213,11 @@ def main(
     with_lyrics: bool = True,
     with_structure: bool = True,
     with_tempo: bool = True,
+    with_quality_gate: bool = True,
+    with_dedup: bool = True,
+    with_filter: bool = True,
+    with_align: bool = True,
+    align_use_demucs: bool = False,
     structure_sample_pct: int = 50,
     stems_sample_pct: int = 50,
     drop_mp3: bool = False,
@@ -183,6 +229,9 @@ def main(
         with_melody=with_melody, with_stems=with_stems, with_tags=with_tags,
         with_lyrics=with_lyrics,
         with_structure=with_structure, with_tempo=with_tempo,
+        with_quality_gate=with_quality_gate, with_dedup=with_dedup,
+        with_filter=with_filter, with_align=with_align,
+        align_use_demucs=align_use_demucs,
         structure_sample_pct=structure_sample_pct,
         stems_sample_pct=stems_sample_pct, drop_mp3=drop_mp3,
     )
