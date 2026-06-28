@@ -178,11 +178,19 @@ def test_vocal_crop_bias_increases_word_hits(synth_tokens_dir, tmp_path):
     the large majority of the time. Drives _choose_crop_start directly so the
     crop position is observable."""
     import random
+    from diskrot.dataset import _FRAME_RATE_HZ
 
-    rate = DACodec.FRAME_RATE_HZ
+    # Use the dataset's OWN frame rate (codec-dependent: DAC 86 Hz / SpectroStream
+    # 25 Hz) so the crop geometry is identical regardless of NANO_CODEC — hardcoding
+    # DACodec.FRAME_RATE_HZ here made the test fail under NANO_CODEC=spectrostream
+    # (the biasing code is fine). See the nano-codec-env-breaks-dac-tests note.
+    rate = _FRAME_RATE_HZ
     seg = 500
     T = 1000
-    word = {"word": "late", "start": 10.0, "end": 10.5}  # ~860-903 frames, late
+    # Anchor the word LATE in FRAME space (~860-903 of 1000) and convert to seconds
+    # with `rate`, so it stays late (uniform usually misses) under any codec.
+    w_start_f, w_end_f = 860, 903
+    word = {"word": "late", "start": w_start_f / rate, "end": w_end_f / rate}
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=T))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({"song_000": {"words": [word]}}))

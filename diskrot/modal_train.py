@@ -213,11 +213,14 @@ DEFAULTS = {
     "lyric_enc_layers": 3,
     "lyric_enc_heads": 8,
     "lyric_enc_d_ff": 4096,
-    # 512 (up from 256): a dense 60s crop carries ~400-600 phoneme tokens; the
-    # old 256 cap silently truncated the tail (lyric_encoder.append_unit_capped),
-    # losing alignment signal on the back half of busy crops. Sizes only the
-    # encoder PE (non-persistent) + the dataset cap — no checkpoint reshape.
-    "max_lyric_len": 512,
+    # 1024 (up from 512): the 512 cap was sized for 60s crops (~400-600 phoneme
+    # tokens), but v9 trains on 180s crops — a dense/wordy 180s window can exceed
+    # 1500 IPA tokens, so 512 silently truncated the tail (append_unit_capped),
+    # starving the back half of busy crops of alignment signal (the exact failure
+    # bias_vocal_crops fixes, reintroduced at the crop tail). Hits the densest sung
+    # examples (rap/fast pop) hardest. Sizes only the encoder PE (non-persistent) +
+    # the dataset cap — no checkpoint reshape, free for a fresh run.
+    "max_lyric_len": 1024,
     # Melody (chroma) conditioning — a small additive encoder over the 12-bin
     # chromagram (~13M params). Enabled together with tags + lyrics.
     "melody_n_bins": 12,
@@ -246,7 +249,17 @@ DEFAULTS = {
     "use_stem_conditioning": True,
     "stem_enc_layers": 2,
     "n_stem_types": 4,
-    "stem_prob": 0.15,
+    # 0.08 (down from 0.15): stem-add batches whose target is a non-vocal stem
+    # DROP the lyric stream (train.py: lyric_drop = ... or stem_drop_lyrics), so
+    # with 4 stem types ~3/4 of stem batches drop lyrics ON TOP of the 10%
+    # cfg_dropout — at 0.15 the effective lyric-drop was ~20%. 0.08 keeps the
+    # /addstem capability while giving the sung-words objective more batches.
+    "stem_prob": 0.08,
+    # Codebook-0 loss up-weight (intelligibility lever). 1.0 = OFF (flat loss over
+    # all 24 codebooks, identical to history). >1.0 (try ~1.5) weights cb0 — the
+    # codebook carrying most phonetic content — harder, to push singing. cb0 is
+    # where v8 diverged in warmup, so only raise this with a short validation run.
+    "cb0_loss_weight": 1.0,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 4 (global 32 on 8 ranks)
 
@@ -271,6 +284,7 @@ def _build_cfg_kwargs(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ) -> dict:
     """Shared TrainConfig builder for both single- and multi-GPU paths.
     Returns a plain dict so it survives mp.spawn pickling.
@@ -326,6 +340,7 @@ def _build_cfg_kwargs(
         distill_from=f"/ckpts/{distill_from}" if distill_from else None,
         distill_alpha=distill_alpha,
         distill_tau=distill_tau,
+        cb0_loss_weight=cb0_loss_weight,
     )
 
 

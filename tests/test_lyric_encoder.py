@@ -83,8 +83,9 @@ def test_vocab_size_and_uniqueness():
     assert len(set(PHONEME_VOCAB)) == PHONEME_VOCAB_SIZE  # no dup ids
     # v9 multilingual: 4 specials + 9 structure + 3 gender + 15 tempo
     # (1 unknown + 14 buckets) + 25 key (1 unknown + 24 keys) + 3 vocal
-    # + 36 lang (1 unknown + 35 langs) + 157 IPA codepoints
-    assert PHONEME_VOCAB_SIZE == 252
+    # + 36 lang (1 unknown + 35 langs) + 161 IPA codepoints (incl. the 4 espeak
+    # phones added in cec4f1f: ᵻ ä ɫ ᵝ). Bumping this is checkpoint-incompatible.
+    assert PHONEME_VOCAB_SIZE == 256
 
 
 # --- structure markers -------------------------------------------------------

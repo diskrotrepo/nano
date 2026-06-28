@@ -187,7 +187,7 @@ def test_gptconfig_k24_shapes():
 def test_phoneme_vocab_unique_and_sized():
     import model.lyric_encoder as le
 
-    assert len(set(le.PHONEME_VOCAB)) == len(le.PHONEME_VOCAB) == le.PHONEME_VOCAB_SIZE == 252
+    assert len(set(le.PHONEME_VOCAB)) == len(le.PHONEME_VOCAB) == le.PHONEME_VOCAB_SIZE == 256
     assert le.PAD_PHONEME_ID == 0  # PAD stays at id 0
     # IPA phones + language markers are present
     assert all(c in le.PHONEME_TO_ID for c in ["ɛ", "ʃ", "ŋ", "θ", "ː"])

@@ -78,6 +78,13 @@ class TrainConfig:
     phonemes_path: str | None = None  # path to the pre-phonemized phonemes/ dir (diskrot.phonemize)
     tempo_path: str | None = None  # path to tempo.json (diskrot.tempo_detect); dense bpm, overrides structure bpm
     cfg_dropout: float = 0.1  # probability of dropping text conditioning (classifier-free guidance)
+    # Codebook-0 loss up-weight (an intelligibility lever). 1.0 = OFF — a flat
+    # per-token mean over all K codebooks, byte-identical to the historical loss.
+    # >1.0 weights cb0 (the codebook carrying most phonetic/semantic content) more
+    # heavily in the pooled TRAINING loss to bias capacity toward singing; try ~1.5.
+    # cb0 is also where v8 diverged during warmup, so validate on a short run. The
+    # val metric stays unweighted (comparable across configs / to run history).
+    cb0_loss_weight: float = 1.0
     # Fraction of training batches reordered into the FIM (infill) layout. Only
     # active when model.use_fim is True. A FIM batch drops lyric conditioning
     # (its sung alignment can't survive a frame reorder) but keeps tags and the
@@ -622,14 +629,20 @@ def _trend_label(history) -> str:
     return f"😐 about the same over last {n} checkups"
 
 
-def _loss_fn(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _loss_fn(
+    logits: torch.Tensor, targets: torch.Tensor, pad_id: int, cb0_weight: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor]:
     """logits: [B, K, T, V], targets: [B, K, T] -> (total_loss, per_cb_loss [K]).
 
     Computes per-token CE once with ``reduction='none'`` (which honors
     ignore_index by zeroing pad positions) and derives both the global mean and
     per-codebook means from that single tensor. This replaces a Python loop of
     1 + K=9 ``F.cross_entropy`` calls with 1 call + a couple of reductions —
-    fewer kernel launches and less Python overhead per training step."""
+    fewer kernel launches and less Python overhead per training step.
+
+    ``cb0_weight`` (default 1.0) up-weights codebook 0 in the pooled total — the
+    intelligibility lever. At 1.0 the total is the flat per-token mean, identical
+    to the historical loss; any other value uses the weighted pool below."""
     B, K, T, V = logits.shape
     per_pos = F.cross_entropy(
         logits.reshape(B * K * T, V),
@@ -643,7 +656,16 @@ def _loss_fn(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> tuple[
     cb_count = mask.sum(dim=(0, 2)).clamp(min=1.0)  # [K]
     per_cb = cb_sum / cb_count
 
-    total = (per_pos * mask).sum() / mask.sum().clamp(min=1.0)
+    if cb0_weight == 1.0:
+        total = (per_pos * mask).sum() / mask.sum().clamp(min=1.0)
+    else:
+        # Pooled mean with codebook 0 up-weighted. Reduces EXACTLY to the flat
+        # per-token mean when cb0_weight == 1.0: total = sum_k cb_sum[k] /
+        # sum_k cb_count[k]. Weighting scales cb0's loss AND its token count by w
+        # in that pool, so it stays a proper (token-count-aware) weighted mean.
+        w = torch.ones(K, dtype=per_pos.dtype, device=per_pos.device)
+        w[0] = cb0_weight
+        total = (w * cb_sum).sum() / (w * cb_count).sum().clamp(min=1.0)
     return total, per_cb
 
 
@@ -654,6 +676,7 @@ def _distill_loss(
     pad_id: int,
     tau: float,
     alpha: float,
+    cb0_weight: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Knowledge-distillation loss -> (total, ce, kd, per_cb).
 
@@ -668,7 +691,7 @@ def _distill_loss(
     ``targets != pad_id`` mask CE uses, so the delay-pattern pad tail never
     contributes. per_cb is the per-codebook CE (for logging continuity).
     """
-    ce, per_cb = _loss_fn(student_logits, targets, pad_id)
+    ce, per_cb = _loss_fn(student_logits, targets, pad_id, cb0_weight=cb0_weight)
 
     # F.kl_div(input=student_logp, target=teacher_logp, log_target=True) computes
     # sum_v exp(target) * (target - input) = KL(teacher || student) per position.
@@ -1522,9 +1545,10 @@ def train_run(
                                        target_stem_type=m_target_stem,
                                        stem_keep=m_stem_keep)
                 loss, ce_term, kd_term, per_cb = _distill_loss(
-                    logits, t_logits, targets, pad_id, cfg.distill_tau, cfg.distill_alpha)
+                    logits, t_logits, targets, pad_id, cfg.distill_tau, cfg.distill_alpha,
+                    cb0_weight=cfg.cb0_loss_weight)
             else:
-                loss, per_cb = _loss_fn(logits, targets, pad_id)
+                loss, per_cb = _loss_fn(logits, targets, pad_id, cb0_weight=cfg.cb0_loss_weight)
                 ce_term = kd_term = None
         optim.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
