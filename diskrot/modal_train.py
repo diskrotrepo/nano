@@ -243,17 +243,20 @@ DEFAULTS = {
     # song. On a stem-add batch the decoder TARGET is one isolated stem and the
     # conditioning is the song's OTHER stems (+ the target-stem caption via tags);
     # lyrics/melody drop. Needs the packed stem sidecar (modal_stems -> pack with
-    # stem_cache_dir). A new submodule (StemEncoder), so it's checkpoint-incompatible
-    # — it rides the v9 fresh start. ON for v9. ``stem_prob`` is the fraction of
-    # batches run in stem-add mode (trades against full-song training).
-    "use_stem_conditioning": True,
+    # stem_cache_dir). A new submodule (StemEncoder), so it's checkpoint-incompatible.
+    #
+    # OFF for v9 (2026-06-28 cost decision): the stems prep stage (Demucs + 4x codec
+    # on GPU) is the single most expensive prep line (~$7.6k at 50% sampling / ~$15k
+    # at 100%), AND a stem-add batch only fires when EVERY song in the per-rank batch
+    # has stems — at <100% sampling that's ~0.4% of batches, so the feature barely
+    # trains unless you pay for ~100% coverage. Worst cost/value of all the streams,
+    # so /addstem is deferred to a later continued-train if it earns it. Dropping it
+    # also removes the stem-add lyric-drop, restoring the clean 10% lyric-drop (more
+    # batches train singing). Set True + run the stems stage to re-enable on a fresh
+    # start. ``stem_prob`` is unused while this is False.
+    "use_stem_conditioning": False,
     "stem_enc_layers": 2,
     "n_stem_types": 4,
-    # 0.08 (down from 0.15): stem-add batches whose target is a non-vocal stem
-    # DROP the lyric stream (train.py: lyric_drop = ... or stem_drop_lyrics), so
-    # with 4 stem types ~3/4 of stem batches drop lyrics ON TOP of the 10%
-    # cfg_dropout — at 0.15 the effective lyric-drop was ~20%. 0.08 keeps the
-    # /addstem capability while giving the sung-words objective more batches.
     "stem_prob": 0.08,
     # Codebook-0 loss up-weight (intelligibility lever). 1.0 = OFF (flat loss over
     # all 24 codebooks, identical to history). >1.0 (try ~1.5) weights cb0 — the
