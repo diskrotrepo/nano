@@ -9,8 +9,9 @@ Pipeline:
   2. A single container groups the signatures (LSH bands + Hamming + union-find,
      ``diskrot.audio_dedup``), keeps the best copy per group (highest bitrate), and
      reports the rest.
-  3. ``--apply`` deletes the non-keeper near-dups from /corpus (the R2 unlink flushes
-     through the CloudBucketMount, like prepare). Default is dry-run.
+  3. ``--apply`` deletes the non-keeper near-dups from R2 (batched S3 DeleteObjects
+     via boto3, like prepare — ~1000 keys/request, not one FUSE unlink per file).
+     Default is dry-run.
 
 Run AFTER prepare (so byte-dupes/garbage are already gone) and before the GPU stages
 (don't fingerprint/tokenize/caption a song you're about to delete).
@@ -26,7 +27,9 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import (
+    bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
+)
 
 app = modal.App("nano-audio-dedup")
 
@@ -34,6 +37,8 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     # fpcalc (chromaprint) + ffprobe (ffmpeg). fpcalc decodes the audio itself.
     .apt_install("ffmpeg", "libchromaprint-tools")
+    # boto3 drives the batched R2 DeleteObjects in apply_deletions.
+    .pip_install("boto3")
     .add_local_python_source("diskrot")
 )
 
@@ -123,18 +128,18 @@ def write_manifest(manifest: dict) -> None:
     tokens_vol.commit()
 
 
-@app.function(image=image, volumes={"/corpus": corpus_vol}, timeout=60 * 60)
+@app.function(
+    image=image,
+    # No /corpus mount: batch delete goes straight to R2 via boto3, not one
+    # FUSE unlink per file. See modal_common.bulk_delete_r2.
+    secrets=[modal.Secret.from_name("r2-creds"), r2_env_secret()],
+    timeout=60 * 60,
+)
 def apply_deletions(names: list[str]) -> int:
-    n = 0
-    for name in names:
-        try:
-            (Path("/corpus") / name).unlink()
-            n += 1
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            print(f"failed to delete {name}: {e}")
-    return n
+    n_deleted, errors = bulk_delete_r2(names)
+    if errors:
+        print(f"({len(errors)} objects failed to delete)")
+    return n_deleted
 
 
 @app.function(

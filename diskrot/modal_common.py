@@ -128,6 +128,59 @@ def corpus_mount(read_only: bool = True):
     return modal.CloudBucketMount(bucket, **kwargs)
 
 
+def r2_env_secret():
+    """Secret carrying NANO_AUDIO_BUCKET / NANO_AUDIO_ENDPOINT into the container.
+
+    ``corpus_mount()`` reads these locally to configure the CloudBucketMount, so
+    they're baked into the *mount* but NOT present in the container's env. Any
+    code that talks to R2 directly (``bulk_delete_r2``'s boto3 client) needs them
+    at runtime, so capture the local values at app-build time and inject them.
+    Pair with ``modal.Secret.from_name("r2-creds")`` (the AWS-style keys)."""
+    d = {k: os.environ[k] for k in ("NANO_AUDIO_BUCKET", "NANO_AUDIO_ENDPOINT")
+         if os.environ.get(k)}
+    return modal.Secret.from_dict(d)
+
+
+def bulk_delete_r2(names, *, batch_size: int = 1000, log=print):
+    """Delete R2 objects by key via the S3 multi-object ``DeleteObjects`` API.
+
+    ``names`` are keys relative to the bucket root — exactly the paths the
+    CloudBucketMount exposes under /corpus (e.g. ``waves/wave_17/song.mp3``).
+    Deletes up to 1000 objects per request instead of one FUSE ``unlink()``
+    network round-trip per file, turning a serial ~1 hr delete of ~20k objects
+    into a few seconds.
+
+    Requires the ``r2-creds`` secret (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+    and ``r2_env_secret()`` (bucket + endpoint) attached to the calling function.
+    Returns ``(n_deleted, errors)`` where ``errors`` is a list of the S3 error
+    dicts (``{Key, Code, Message}``). ``DeleteObjects`` is idempotent, so keys
+    that are already gone count as deleted (no FileNotFound bookkeeping needed)."""
+    import boto3
+
+    bucket = os.environ.get("NANO_AUDIO_BUCKET", "nano-audio")
+    endpoint = os.environ.get("NANO_AUDIO_ENDPOINT")  # R2/S3-compatible endpoint
+    # region_name="auto" is R2's convention and avoids boto3's NoRegionError.
+    s3 = boto3.client("s3", endpoint_url=endpoint, region_name="auto")
+
+    total = len(names)
+    n_deleted = 0
+    errors: list = []
+    for i in range(0, total, batch_size):
+        batch = names[i:i + batch_size]
+        # Quiet=True → R2 returns only the failures, not the (large) success list.
+        resp = s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+        )
+        batch_errors = resp.get("Errors", [])
+        errors.extend(batch_errors)
+        n_deleted += len(batch) - len(batch_errors)
+        for e in batch_errors:
+            log(f"failed to delete {e.get('Key')}: {e.get('Code')} {e.get('Message')}")
+        log(f"  deleted {min(i + batch_size, total):,}/{total:,}")
+    return n_deleted, errors
+
+
 def wave_subdir(wave_id: str) -> str:
     """'' (flat legacy layout) or 'waves/wave_<id>' for a wave ingest."""
     return f"waves/wave_{wave_id}" if wave_id else ""

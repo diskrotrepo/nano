@@ -1,6 +1,6 @@
 # nano
 
-Nano-scale audio generation model. Uses the Descript Audio Codec (DAC) to tokenize audio into 9 codebooks, then trains a MusicGen-style delayed-sequence transformer to predict next frames autoregressively. Supports text conditioning (genre/mood descriptions) and audio style transfer via CLAP embeddings.
+Nano-scale audio generation model. Tokenizes audio with a neural codec — the default v9 path uses SpectroStream (48 kHz, joint stereo, 24 codebooks) — then trains a MusicGen-style delayed-sequence transformer to predict next frames autoregressively. (The Descript Audio Codec (DAC) — 44.1 kHz mono, 9 codebooks — is the code default, selected via `NANO_CODEC`.) Supports text conditioning (genre/mood descriptions via pooled CLAP), sung lyrics (a phoneme `LyricEncoder`, not CLAP), and melody conditioning (a time-aligned chromagram).
 
 > **New to ML?** [README.explained.md](README.explained.md) walks through the whole project from first principles for engineers with a CS background but no ML experience — what a transformer actually is, why audio gets turned into integers, what the delay pattern accomplishes, and what the training log lines mean.
 
@@ -10,14 +10,14 @@ nano is a single bespoke model. Its shape is the `DEFAULTS` dict in [diskrot/mod
 
 | | |
 |---|---|
-| Parameters | ~1.5B (with text-conditioning cross-attention, on by default; ~1.14B without) |
+| Parameters | ~2.08B (2,077M, with text/lyric/melody conditioning, on by default; ~1.2B / 1,208M without) |
 | d_model / layers / heads / d_ff | 2048 / 22 / 16 / 8192 |
 | Positional encoding | RoPE (`rope_base` 10000), `max_seq_len` 8192 |
-| Training segments | 30s |
+| Training segments | 180s (Modal default) |
 | Training steps | 400,000 (Modal default; early stopping at `patience=20`) |
 | Corpus | your own MP3s, served from a sharded mmap layout (~50k songs minimum recommended) |
-| Audio codec | Descript Audio Codec (DAC) — 9 codebooks, 1024 vocab each, 86 Hz frame rate |
-| Max single-shot generation | ~95s (via the 8192-token RoPE table) |
+| Audio codec | SpectroStream — 24 codebooks, 1024 vocab each, 25 Hz frame rate, joint stereo, 48 kHz (the v9 path; select with `NANO_CODEC=spectrostream`). DAC — 9 codebooks, 86 Hz, mono, 44.1 kHz — is the code default fallback |
+| Max single-shot generation | ~5.4 minutes on SpectroStream — a full song fits in one shot (via the 8192-token RoPE table; ~95s under DAC's 86 Hz) |
 | Inference | CPU, MPS (Apple Silicon), or CUDA — no GPU required |
 
 This is a bespoke model: it is trained at scale on one kind of data. More of the same data helps; variety does not — the corpus is not curated for genre/style diversity. You supply your own MP3s (stored in the R2 `nano-audio` bucket); **plan on at least ~50,000 songs** for coherent musical output (below ~10,000 the model mostly produces noise, useful only for validating the pipeline), with quality improving as you add more of the same kind of data — object storage has no inode cap, so the corpus can grow without a hard ceiling.
@@ -100,6 +100,11 @@ curl -X POST http://localhost:8000/generate \
   --output rock.mp3
 ```
 
+Lyrics can be steered with inline `[marker]` brackets — gender, tempo, key,
+vocals, and song section, e.g. `[female] [120bpm] [a minor] [chorus] walking
+through the city lights tonight`. See [README.prompting.md](README.prompting.md)
+for the full marker syntax.
+
 Generate with a style reference audio:
 
 ```bash
@@ -134,5 +139,17 @@ curl -X POST http://localhost:8000/extend \
 By default the cut point is the clip's tail, so this just appends 10s onto the end.
 Pass `-F from_seconds=30` to instead keep the original up to 0:30, regenerate from
 there, and discard whatever came after. Chain `/extend` calls to grow clips past the
-~95 second single-shot limit. All endpoints accept optional `prompt`, `lyrics`,
+~5.4 minute single-shot limit. All endpoints accept optional `prompt`, `lyrics`,
 `style_audio`, and `style_weight` parameters.
+
+### More endpoints
+
+Beyond `/generate` and `/extend`, the server also exposes `/cover` (re-render a
+hummed/uploaded melody in the prompt's timbre, via its chromagram), `/infill`
+(fill the gap between two clips), `/stem` (Demucs source separation — no model),
+and `/addstem` (generate a new stem that fits an existing song). `/infill` and
+`/addstem` need a checkpoint trained for them; the v9 checkpoint disables both
+(`use_fim=False`, `use_stem_conditioning=False`), so they return HTTP 400.
+
+See [README.prompting.md](README.prompting.md) for the full lyric `[marker]`
+syntax and ready-to-paste recipes for every endpoint.

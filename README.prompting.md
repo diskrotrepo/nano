@@ -288,9 +288,11 @@ lyrics:       [chorus]
 
 **Worked sequence: build a full song from sections**
 
-Because nano generates ~60s at a time, you assemble a longer, structured song by chaining
-`/extend` and switching the **vocals** and **section** markers per call. Each call returns
-`[everything so far | new part]`, so the **last file is the whole song.** Restate
+nano can generate up to **~5.4 min in one shot** (a full ~3 min song fits), so you no
+longer *have* to stitch — but for a very long or tightly structured song you can still
+assemble it by chaining `/extend` and switching the **vocals** and **section** markers per
+call. Each call returns `[everything so far | new part]`, so the **last file is the whole
+song.** Restate
 `[tempo]`/`[key]` (and gender) on *every* call — the marker header is per-call, not
 inherited; the audio tail is what carries timbre across the seam.
 
@@ -363,8 +365,8 @@ melody_cfg_scale: 2.5
 
 ### `/infill` — bridge two clips *(needs a FIM-trained checkpoint)*
 
-> ⚠️ The current v8 checkpoint ships with FIM **disabled**, so `/infill` returns HTTP 400
-> on it. This recipe applies once a FIM-trained checkpoint is served.
+> ⚠️ The current v9 checkpoint ships with FIM **disabled** (`use_fim=False`), so `/infill`
+> returns HTTP 400 on it. This recipe applies once a FIM-trained checkpoint is served.
 
 ```
 before_audio:  intro.mp3

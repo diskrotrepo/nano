@@ -6,6 +6,8 @@ This is a bespoke model: it trains on one kind of data at scale. You supply your
 
 **Recommended corpus size:** at least **~50,000 songs** for coherent musical output. Below **~10,000 songs** the model mostly produces noise — useful only for validating the pipeline end-to-end, not for a real model. More of the same kind of data keeps helping, so larger is better; the raw audio lives in the R2 `nano-audio` bucket (object storage — no inode cap, so no hard file ceiling). A tiny "smoke" corpus is still handy for exercising the pipeline, but it will not produce musical output.
 
+> **⚠️ #1 footgun — the codec is selected by an env var that Modal does NOT forward.** v9 tokenizes the corpus with **SpectroStream** (Magenta RealTime's codec: 48 kHz, joint stereo, **24 codebooks** predicted, **25 Hz** frame rate), selected with `export NANO_CODEC=spectrostream`. Modal doesn't forward your local shell env to remote containers, so you MUST set it at **both `modal deploy` and `modal run` time** — every stage that tokenizes or reads tokens (tokenize, stems, train, serve) has to agree on the codec, and a mismatch silently corrupts the pipeline. The code default is still **DAC** (44.1 kHz, **mono**, 9 codebooks, 86 Hz) — that's the fallback, not the v9 path. (SpectroStream's 25 Hz frame rate is also why single-shot generation reaches ~5.4 min instead of DAC's ~95 s.)
+
 ## Cost summary
 
 Cost for the data-prep steps scales roughly linearly with corpus size, so the table below quotes them **per 1,000 songs** — multiply by however many thousands of songs you bring. Training is the exception: its cost is driven by `steps` and model size, **not** corpus size, so it's a flat range. All cost estimates are against Modal's published GPU prices ([modal.com/pricing](https://modal.com/pricing)).
@@ -13,19 +15,24 @@ Cost for the data-prep steps scales roughly linearly with corpus size, so the ta
 | Step | GPU | Per 1,000 songs |
 |---|---|---|
 | 1. Upload | — | uplink-bound (~0.7 GB/min at 100 Mbps) |
-| 2. Prepare | CPU × 20 | ~20 s, <$0.01 |
+| 2. Prepare (+ optional `--quality-gate`) | CPU × 20 | ~20 s, <$0.01 |
+| 2b. Audio-dedup (optional, after prepare) | CPU × 50 | negligible |
 | 3. Tokenize | L4 × 50 | ~1.5 min, ~$0.07–0.10 |
-| 4. Auto-tag (optional) | L4 × 20 | ~0.5 min, ~$0.02 |
-| 4b. Transcribe lyrics (optional) | L4 × 50 | ~14 min, ~$5–7 |
+| 3b. Melody (optional, after tokenize — for `/cover`) | CPU × 50 | negligible |
+| 3c. Stems (optional, after tokenize — for `/addstem`) | GPU × 50 | most expensive optional stage (Demucs; `--sample-pct 50` halves it) |
+| 4. Auto-tag (optional) | A100 × 50 | audio-LLM captioner (Qwen2-Audio-7B) |
+| 4b. Transcribe lyrics (optional) | L4 × 50 | ~$5–7 (Demucs-free now, much cheaper than before) |
 | 4c. Filter lyrics (recommended, after 4b) | CPU | negligible (seconds, one container) |
-| 4d. Phonemize (recommended, after 4c) | CPU × 16 | negligible (~$1 full corpus) |
+| 4d. Align lyrics (optional, after filter) | L4 × 50 | forced alignment, refinement-only |
+| 4e. Phonemize (recommended, after 4c) | CPU × 16 | negligible (~$1 full corpus) |
 | 5. Pack (sharded mmap) | CPU | negligible |
 | 5b. Key detect (optional, after 5) | CPU × 4 | negligible (~$1 full corpus) |
-| 6. Train (flat — corpus-independent) | H100 × 8 DDP | a few thousand USD for the full 400k-step run |
+| 5c. Tempo (optional, dense tempo markers) | CPU | negligible |
+| 6. Train (flat — corpus-independent) | B200 × 4 DDP | a few thousand USD for the full 400k-step run |
 
-GPU rates used above (as of 2026-05): H100 ≈ $5.92/hr, A100-40 ≈ $3.10/hr, L4 ≈ $0.30/hr, debian_slim CPU ≈ $0.10/hr.
+GPU rates used above (as of 2026-05): B200 ≈ $6.25/hr, H100 ≈ $5.92/hr, A100-40 ≈ $3.10/hr, L4 ≈ $0.30/hr, debian_slim CPU ≈ $0.10/hr.
 
-Modal bills per second of actual compute, and the tokenize/tag/transcribe/train steps are all detached, so wall-clock time doesn't tie up your terminal. The two expensive steps are transcribe (skip it unless you actually plan to use lyric conditioning at inference) and train. Training has early stopping with `patience=20`, so a typical run finishes 30–50% sooner than the full-step worst case.
+Modal bills per second of actual compute, and the tokenize/tag/transcribe/train steps are all detached, so wall-clock time doesn't tie up your terminal. The expensive steps are auto-tag (the audio-LLM captioner runs on A100), stems (the most expensive *optional* stage — GPU Demucs; sampled to 50% by default), transcribe (skip it unless you actually plan to use lyric conditioning at inference — but it's much cheaper now that Demucs is gone), and train. Training has early stopping with `patience=20`, so a typical run finishes 30–50% sooner than the full-step worst case.
 
 ## Prerequisites
 
@@ -98,36 +105,60 @@ Runs across ~20 CPU containers in parallel; throughput is roughly ~3,000 songs/m
 
 ## 3. Tokenize
 
-Encodes every MP3 into DAC tokens on L4 GPUs, fanned out across up to 50 containers ([modal_tokenize.py:62-68](diskrot/modal_tokenize.py#L62-L68)). Clips shorter than 20 seconds are skipped. The `.pt` files are heavily compressed int16 token tensors (~140 KB per song on average).
+Encodes every MP3 into codec tokens on L4 GPUs, fanned out across up to 50 containers ([modal_tokenize.py:62-68](diskrot/modal_tokenize.py#L62-L68)). Clips shorter than 20 seconds are skipped. The `.pt` files are heavily compressed int16 token tensors (~140 KB per song on average). For v9 the codec is **SpectroStream** — remember `export NANO_CODEC=spectrostream` at both deploy and run time (see the footgun note above); the default is DAC.
 
 ```bash
 modal volume create nano-tokens
+export NANO_CODEC=spectrostream    # v9 codec — required at deploy AND run time
 modal run --detach diskrot/modal_tokenize.py
 ```
 
 Tokens are persisted in the `nano-tokens` volume. Throughput is roughly ~600 songs/min on L4 × 50.
 
-> **L4 caveat — tokenize relies on prep's length cap.** Each L4 has 22 GiB of GPU memory and DAC's full-sequence encoder peaks at activation memory ~ proportional to audio length. The workarounds for L4 fit are: prep drops anything longer than 5:30, [modal_tokenize.py](diskrot/modal_tokenize.py) sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on the image to avoid fragmentation, and the per-container batch is forced to `batch_size=1` so 8 files don't get padded together. Even with all that, expect ~5% of files to OOM on the upper-bound lengths (single 4-5 GiB layer allocations exceeding what L4 has free). If you need 100% completion, change `gpu="L4"` → `gpu="A100"` at [modal_tokenize.py:70](diskrot/modal_tokenize.py#L70), revert the workarounds, and accept ~3× the per-GPU-hour cost.
+> **L4 caveat — tokenize relies on prep's length cap.** Each L4 has 22 GiB of GPU memory and the codec's full-sequence encoder peaks at activation memory ~ proportional to audio length. The workarounds for L4 fit are: prep drops anything longer than 5:30, [modal_tokenize.py](diskrot/modal_tokenize.py) sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on the image to avoid fragmentation, and the per-container batch is forced to `batch_size=1` so 8 files don't get padded together. Even with all that, expect ~5% of files to OOM on the upper-bound lengths (single 4-5 GiB layer allocations exceeding what L4 has free). If you need 100% completion, change `gpu="L4"` → `gpu="A100"` at [modal_tokenize.py:70](diskrot/modal_tokenize.py#L70), revert the workarounds, and accept ~3× the per-GPU-hour cost.
+
+## 3b. Melody (optional, needed for `/cover`)
+
+Extracts a time-aligned 12-bin chromagram per song and writes it as `<name>.mel.npy` to the dedicated **nano-melody** volume ([modal_melody.py](diskrot/modal_melody.py)). This is the octave-invariant melodic contour the `/cover` path conditions on (a hummed/uploaded melody re-rendered in the prompt's timbre). CPU-only and embarrassingly parallel across up to 50 containers:
+
+```bash
+modal run --detach diskrot/modal_melody.py
+```
+
+Runs **after** tokenize (it forces the chroma to the song's token frame count) and **before** pack (the packer folds `<name>.mel.npy` into a parallel `packed_NNN.mel.bin` sidecar via `--mel-cache-dir`). The chroma lives on its own volume so the ~1 file/song it adds doesn't push nano-tokens over its ~500k-inode cap. A song without a `.mel.npy` is zero-filled at pack time (membership stays identical), so a partial pass is safe — but `/cover` only works if the corpus was largely melody-covered.
+
+## 3c. Stems (optional, needed for `/addstem`)
+
+Demucs-separates each song into 4 stems (drums/bass/vocals/other), codec-tokenizes each, and writes `<name>.stems.npy` (`[4, depth, T]` int16) to the dedicated **nano-stems** volume ([modal_stems.py](diskrot/modal_stems.py)). This is what the generative `/addstem` path conditions on. It's a **GPU** stage (Demucs + the codec) and the **most expensive optional stage**, so `--sample-pct` (the ingest default is **50**) runs it on a deterministic fraction — non-sampled songs are flagged absent by the packer's present mask and just skipped as stem-add targets:
+
+```bash
+export NANO_CODEC=spectrostream    # the stems are codec-tokenized — must match the corpus
+modal run --detach diskrot/modal_stems.py --wave-id <id> --sample-pct 50
+```
+
+Runs **after** tokenize (needs the token frame count to align) and **before** pack (folded into `packed_NNN.stem.bin` via `--stem-cache-dir`). Calibrate cost with `--limit` on one wave first. Stem-add is off by default in the v9 checkpoint (`use_stem_conditioning=False`), so this stage is only worth running if you plan to train stem conditioning on.
 
 ## 4. Auto-tag (optional, needed for text conditioning)
 
-Captions each MP3 with a natural-language description (genre, mood, instruments) using the vendored LP-MusicCaps BART captioner, fanned out across up to 20 L4 containers ([modal_auto_tag.py:68-70](diskrot/modal_auto_tag.py#L68-L70)):
+Captions each MP3 with a rich, multi-facet natural-language description (genre/mood, drums, bass, instruments, vocals, production, arc) using the **audio-LLM captioner (Qwen2-Audio-7B-Instruct)** over the whole song, fanned out across up to 50 **A100** containers ([modal_auto_tag.py](diskrot/modal_auto_tag.py)). Each caption also carries a vocal-gender tag and per-stem lines — the gender marker source (so transcribe no longer needs Demucs) and the `/addstem` per-stem caption source. Set `NANO_CAPTIONER=bart` (+ the matching image) for the legacy single-window LP-MusicCaps BART captioner on L4.
 
 ```bash
-modal run --detach diskrot/modal_auto_tag.py
+modal run --detach diskrot/modal_auto_tag.py             # caption missing songs
+modal run --detach diskrot/modal_auto_tag.py --redo      # upgrade legacy short captions (resumable)
+modal run --detach diskrot/modal_auto_tag.py --limit 50  # calibrate image/cost first
 ```
 
-Writes `tags.json` to the `nano-tokens` volume. Re-running skips files already present in `tags.json` — only new MP3s are processed. Throughput is roughly ~1,700 songs/min across 20 L4 containers.
+Writes `tags.json` to the `nano-tokens` volume. Each entry is stamped with a captioner marker (`CAPTIONER_MARKER = "audio_llm_v5"`), so a bare run captions only missing songs and `--redo` re-captions only legacy/non-current entries (skips already-upgraded ones → resumable). Calibrate cost with a small `--limit` run before the full corpus — the audio-LLM is heavy (~7B, A100).
 
 ## 4b. Transcribe lyrics (optional, needed for lyric conditioning)
 
-Isolates vocals with Demucs (`htdemucs`), then transcribes them with faster-whisper (`large-v3`, word-level timestamps), fanned out across up to 50 L4 containers ([modal_transcribe.py](diskrot/modal_transcribe.py)):
+Transcribes each song with faster-whisper (`large-v3-turbo` + Silero VAD, word-level timestamps) directly on the **raw mono mix**, fanned out across up to 50 L4 containers ([modal_transcribe.py](diskrot/modal_transcribe.py)). The stage is **Demucs-free**: vocal isolation was a no-op-to-worse ASR input (arXiv:2506.15514) and was the dominant former cost, so it's gone — vocal gender now comes from the audio-LLM captioner (step 4), not an F0/Demucs pass.
 
 ```bash
 modal run --detach diskrot/modal_transcribe.py
 ```
 
-Writes a sharded `lyrics/` dir (`lyrics_NNN.json`, 256 shards keyed by a stable hash of the stem) to the `nano-tokens` volume; each entry is `{stem: {"text": ..., "words": [{word, start, end}, ...]}}` and instrumental tracks map to `null`. Sharding keeps each flush O(batch) instead of rewriting one giant JSON, and writes are atomic (temp+rename) so a kill can corrupt at most one shard. The `.map()` collect/flush loop runs in a spawned remote function, so `--detach` survives terminal close. Re-running skips files already present. **This is the single most expensive step** (~$5–7 per 1,000 songs) — skip it unless you actually plan to use lyric conditioning at inference.
+Writes a sharded `lyrics/` dir (`lyrics_NNN.json`, 256 shards keyed by a stable hash of the stem) to the `nano-tokens` volume; each entry is `{stem: {"text": ..., "words": [{word, start, end}, ...]}}` and instrumental tracks map to `null`. Sharding keeps each flush O(batch) instead of rewriting one giant JSON, and writes are atomic (temp+rename) so a kill can corrupt at most one shard. The `.map()` collect/flush loop runs in a spawned remote function, so `--detach` survives terminal close. Re-running skips files already present. This is one of the more expensive optional steps (~$5–7 per 1,000 songs, down substantially now that Demucs is gone) — skip it unless you actually plan to use lyric conditioning at inference.
 
 ## 4c. Filter hallucinated lyrics (recommended after transcribe)
 
@@ -142,7 +173,18 @@ Flags entries with fewer than 6 valid words, or a known caption-artifact phrase 
 
 To see the overall state of the lyric data at any point — per-stream coverage of the packed corpus, instrumental/hallucinated/vocal-ready breakdown, gender and word-count distributions — run the read-only audit ([scripts/lyrics_audit.py](scripts/lyrics_audit.py), safe even mid-transcribe): `modal run scripts/lyrics_audit.py`.
 
-## 4d. Phonemize (recommended after transcribe + filter)
+## 4d. Align lyrics (optional, after filter)
+
+Sharpens Whisper's loose word timestamps with a CTC forced aligner (torchaudio MMS_FA, optionally on Demucs-isolated vocals) and rewrites the refined onsets into the sharded `lyrics/` store in place ([modal_align_lyrics.py](diskrot/modal_align_lyrics.py)). It's idempotent (an `aligned` stamp) and refinement-only — any failure keeps the original timestamp. Dry-run reports eligibility cheaply (no GPU); `--apply` runs the L4 fan-out. Tighter onsets help the sung-alignment learning and the dataset's vocal-crop biasing.
+
+```bash
+modal run --detach diskrot/modal_align_lyrics.py --wave-id N              # dry-run report
+modal run --detach diskrot/modal_align_lyrics.py --wave-id N --apply      # rewrite shards
+```
+
+Runs **after** transcribe + filter, before (or around) phonemize.
+
+## 4e. Phonemize (recommended after transcribe + filter)
 
 Pre-runs g2p over every transcribed song and writes the per-word phoneme-id groups to a sharded `phonemes/` dir ([modal_phonemize.py](diskrot/modal_phonemize.py)):
 
@@ -150,7 +192,7 @@ Pre-runs g2p over every transcribed song and writes the per-word phoneme-id grou
 modal run --detach diskrot/modal_phonemize.py
 ```
 
-Why: the dataset otherwise phonemizes lazily inside the DataLoader workers, and OOV-heavy Whisper transcripts cost ~20–200 ms/song there — at corpus scale that can starve the 8×H100 training step. This pass is a ~$1 CPU one-shot that turns it into a pure lookup. Resumable (per-song skip, atomic shard rewrites); training falls back to live g2p for any song not covered, so partial is safe. Re-run it after any re-transcribe (stale entries are detected by word count and redone).
+Why: the dataset otherwise phonemizes lazily inside the DataLoader workers, and OOV-heavy Whisper transcripts cost ~20–200 ms/song there — at corpus scale that can starve the 4×B200 training step. This pass is a ~$1 CPU one-shot that turns it into a pure lookup. Resumable (per-song skip, atomic shard rewrites); training falls back to live g2p for any song not covered, so partial is safe. Re-run it after any re-transcribe (stale entries are detected by word count and redone).
 
 ## 5. Pack (sharded mmap layout)
 
@@ -180,20 +222,25 @@ modal run --detach diskrot/modal_key_detect.py
 
 CPU-only, one container, ~$1; needs the pack to carry the melody sidecar (`packed_NNN.mel.bin`). Resumable; songs without an estimate just get `<unknown_key>` at train time.
 
+## 5c. Tempo (optional, dense tempo markers)
+
+Estimates each song's tempo and writes dense `<tempo_*>` markers to `tempo.json` — the source of the tempo header/inline markers the lyric stream carries (the dataset prefers this over the allin1 per-song bpm). CPU-only, negligible cost. Songs without an estimate just get `<unknown_tempo>` at train time.
+
 ## 6. Train
 
-Trains the ~1.5B parameter transformer (d_model=2048, n_layers=22, n_heads=16, d_ff=8192) over 30-second segments with RoPE (`max_seq_len=8192`) so inference can extrapolate to ~95s single-shot generation. Defaults to 400K steps with early stopping at `patience=20`, gradient checkpointing on, and checkpoints under `/ckpts/v8_sing/` — the `DEFAULTS` dict in [diskrot/modal_train.py](diskrot/modal_train.py) is the source of truth. Text conditioning is enabled by default (requires step 4 auto-tagging).
+Trains the ~2.08B parameter transformer (d_model=2048, n_layers=22, n_heads=16, d_ff=8192) over 180-second (full-song) segments with RoPE (`max_seq_len=8192`) so inference reaches ~5.4 min single-shot generation (at SpectroStream's 25 Hz frame rate — a full song fits in one shot). Defaults to 400K steps with early stopping at `patience=20`, gradient checkpointing on, EMA on (`use_ema=True`, so `best.pt` is selected on the EMA's smoother val loss), and checkpoints under `/ckpts/v9_stereo/` — the `DEFAULTS` dict in [diskrot/modal_train.py](diskrot/modal_train.py) is the source of truth. Text conditioning is enabled by default (requires step 4 auto-tagging). Don't forget `export NANO_CODEC=spectrostream` at deploy and run time.
 
-This is a 4×B200 DDP job (the only multi-GPU function is hardwired `gpu="B200:4"`; `--n-gpus 8` would trip its device-count assert). Single-GPU is technically possible but not recommended — each rank pays the CLAP precompute and memory is tighter:
+This is a 4×B200 DDP job (the only multi-GPU function is hardwired `gpu="B200:4"`; `--n-gpus 8` would trip its `torch.cuda.device_count()` assert). Single-GPU is technically possible but not recommended — each rank pays the CLAP precompute and memory is tighter:
 
 ```bash
 modal volume create nano-ckpts
+export NANO_CODEC=spectrostream
 modal run --detach diskrot/modal_train.py --n-gpus 4
 ```
 
-The DDP path auto-picks `batch_size = 32 // n_gpus` (8 per rank on 4 ranks) → global = 32, matching the tuned LR (lr=1.5e-4, warmup=10000). Single-GPU runs use the full `batch_size=32`. Pass `--batch-size N` to override (per-rank in DDP mode); if you do, sqrt-scale the LR proportionally. Any field can be overridden on the CLI (`--d-model`, `--steps`, `--ckpt-subdir`, …).
+The DDP run reports `DDP active: world_size=4, per-rank batch=8, global batch=32`, matching the tuned LR (lr=1.5e-4, warmup=10000). Single-GPU runs use the full `batch_size=32` (`DEFAULTS["batch_size"]`). Pass `--batch-size N` to override (per-rank in DDP mode); if you do, sqrt-scale the LR proportionally. Any field can be overridden on the CLI (`--d-model`, `--steps`, `--ckpt-subdir`, …). Note that infill (`use_fim`) and stem-add (`use_stem_conditioning`) are both deferred (off) in the v9 defaults.
 
-Expect considerably more wall-clock and cost than the old 287M model — the 1.5B is ~5× the per-step compute. Rough order: a few thousand USD on 8×H100 for the full 400k steps (treat as an estimate, not a quote); early stopping (`patience=20`) commonly cuts this once the val loss plateaus. Training cost is independent of corpus size — only `steps` and model size drive it. Checkpoints land in `/ckpts/v7_1500m/` every ~5000 steps.
+Expect considerably more wall-clock and cost than the old 287M model — the ~2B is roughly an order of magnitude more per-step compute. Rough order: a few thousand USD on 4×B200 for the full 400k steps (treat as an estimate, not a quote); early stopping (`patience=20`) commonly cuts this once the val loss plateaus. Training cost is independent of corpus size — only `steps` and model size drive it. Checkpoints land in `/ckpts/v9_stereo/` every ~5000 steps.
 
 The trainer auto-switches to the sharded mmap dataset whenever `cache_dir/packed/packed_index.json` exists, so the launch line above just works after step 5 (pack) completes.
 
@@ -205,7 +252,7 @@ The DDP path went through several rounds of bug-fixing during its first real end
 
 2. **`text_encoder.proj` lives outside the DDP wrapper.** The CLAP→d_model projection ([train.py](diskrot/train.py) — `CLAPTextEncoder.proj`) is a separate `nn.Linear(1024, d_model)` (1024→1024, ~1M params, no bias) that isn't part of `NanoAudioGPT`, so DDP doesn't sync it. The code now explicitly handles both halves: `_broadcast_module_params(text_encoder.proj, src=0)` after construction makes initial weights identical across ranks; `_all_reduce_module_grads(text_encoder.proj)` between `scaler.unscale_(optim)` and `optim.step()` averages per-rank grads each step. See helpers in [diskrot/train.py](diskrot/train.py).
 
-3. **Batch-size auto-default.** Without `--batch-size`, `main()` resolves the right per-rank value: `DDP_PER_RANK_BATCH` (8) when `--n-gpus > 1`, the full `batch_size` (64) otherwise. A startup line prints which value was picked so it's not silent. Override with any positive `--batch-size N`; sentinel `0` (the default) means auto.
+3. **Batch-size auto-default.** Without `--batch-size`, `main()` resolves the right per-rank value: `DDP_PER_RANK_BATCH` (8 per rank → global 32 on 4 ranks) when `--n-gpus > 1`, the full `batch_size` (32, `DEFAULTS["batch_size"]`) otherwise. A startup line prints which value was picked so it's not silent. Override with any positive `--batch-size N`; sentinel `0` (the default) means auto.
 
 4. **`model.cfg` doesn't passthrough DDP/compile wrappers.** `_evaluate()` previously read `model.cfg.pad_id`; on DDP runs that raised `AttributeError: 'DistributedDataParallel' object has no attribute 'cfg'` at the first checkup (step 1000). Now reads `cfg.model.pad_id` from the passed `TrainConfig` instead. If you add new DDP-mode code paths, prefer `cfg.model.<x>` over `model.<x>` for any `<x>` that isn't an `nn.Module` method.
 
@@ -215,7 +262,7 @@ The DDP path went through several rounds of bug-fixing during its first real end
 
 ```bash
 mkdir -p checkpoints
-modal volume get nano-ckpts /v7_1500m/best.pt ./checkpoints/latest.pt --force
+modal volume get nano-ckpts /v9_stereo/best.pt ./checkpoints/latest.pt --force
 ```
 
 Then follow the [inference instructions](README.md#inference) in the main README. The server reads `GPTConfig` from the checkpoint's `cfg` dict, so any checkpoint works without client-side flag changes.

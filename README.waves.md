@@ -48,8 +48,8 @@ registers them so `modal_ingest_wave.py` can call them. Deploy **with the R2 env
 vars exported** so the mount resolves:
 
 ```bash
-for m in prepare tokenize melody stems auto_tag transcribe structure tempo \
-         pack_cache wave_cleanup phonemize key_detect; do
+for m in prepare audio_dedup tokenize melody stems auto_tag transcribe filter_lyrics \
+         align_lyrics structure tempo pack_cache wave_cleanup phonemize key_detect; do
     modal deploy diskrot/modal_$m.py
 done
 ```
@@ -72,15 +72,17 @@ rclone copy ./downloads/wave_17 r2:nano-audio/waves/wave_17/
 modal run --detach diskrot/modal_ingest_wave.py --wave-id 17
 ```
 
-Runs `prepare → tokenize → melody → stems → auto_tag → transcribe → structure →
-pack_append → cleanup → phonemize → key_detect`, each blocking until done (so
-only one GPU stage runs at a time — respects a 50-GPU cap automatically).
-Resumable: a re-run with the same `--wave-id` skips stages already marked done in
+Runs `prepare(+quality-gate) → audio_dedup → tokenize → melody → stems → auto_tag
+→ transcribe → filter_lyrics → align_lyrics → structure → tempo → pack_append →
+cleanup → phonemize → key_detect`, each blocking until done (so only one GPU stage
+runs at a time — respects a 50-GPU cap automatically). Resumable: a re-run with the
+same `--wave-id` skips stages already marked done in
 `/tokens/waves/wave_17/status.json`, and each stage also resumes mid-stage by
 skip-by-existence. Toggle streams with `--no-with-melody` / `--no-with-tags` /
-`--no-with-lyrics` / `--no-with-structure`. Leave the raw mp3s in R2 (no inode
-cap, and they're the re-derivation source) — `--drop-mp3` deletes a wave's source
-audio from the bucket and is only for reclaiming space you don't need.
+`--no-with-lyrics` / `--no-with-structure` / `--no-with-tempo`. **Stems are default
+OFF** (`--with-stems` to enable the GPU `/addstem` conditioning stage). Leave the raw
+mp3s in R2 (no inode cap, and they're the re-derivation source) — `--drop-mp3` deletes
+a wave's source audio from the bucket and is only for reclaiming space you don't need.
 
 ### Option B — per-stage (no deploy needed)
 
@@ -114,9 +116,12 @@ baseline):
 
 ```bash
 modal run --detach diskrot/modal_train.py \
-    --init-from v8_sing4/best.pt --ckpt-subdir v9_genre \
+    --init-from v9_stereo/best.pt --ckpt-subdir v9_genre \
     --lr 5e-5 --warmup-steps 2000 --steps 150000 --n-gpus 4
 ```
+
+(The multi-GPU path is hardwired to **4×B200** — `--n-gpus 4` is the default; `--n-gpus 8`
+fails the device-count assert.)
 
 ---
 
@@ -142,5 +147,6 @@ encodes only new tags.
 - Tested locally (`tests/test_pack_append.py`, `tests/test_sharded_store.py`,
   276 passing); the Modal pipeline itself should be validated with a small
   (~500-song) smoke wave before a full 100k one.
-- The append invariant (prior shards stay byte-identical; the existing 427k pack
-  is never repacked) is the guard that makes growth cheap and safe.
+- The append invariant (prior shards stay byte-identical; the existing pack — a
+  ~427k-song snapshot at the time this was written — is never repacked) is the guard
+  that makes growth cheap and safe.

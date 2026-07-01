@@ -52,7 +52,9 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import (
+    bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
+)
 
 app = modal.App("nano-prepare")
 
@@ -61,7 +63,8 @@ image = (
     .apt_install("ffmpeg")  # ffprobe ships with ffmpeg
     # numpy backs the optional --quality-gate signal metrics (audio_quality); the
     # decode itself goes through the ffmpeg binary above, so no librosa/soundfile.
-    .pip_install("numpy")
+    # boto3 drives the batched R2 DeleteObjects in apply_deletions.
+    .pip_install("numpy", "boto3")
     # Required for `modal deploy` (used by the ingest orchestrator's from_name
     # lookup): unlike `modal run`, deploy does NOT auto-mount the entrypoint's
     # package, so the top-level `from diskrot...` import below would fail with
@@ -69,8 +72,9 @@ image = (
     .add_local_python_source("diskrot")
 )
 
-# read_only=False: prepare deletes undecodable/dup/too-long files in place
-# (R2 bucket — unlinks flush through the CloudBucketMount, no .commit()).
+# read_only=False kept for parity with the wave-scoped listing; the actual
+# deletions no longer go through this mount — apply_deletions batch-deletes
+# straight from R2 via boto3 (see modal_common.bulk_delete_r2).
 corpus_vol = corpus_mount(read_only=False)
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
@@ -231,24 +235,15 @@ def write_manifest(manifest: dict) -> None:
 
 @app.function(
     image=image,
-    volumes={"/corpus": corpus_vol},
+    # No /corpus mount: batch delete goes straight to R2 via boto3 (r2-creds =
+    # AWS keys, r2_env_secret = bucket + endpoint), not one FUSE unlink per file.
+    secrets=[modal.Secret.from_name("r2-creds"), r2_env_secret()],
     timeout=60 * 60,
 )
 def apply_deletions(names: list[str]) -> int:
-    n_deleted = 0
-    n_missing = 0
-    for name in names:
-        path = Path("/corpus") / name
-        try:
-            path.unlink()
-            n_deleted += 1
-        except FileNotFoundError:
-            n_missing += 1
-        except OSError as e:
-            print(f"failed to delete {name}: {e}")
-    # corpus is an R2 CloudBucketMount: unlinks flush through the FUSE mount; no commit().
-    if n_missing:
-        print(f"(skipped {n_missing} already-gone files)")
+    n_deleted, errors = bulk_delete_r2(names)
+    if errors:
+        print(f"({len(errors)} objects failed to delete)")
     return n_deleted
 
 
