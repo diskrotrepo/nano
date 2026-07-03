@@ -90,10 +90,13 @@ MAX_DURATION_S = 330.0  # 5:30
 MANIFEST_PATH = "/tokens/prepare_manifest.json"
 
 
+VALIDATOR_MAX_CONTAINERS = 50
+
+
 @app.cls(
     image=image,
     cpu=1.0,
-    max_containers=20,
+    max_containers=VALIDATOR_MAX_CONTAINERS,
     volumes={"/corpus": corpus_vol},
     timeout=60 * 60,
 )
@@ -108,9 +111,9 @@ class Validator:
         import hashlib
         import json
         import subprocess
+        from concurrent.futures import ThreadPoolExecutor
 
-        results: list[dict] = []
-        for name in names:
+        def validate_one(name: str) -> dict:
             path = Path("/corpus") / name
             entry: dict = {"name": name, "stem": path.stem}
 
@@ -128,8 +131,7 @@ class Validator:
                 if proc.returncode != 0 or not proc.stdout.strip():
                     err = (proc.stderr or "ffprobe failed").strip()
                     entry.update(status="undecodable", error=err[:200])
-                    results.append(entry)
-                    continue
+                    return entry
                 meta = json.loads(proc.stdout)
                 streams = meta.get("streams", [])
                 fmt = meta.get("format", {})
@@ -144,8 +146,7 @@ class Validator:
             except (subprocess.TimeoutExpired, json.JSONDecodeError,
                     OSError, ValueError) as e:
                 entry.update(status="undecodable", error=str(e)[:200])
-                results.append(entry)
-                continue
+                return entry
 
             try:
                 h = hashlib.sha256()
@@ -158,8 +159,7 @@ class Validator:
                 sha = h.hexdigest()
             except OSError as e:
                 entry.update(status="undecodable", error=f"hash: {e}"[:200])
-                results.append(entry)
-                continue
+                return entry
 
             if duration_s < MIN_DURATION_S:
                 status = "too_short"
@@ -191,8 +191,14 @@ class Validator:
                 except (subprocess.TimeoutExpired, OSError, ValueError) as e:
                     entry["quality_error"] = str(e)[:200]
 
-            results.append(entry)
-        return results
+            return entry
+
+        # A few threads overlap the R2 FUSE read-waits: ffprobe/ffmpeg are
+        # subprocesses and sha256 releases the GIL, so the per-file work is
+        # I/O-bound from this process's view. Keep the pool small — the
+        # container reserves 1 core; bursts above it bill actual usage.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            return list(pool.map(validate_one, names))
 
 
 @app.function(
@@ -376,7 +382,7 @@ def run_prepare(
         chunks = [pending[i:i + batch_size]
                   for i in range(0, len(pending), batch_size)]
         print(f"validating {len(pending):,} files in {len(chunks):,} batches "
-              f"of ~{batch_size} across up to 20 containers...")
+              f"of ~{batch_size} across up to {VALIDATOR_MAX_CONTAINERS} containers...")
         n_done = 0
         last_checkpoint = 0
         # Persist the manifest periodically so a worker preemption (these run

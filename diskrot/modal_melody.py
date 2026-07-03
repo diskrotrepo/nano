@@ -79,9 +79,13 @@ _BATCH = 200           # songs per worker call (bounds commit frequency)
 
 @app.cls(
     image=image,
-    cpu=2.0,
+    # The decode + chroma_cqt loop is single-core serial, so 1 reserved core is
+    # the right size; 100 x 1-core containers = the same peak reservation as the
+    # old 50 x 2-core at roughly half the wall-clock.
+    cpu=1.0,
+    memory=2048,
     timeout=60 * 60,
-    max_containers=50,
+    max_containers=100,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol, "/melody": melody_vol},
 )
 class MelodyExtractor:

@@ -42,7 +42,9 @@ stems_vol = modal.Volume.from_name("nano-stems", create_if_missing=True)
 
 @app.function(
     image=image,
-    cpu=8.0,
+    # The 16-thread shard load is FUSE-latency-bound and GIL-serialized, not
+    # CPU-bound — 2 reserved cores carry it; bursts above bill actual usage.
+    cpu=2.0,
     # ~5 GB per shard worth of int16 tensors held in RAM during the per-shard
     # parallel load, plus Python overhead. 16 GB is generous headroom.
     memory=16 * 1024,
@@ -109,7 +111,8 @@ def pack_remote(
 
 @app.function(
     image=image,
-    cpu=8.0,
+    # Same sizing rationale as pack_remote: FUSE-latency-bound threaded load.
+    cpu=2.0,
     memory=16 * 1024,
     # A wave is ~100k songs -> ~20 shards, so this is far quicker than a full
     # pack, but keep the generous ceiling for safety.

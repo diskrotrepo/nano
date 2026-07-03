@@ -51,7 +51,9 @@ FP_LENGTH_S = 120  # fingerprint the first ~2 min (a re-encode matches over that
 
 @app.cls(
     image=image,
-    cpu=2.0,
+    # fpcalc and ffprobe run strictly serially per file, single-threaded — a
+    # second reserved core never does fingerprint work, it just doubles the bill.
+    cpu=1.0,
     max_containers=50,
     volumes={"/corpus": corpus_vol},
     timeout=60 * 60,

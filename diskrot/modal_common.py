@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import warnings
+from pathlib import Path
 
 import modal
 
@@ -184,6 +185,18 @@ def bulk_delete_r2(names, *, batch_size: int = 1000, log=print):
 def wave_subdir(wave_id: str) -> str:
     """'' (flat legacy layout) or 'waves/wave_<id>' for a wave ingest."""
     return f"waves/wave_{wave_id}" if wave_id else ""
+
+
+def list_wave_mp3s(corpus_root: Path, wave_id: str) -> list[Path]:
+    """MP3s a stage should process for *wave_id*.
+
+    '' globs the flat legacy root (non-recursive — empty now that the corpus
+    lives under waves/), 'all' sweeps every waves/wave_*/ folder in one pass
+    (e.g. a whole-corpus --redo), anything else scopes to waves/wave_<id>.
+    """
+    if wave_id == "all":
+        return sorted(corpus_root.glob("waves/wave_*/*.mp3"))
+    return sorted((corpus_root / wave_subdir(wave_id)).glob("*.mp3"))
 
 
 def assert_stage_produced_output(

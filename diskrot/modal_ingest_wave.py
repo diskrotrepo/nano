@@ -80,7 +80,7 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 def ingest_wave(
     wave_id: str,
     min_seconds: int = 20,
-    tokenize_batch: int = 8,
+    tokenize_batch: int = 64,
     with_melody: bool = True,
     with_stems: bool = False,
     with_tags: bool = True,
@@ -158,11 +158,11 @@ def ingest_wave(
     if with_tags:
         # batch_size=256 (auto_tag's own default), NOT 16: each .map element is
         # run as ONE vLLM continuous batch, internally pipelined in
-        # NANO_CAPTION_SUBBATCH(=64)-sized sub-batches so CPU decode overlaps GPU
+        # NANO_CAPTION_SUBBATCH(=128)-sized sub-batches so CPU decode overlaps GPU
         # generate. At 16 there's a single 16-song sub-batch and that overlap
         # never engages — the A100 idles during decode. 256 keeps it saturated.
         run("auto_tag", "nano-auto-tag", "run_auto_tag",
-            batch_size=256, flush_every_batches=4, wave_id=wave_id)
+            batch_size=256, flush_every_batches=25, wave_id=wave_id)
     if with_lyrics:
         # Transcribe is Demucs-free: Whisper runs on the raw mix and vocal gender
         # comes from the audio-LLM captioner (auto_tag, above), so there is no
@@ -206,7 +206,7 @@ def ingest_wave(
 def main(
     wave_id: str = "",
     min_seconds: int = 20,
-    tokenize_batch: int = 8,
+    tokenize_batch: int = 64,
     with_melody: bool = True,
     with_stems: bool = False,
     with_tags: bool = True,

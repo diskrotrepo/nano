@@ -12,8 +12,9 @@ tags.json-scale, loaded sparse at train time (a song without an entry gets
 ``<unknown_key>``). Songs whose chroma is all-zero (the packer's zero-fill for a
 missing .mel.npy) are skipped, never guessed.
 
-Resumable: the output is rewritten atomically after every shard, and a re-run
-skips songs already present, so a kill mid-sweep only loses the in-flight shard.
+Resumable: the output is rewritten atomically every ``flush_every_shards``
+shards (and once at the end), and a re-run skips songs already present, so a
+kill mid-sweep only re-derives the few un-flushed shards' mean-chroma.
 
 CLI::
 
@@ -101,13 +102,18 @@ def detect_keys(
     out_path: str | Path | None = None,
     verbose: bool = True,
     commit_cb=None,
+    flush_every_shards: int = 10,
 ) -> Path:
     """Sweep every melody-packed shard under ``<cache_dir>/packed`` and write
     ``<cache_dir>/keys.json``. Returns the output path.
 
     Shards packed without melody are skipped with a note (their songs simply get
     no entry -> ``<unknown_key>`` at train time). ``commit_cb`` (e.g. a Modal
-    volume commit) runs after each per-shard atomic rewrite."""
+    volume commit) runs after each atomic rewrite. The growing keys.json is
+    rewritten whole every ``flush_every_shards`` shards (plus once at the end),
+    not after every shard — at corpus scale the per-shard rewrite is ~O(corpus)
+    write/commit amplification, and a kill between flushes only re-derives a few
+    shards' worth of mean-chroma (seconds of CPU) on resume."""
     from diskrot.pack_cache import (
         PACKED_DIR, load_shard_index, load_shard_meta, open_shard_mel_mmap,
     )
@@ -122,8 +128,15 @@ def detect_keys(
         if verbose:
             print(f"[key] resuming: {len(keys)} songs already in {out_path}", flush=True)
 
+    def flush() -> None:
+        _atomic_write_json(keys, out_path)
+        if commit_cb is not None:
+            commit_cb()
+
     index = load_shard_index(packed_dir)
     n_done = n_skipped_flat = 0
+    shards_since_flush = 0
+    dirty = False
     t0 = time.time()
     for shard_entry in index["shards"]:
         shard_id = shard_entry["shard_id"]
@@ -147,14 +160,19 @@ def detect_keys(
             keys[name] = {"key": label}
             n_done += 1
         del mel_mm
-        _atomic_write_json(keys, out_path)
-        if commit_cb is not None:
-            commit_cb()
+        dirty = True
+        shards_since_flush += 1
+        if shards_since_flush >= flush_every_shards:
+            flush()
+            shards_since_flush = 0
+            dirty = False
         if verbose:
             print(f"[key] shard {shard_id:03d}: {len(keys)} total "
                   f"(+{n_done} new, {n_skipped_flat} flat/zero skipped, "
                   f"{time.time() - t0:.0f}s)", flush=True)
 
+    if dirty or not out_path.exists():
+        flush()
     if verbose:
         print(f"[key] done: {len(keys)} songs -> {out_path} "
               f"({n_skipped_flat} skipped, {time.time() - t0:.0f}s)", flush=True)

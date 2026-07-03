@@ -4,14 +4,19 @@ Each container loads the audio-LLM captioner (Qwen2-Audio,
 [model/audio_llm_captioner.py]) once in ``@modal.enter()``, then captions a batch
 of MP3 files over the WHOLE song into rich multi-facet descriptions (the chunked-
 CLAP tag path conditions on them in full). The orchestrator lists pending files,
-dispatches batches via ``.map()``, and periodically flushes ``tags.json`` on the
-tokens volume. Set ``NANO_CAPTIONER=bart`` (+ the matching image) for the legacy
-single-window LP-MusicCaps captioner.
+dispatches batches via ``.map()``, and periodically flushes the sharded tags
+store (``/tokens/tags/tags_NNN.json``, O(touched-shards) per flush) on the tokens
+volume; a merged ``tags.json`` compat file is written once at end-of-stage for
+the single-file readers (train startup, audit scripts). Set ``NANO_CAPTIONER=bart``
+(+ the matching image) for the legacy single-window LP-MusicCaps captioner.
 
 Run (spawns and returns immediately; --detach keeps the app alive):
     modal run --detach diskrot/modal_auto_tag.py            # caption missing songs
     modal run --detach diskrot/modal_auto_tag.py --redo     # + upgrade legacy short captions (resumable)
     modal run --detach diskrot/modal_auto_tag.py --limit 50 # calibrate the image/cost first
+    modal run --detach diskrot/modal_auto_tag.py --wave-id all --redo  # whole-corpus upgrade sweep
+                                                            # (all waves/wave_*/; a bare --redo globs
+                                                            # only the flat legacy root, empty post-R2)
 
 Watch:
     modal app logs nano-auto-tag -f
@@ -28,7 +33,8 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import assert_stage_produced_output, corpus_mount, wave_subdir
+from diskrot.modal_common import assert_stage_produced_output, corpus_mount, list_wave_mp3s
+from diskrot.sharded_store import load_json_shards, shard_index, write_json_shards
 
 app = modal.App("nano-auto-tag")
 
@@ -107,7 +113,17 @@ image = (
     # here — v0.23.0 doesn't recognize it (logs "Unknown vLLM environment
     # variable") and it's inert. The real forward-proofing is to LOCK the vllm
     # version above so the resolver can't drift back onto a FlashInfer default.
-    .env({"VLLM_USE_FLASHINFER_SAMPLER": "0"})
+    .env({
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        # Throughput knobs, baked from the deploying shell (override there to
+        # calibrate). max_num_seqs=32 (the engine default in audio_llm_captioner)
+        # left the already-reserved KV cache under-filled on the bandwidth-bound
+        # decode; 64 fills it. The decode sub-batch must EXCEED max_num_seqs so
+        # the scheduler backfills as sequences finish instead of draining to
+        # empty at each generate()'s tail.
+        "NANO_VLLM_MAX_NUM_SEQS": os.environ.get("NANO_VLLM_MAX_NUM_SEQS", "64"),
+        "NANO_CAPTION_SUBBATCH": os.environ.get("NANO_CAPTION_SUBBATCH", "128"),
+    })
     .add_local_python_source("model", "diskrot")
 )
 
@@ -124,7 +140,11 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 @app.cls(
     image=image,
-    gpu="A100",  # Qwen2-Audio-7B in fp16 (~15 GB) — too big for the L4
+    # Qwen2-Audio-7B in fp16 (~15 GB) — too big for the L4. NANO_AUTOTAG_GPU
+    # (read in the deploying/`modal run` shell, like tokenize's NANO_SPIKE_GPU)
+    # is the probe lever for H100 / A100-80GB $/song comparisons — identical
+    # weights and greedy decode, so outputs are quality-equivalent.
+    gpu=os.environ.get("NANO_AUTOTAG_GPU", "A100"),
     timeout=60 * 60 * 4,
     max_containers=MAX_CONTAINERS,
     # Retry an element whose container died under it (preemption, OOM, platform
@@ -238,20 +258,26 @@ class Captioner:
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
 def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
-                 redo: bool = False) -> None:
+                 redo: bool = False, limit: int = 0) -> None:
     """Full pass: list pending, fan out across Captioner containers, merge into
     tags.json with periodic flushes. Spawned from the local entrypoint so
     the user can launch and walk away. ``wave_id`` scopes the input glob to
-    /corpus/waves/wave_<id>; tags.json keys stay the song stem either way.
+    /corpus/waves/wave_<id> ("all" sweeps every wave folder in one launch);
+    tags.json keys stay the song stem either way.
     ``redo=True`` ALSO re-captions songs whose existing caption is NOT the current
     format (legacy/short ones, identified by the ``captioner`` marker) — but skips
     those already upgraded, so a killed --redo resumes instead of restarting. A
     bare run still only captions songs missing from tags.json entirely."""
-    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
+    mp3s = list_wave_mp3s(Path("/corpus"), wave_id)
     tags_path = Path("/tokens/tags.json")
+    tags_dir = Path("/tokens/tags")
     existing: dict = {}
     if tags_path.exists():
         existing = json.loads(tags_path.read_text())
+    # Overlay the sharded store (the flush target below): on a mid-stage resume
+    # the shards are newer than the last end-of-stage compat tags.json, so they
+    # win. A never-sharded volume just yields an empty dict here.
+    existing.update(load_json_shards(tags_dir, "tags"))
 
     def _pending(mp3) -> bool:
         if mp3.stem not in existing:
@@ -274,6 +300,12 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
         print(f"fresh run: {len(mp3s):,} mp3s, 0 already captioned, "
               f"{len(pending):,} pending", flush=True)
 
+    if limit and len(pending) > limit:
+        print(f"--limit {limit:,}: capping this pass at {limit:,} of "
+              f"{len(pending):,} pending songs (calibration mode; captions are "
+              f"real output, skipped on the next full pass)", flush=True)
+        pending = pending[:limit]
+
     if not pending:
         print("Nothing to caption — all files already in tags.json", flush=True)
         return
@@ -283,14 +315,9 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
     print(f"dispatching {len(pending):,} files in {len(chunks):,} batches "
           f"of ~{batch_size} across up to {MAX_CONTAINERS} containers...", flush=True)
 
-    def flush() -> None:
-        # Atomic write (temp + os.replace): tags.json is loaded WHOLE at train
-        # startup, and a kill mid-write (preemption is routine on Modal) would
-        # otherwise truncate it. The volume commit below persists the replaced file.
-        tags_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = tags_path.with_suffix(tags_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(existing, indent=2))
-        os.replace(tmp, tags_path)
+    touched: set[int] = set()
+
+    def commit_with_retry() -> None:
         # Retry a transient DataLossError so a storage blip on the periodic
         # flush doesn't crash the orchestrator and trigger a full rescan +
         # fleet re-spawn.
@@ -303,6 +330,17 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
                     raise
                 print(f"commit failed ({e}); retry {attempt + 1}/2", flush=True)
                 time.sleep(2.0 * (attempt + 1))
+
+    def flush() -> None:
+        # O(touched) flush: rewrite only the hash shards that gained entries
+        # since the last flush (atomic per shard). The monolithic tags.json is
+        # deliberately NOT rewritten here — at 1.3M entries each re-serialize is
+        # a multi-second O(corpus) stall inside the .map consume loop that
+        # backpressures the GPU fleet; the single-file readers get one compat
+        # write at end-of-stage instead.
+        write_json_shards(tags_dir, "tags", existing, only_shards=touched)
+        commit_with_retry()
+        touched.clear()
 
     captioner = Captioner()
     n_done = n_failed = 0
@@ -332,6 +370,7 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
                 n_failed += 1
             else:
                 existing[stem] = tags
+                touched.add(shard_index(stem))
                 n_done += 1
         batch_idx += 1
         if batch_idx % flush_every_batches == 0:
@@ -340,9 +379,18 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
             pct = 100.0 * done / len(pending)
             print(f"  progress {done:,}/{len(pending):,} ({pct:.1f}%) "
                   f"— captioned {n_done:,}, failed {n_failed:,} "
-                  f"(saved to tags.json)", flush=True)
+                  f"(saved to the tags shard store)", flush=True)
 
     flush()
+    # Compat write for the single-file readers (modal_train's tags_path, the
+    # audit/eval scripts): one O(corpus) merged tags.json per stage run instead
+    # of per flush. Atomic (temp + os.replace) — tags.json is loaded WHOLE at
+    # train startup, and a kill mid-write must never truncate it.
+    tags_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tags_path.with_suffix(tags_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(existing))
+    os.replace(tmp, tags_path)
+    commit_with_retry()
     print(f"\ncaptioned: {n_done:,}  failed: {n_failed:,}", flush=True)
     assert_stage_produced_output("auto_tag", n_done, len(pending), n_failed)
     if n_batch_errors:
@@ -353,21 +401,24 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
 
 
 @app.local_entrypoint()
-def main(batch_size: int = 256, flush_every_batches: int = 4, wave_id: str = "",
-         redo: bool = False):
+def main(batch_size: int = 256, flush_every_batches: int = 25, wave_id: str = "",
+         redo: bool = False, limit: int = 0):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.
-    # --wave-id N scopes captioning to /corpus/waves/wave_N; --redo re-captions all.
+    # --wave-id N scopes captioning to /corpus/waves/wave_N ("all" = every wave
+    # folder — the whole-corpus sweep); --redo re-captions legacy/non-current.
+    # --limit N caps the pass at N pending songs (calibration mode).
     # batch_size default 256: each .map element is run as ONE vLLM continuous batch
     # (internally pipelined in NANO_CAPTION_SUBBATCH-sized sub-batches so CPU decode
     # overlaps GPU compute), keeping the GPU saturated; the orchestrator still
-    # flushes tags.json every flush_every_batches elements.
+    # flushes the tags shard store every flush_every_batches elements.
     fc = run_auto_tag.spawn(
         batch_size=batch_size,
         flush_every_batches=flush_every_batches,
         wave_id=wave_id,
         redo=redo,
+        limit=limit,
     )
     print(f"auto-tag launched (detached) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "

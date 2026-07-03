@@ -386,7 +386,7 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
 
 
 @app.local_entrypoint()
-def main(min_seconds: int = 20, batch_size: int = 8, wave_id: str = ""):
+def main(min_seconds: int = 20, batch_size: int = 64, wave_id: str = ""):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.

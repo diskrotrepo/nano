@@ -238,7 +238,8 @@ def estimate_vocal_gender(vocals: np.ndarray, sr: int) -> str | None:
 
 def _transcribe(whisper_model, asr_vocals: np.ndarray,
                 gender_vocals: np.ndarray | None = None,
-                estimate_gender: bool = True) -> dict | None:
+                estimate_gender: bool = True,
+                batch_size: int | None = None) -> dict | None:
     """Transcribe ``asr_vocals`` (mono @44100Hz). Returns {text, words, ...} or None.
 
     ``asr_vocals`` is what Whisper sees — the isolated vocal stem (normal path) or
@@ -250,7 +251,14 @@ def _transcribe(whisper_model, asr_vocals: np.ndarray,
     entirely — vocal gender now comes from the audio-LLM captioner, so transcribe
     runs Whisper-on-mix with no Demucs. The output dict then omits ``gender`` and
     the dataset sources it from tags.json. ``estimate_gender=True`` (default) keeps
-    the legacy F0 ``gender`` field for any caller still on the Demucs path."""
+    the legacy F0 ``gender`` field for any caller still on the Demucs path.
+
+    ``batch_size`` (the v9 Modal path): ``whisper_model`` is a faster-whisper
+    ``BatchedInferencePipeline`` and one song's VAD segments decode as batches of
+    this size (~1.5-2x GPU throughput). Batched decode drops cross-segment
+    conditioning, so transcripts can differ slightly from the sequential path
+    (usually fewer hallucinations). ``None`` (default) keeps the legacy
+    sequential ``WhisperModel.transcribe`` call byte-identical."""
     # faster-whisper expects 16kHz
     import librosa
 
@@ -262,10 +270,12 @@ def _transcribe(whisper_model, asr_vocals: np.ndarray,
     # couldn't be filtered without a full re-transcribe. Storing info.language,
     # language_probability, and the mean segment avg_logprob lets a later filter
     # drop non-English / low-confidence transcripts cheaply.
+    batch_kwargs = {"batch_size": batch_size} if batch_size else {}
     segments, info = whisper_model.transcribe(
         vocals_16k,
         word_timestamps=True,
         vad_filter=True,
+        **batch_kwargs,
     )
 
     words = []

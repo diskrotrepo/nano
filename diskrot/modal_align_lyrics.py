@@ -121,7 +121,7 @@ class Aligner:
 @app.function(
     image=image,
     cpu=2.0,
-    memory=8 * 1024,
+    memory=16 * 1024,
     timeout=60 * 60 * 24,
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
@@ -135,29 +135,47 @@ def run_align(
 ):
     """List eligible entries (words present, not yet aligned, audio on disk), report,
     and (if --apply) fan out the GPU alignment and rewrite only the touched shards."""
+    import json
+    import time
     from pathlib import Path
 
     from diskrot.align_lyrics import is_aligned
     from diskrot.transcribe_lyrics import (
+        N_LYRIC_SHARDS,
         _atomic_write_json,
         _lyric_bucket,
         _shard_path,
-        load_lyrics_shards,
     )
 
-    lyrics = load_lyrics_shards(LYRICS_DIR)
     mp3s = (Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3")
     stem_to_rel = {p.stem: str(p.relative_to("/corpus")) for p in mp3s}
 
-    eligible = [
-        {"stem": stem, "rel": stem_to_rel[stem], "entry": e}
-        for stem, e in lyrics.items()
-        if isinstance(e, dict) and e.get("words") and not is_aligned(e)
-        and stem in stem_to_rel
-    ]
-    n_already = sum(1 for e in lyrics.values() if is_aligned(e))
+    # Stream the shards one at a time instead of load_lyrics_shards's full merge:
+    # the global store outgrows this container's RAM as the corpus accumulates
+    # (a deterministic OOM around ~300-400k transcribed songs that 10 retries
+    # only repeat), and only the wave-scoped eligible entries need to stay in
+    # memory anyway.
+    eligible: list[dict] = []
+    n_entries = n_already = 0
+    for shard in range(N_LYRIC_SHARDS):
+        sp = _shard_path(LYRICS_DIR, shard)
+        if not sp.exists():
+            continue
+        try:
+            bucket = json.loads(sp.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue  # torn/half-written shard: skipped, redone next run
+        n_entries += len(bucket)
+        for stem, e in bucket.items():
+            if is_aligned(e):
+                n_already += 1
+            elif (isinstance(e, dict) and e.get("words")
+                    and stem in stem_to_rel):
+                eligible.append(
+                    {"stem": stem, "rel": stem_to_rel[stem], "entry": e})
+
     print("\n=== nano-align-lyrics ===")
-    print(f"lyrics entries:   {len(lyrics):,}")
+    print(f"lyrics entries:   {n_entries:,}")
     print(f"already aligned:  {n_already:,}")
     print(f"eligible now:     {len(eligible):,}  "
           f"(words present, audio on disk, not yet aligned)")
@@ -173,31 +191,56 @@ def run_align(
     print(f"aligning {len(eligible):,} entries in {len(chunks):,} batches on L4...")
 
     touched: set[int] = set()
+    pending_by_shard: dict[int, dict] = {}
     n_done = n_changed = 0
 
-    def flush(shard_set: set[int]):
-        for shard in shard_set:
-            bucket = {s: v for s, v in lyrics.items() if _lyric_bucket(s) == shard}
-            _atomic_write_json(_shard_path(LYRICS_DIR, shard), bucket)
-        tokens_vol.commit()
+    def flush() -> None:
+        """O(batch) read-merge-rewrite of the shards holding this run's un-flushed
+        results — the modal_transcribe.save_results discipline. Never rewrites a
+        shard from a whole-store in-memory copy: each shard also holds other
+        waves' entries this run never loaded."""
+        if not pending_by_shard:
+            return
+        tokens_vol.reload()  # see other writers' commits before read-merge-write
+        for shard, entries in sorted(pending_by_shard.items()):
+            sp = _shard_path(LYRICS_DIR, shard)
+            bucket = {}
+            if sp.exists():
+                try:
+                    bucket = json.loads(sp.read_text())
+                except (json.JSONDecodeError, OSError):
+                    bucket = {}
+            bucket.update(entries)
+            _atomic_write_json(sp, bucket)
+        # Retry a transient DataLossError so a storage blip doesn't crash the
+        # orchestrator (a restart redoes only the un-flushed tail — idempotent).
+        for attempt in range(3):
+            try:
+                tokens_vol.commit()
+                break
+            except modal.exception.DataLossError as e:
+                if attempt == 2:
+                    raise
+                print(f"commit failed ({e}); retry {attempt + 1}/2", flush=True)
+                time.sleep(2.0 * (attempt + 1))
+        touched.update(pending_by_shard)
+        pending_by_shard.clear()
 
     for batch in Aligner().align_batch.map(
         chunks, kwargs={"use_demucs": use_demucs}, order_outputs=False
     ):
-        batch_shards: set[int] = set()
         for r in batch:
-            lyrics[r["stem"]] = r["entry"]
-            touched.add(_lyric_bucket(r["stem"]))
-            batch_shards.add(_lyric_bucket(r["stem"]))
+            pending_by_shard.setdefault(
+                _lyric_bucket(r["stem"]), {})[r["stem"]] = r["entry"]
             n_changed += int(r["changed"])
         n_done += len(batch)
         # Checkpoint periodically so a preemption doesn't lose hours of alignment.
         if n_done % 5_000 < batch_size:
-            flush(batch_shards)
+            flush()
             print(f"  aligned {n_done:,}/{len(eligible):,} "
                   f"(changed {n_changed:,})")
 
-    flush(touched)
+    flush()
     print(f"done: aligned {n_done:,} entries, {n_changed:,} had timestamps refined; "
           f"rewrote {len(touched):,} shards")
 

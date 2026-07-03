@@ -37,9 +37,19 @@ image = (
         "numpy>=1.26",
         "tqdm>=4.66",
         "soundfile>=0.12",
-        "faster-whisper",
+        # >=1.1.0: BatchedInferencePipeline supports word_timestamps + the vad
+        # params (earlier 1.0.x batched mode lacks both).
+        "faster-whisper>=1.1.0",
     )
     .run_commands("pip install 'protobuf>=4'")
+    # Baked from the deploying shell. NANO_WHISPER_BATCH: VAD segments of one
+    # song decode as batches of this size via BatchedInferencePipeline (~1.5-2x
+    # L4 throughput); 0 = legacy sequential decode (the instant rollback lever —
+    # set both vars and redeploy). NANO_TRANSCRIBE_CONCURRENCY: see the
+    # @modal.concurrent comment on the class.
+    .env({
+        "NANO_WHISPER_BATCH": os.environ.get("NANO_WHISPER_BATCH", "8"),
+    })
     # Demucs is gone from transcribe: Whisper runs on the raw mix (large-v3-turbo +
     # VAD makes separation a no-op-to-worse ASR input, arXiv:2506.15514) and vocal
     # gender comes from the audio-LLM captioner, so there is nothing left to isolate.
@@ -72,11 +82,12 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 )
 # Concurrent inputs per container overlap one song's GPU work (Whisper) with the
 # others' GPU-idle CPU tails (ffmpeg decode + 44.1→16k resample), raising L4
-# utilization at no FLOP cost. Raised 2→4 now that Demucs is gone: htdemucs
-# activations on full-length tracks were the VRAM driver that capped it at 2;
-# large-v3-turbo alone (4 decoder layers, float16) is light enough that 4 concurrent
-# tracks fit the L4's 24 GB. Raise further if utilization still has headroom.
-@modal.concurrent(max_inputs=4)
+# utilization at no FLOP cost. Was 4 for sequential batch-1 decode; with
+# BatchedInferencePipeline each input now drives real batch-8 GPU work, so 2 is
+# enough to keep the L4 fed while the other input decodes — and 4 concurrent
+# batch-8 decodes risk VRAM pressure on 24 GB. Env-driven (deploying shell) so
+# the NANO_WHISPER_BATCH=0 rollback can restore 4 in the same redeploy.
+@modal.concurrent(max_inputs=int(os.environ.get("NANO_TRANSCRIBE_CONCURRENCY", "2")))
 class Transcriber:
     @modal.enter()
     def load_models(self):
@@ -103,16 +114,31 @@ class Transcriber:
         # transcription quality. The first ~30k songs were done with large-v3; the
         # transcript mix is fine for training data.
         self.whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
+        # Batched decode of one song's VAD segments (~1.5-2x GPU throughput at
+        # identical weights). batch_size=0 (env, baked at deploy) falls back to
+        # the sequential batch-1 path — the rollback lever if the post-wave
+        # lyrics-stats parity check drifts.
+        self.batch_size = int(os.environ.get("NANO_WHISPER_BATCH", "8"))
+        if self.batch_size:
+            from faster_whisper import BatchedInferencePipeline
+            self.batched = BatchedInferencePipeline(model=self.whisper_model)
         # Warm the full transcribe path INCLUDING the VAD filter: faster-whisper
         # imports onnxruntime lazily on the first vad_filter=True call, and that
         # import sporadically dies under loaded-model memory pressure, leaving
         # the container raising "Applying the VAD filter requires the
         # onnxruntime package" on every input (the 2026-06-11 storm — same
         # lazy-import poisoning as the scipy warmup above). Done here, a broken
-        # import fails @enter and the container never takes inputs.
+        # import fails @enter and the container never takes inputs. When batched
+        # decode is on, warm THAT path too — it is the runtime path the poison
+        # guards must have exercised.
         list(self.whisper_model.transcribe(
             np.zeros(16000, dtype=np.float32), language="en", vad_filter=True,
         )[0])
+        if self.batch_size:
+            list(self.batched.transcribe(
+                np.zeros(16000, dtype=np.float32), language="en",
+                vad_filter=True, batch_size=self.batch_size,
+            )[0])
         # Poison guard state: consecutive in-band failures. A healthy container
         # essentially never fails several distinct files in a row (prepare
         # already dropped corrupt/over-long audio), but a container with broken
@@ -143,7 +169,10 @@ class Transcriber:
         key = mp3_path.stem
         try:
             mix_mono = _load_mix_mono(mp3_path)
-            result = _transcribe(self.whisper_model, mix_mono, estimate_gender=False)
+            result = _transcribe(
+                self.batched if self.batch_size else self.whisper_model,
+                mix_mono, estimate_gender=False,
+                batch_size=self.batch_size or None)
             with self._fail_lock:
                 self.consecutive_failures = 0
             return (key, result, None)
