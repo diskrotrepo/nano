@@ -53,7 +53,7 @@ from pathlib import Path
 import modal
 
 from diskrot.modal_common import (
-    bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
+    ProgressReporter, bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
 )
 
 app = modal.App("nano-prepare")
@@ -385,6 +385,7 @@ def run_prepare(
               f"of ~{batch_size} across up to {VALIDATOR_MAX_CONTAINERS} containers...")
         n_done = 0
         last_checkpoint = 0
+        rep = ProgressReporter(len(pending), "prepare", unit="files")
         # Persist the manifest periodically so a worker preemption (these run
         # on preemptible CPU workers) doesn't discard hours of validation. On
         # restart, list_pending() skips anything already in the manifest, so we
@@ -404,13 +405,14 @@ def run_prepare(
             for entry in batch:
                 manifest["files"][entry["stem"]] = entry
             n_done += len(batch)
-            print(f"  validated {n_done:,}/{len(pending):,}")
+            rep.update(len(batch))
             if n_done - last_checkpoint >= checkpoint_every:
                 manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
                 write_manifest.remote(manifest)
                 last_checkpoint = n_done
                 print(f"  [checkpoint] manifest persisted at "
                       f"{n_done:,}/{len(pending):,} validated")
+        rep.done()
         # Flush any tail since the last checkpoint before moving on.
         if n_done > last_checkpoint:
             manifest["generated_at"] = datetime.now(timezone.utc).isoformat()

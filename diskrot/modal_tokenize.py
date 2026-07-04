@@ -27,7 +27,11 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import assert_stage_produced_output, corpus_mount
+from diskrot.modal_common import (
+    ProgressReporter,
+    assert_stage_produced_output,
+    corpus_mount,
+)
 
 app = modal.App("nano-tokenize")
 
@@ -336,16 +340,9 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
     # prints on each flush), tokenize workers commit their own .pt per batch, so
     # the orchestrator has no flush to piggyback on — we print a progress line
     # every PROGRESS_EVERY processed files instead.
-    n_seen = 0
-    t_start = time.time()
-    # Progress heartbeat: report every PROGRESS_EVERY files OR every PROGRESS_SECS of
-    # wall time, whichever comes first — so a small wave still gets steady updates
-    # (time-driven) and a large one isn't spammed (count-driven), each line carrying a
-    # live throughput + ETA so overall progress is visible at a glance.
-    PROGRESS_EVERY = 2_000
-    PROGRESS_SECS = 45.0
-    next_report = PROGRESS_EVERY
-    last_report_t = t_start
+    # Uniform progress heartbeat, shared across every pipeline stage (see
+    # diskrot.progress.ProgressReporter): % complete, files/min, elapsed, ETA.
+    rep = ProgressReporter(len(pending), "tokenize", unit="files")
     # Sample a handful of "other" errors at the start so users can still
     # debug novel failure modes — after that, just count by category.
     OTHER_SAMPLES = 20
@@ -393,23 +390,9 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
             elif status == "done":
                 n_done += 1
                 total_frames += frames
-        n_seen += len(batch)
-        now = time.time()
-        if n_seen >= next_report or (now - last_report_t) >= PROGRESS_SECS:
-            processed = n_done + n_short + n_failed
-            pct = 100.0 * processed / len(pending)
-            elapsed = max(1e-6, now - t_start)
-            rate = processed / elapsed  # files/sec across the whole fleet
-            remaining = max(0, len(pending) - processed)
-            eta_s = int(remaining / rate) if rate > 0 else 0
-            eta_h, rem = divmod(eta_s, 3600)
-            eta_m, eta_sec = divmod(rem, 60)
-            print(f"  progress {processed:,}/{len(pending):,} ({pct:.1f}%) "
-                  f"— tokenized {n_done:,}, short {n_short:,}, failed {n_failed:,} "
-                  f"| {rate * 60:,.0f} files/min | elapsed {int(elapsed // 60)}m "
-                  f"| ETA {eta_h}h{eta_m:02d}m", flush=True)
-            next_report = n_seen + PROGRESS_EVERY  # next count trigger from here
-            last_report_t = now
+        rep.update(len(batch),
+                   extra=f"tokenized {n_done:,}, short {n_short:,}, failed {n_failed:,}")
+    rep.done(extra=f"tokenized {n_done:,}, short {n_short:,}, failed {n_failed:,}")
 
     print(f"\ndone:                {n_done}", flush=True)
     print(f"skipped (too short): {n_short} "

@@ -28,7 +28,7 @@ from pathlib import Path
 import modal
 
 from diskrot.modal_common import (
-    bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
+    ProgressReporter, bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
 )
 
 app = modal.App("nano-audio-dedup")
@@ -172,17 +172,19 @@ def run_dedup(
         chunks = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
         print(f"fingerprinting {len(pending):,} files in {len(chunks):,} batches...")
         n_done, last = 0, 0
+        rep = ProgressReporter(len(pending), "audio_dedup", unit="files")
         for batch in Fingerprinter().fingerprint_batch.map(chunks, order_outputs=False):
             for e in batch:
                 manifest["files"][e["stem"]] = e
             n_done += len(batch)
-            print(f"  fingerprinted {n_done:,}/{len(pending):,}")
+            rep.update(len(batch))
             if n_done - last >= 10_000:
                 manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
                 write_manifest.remote(manifest)
                 last = n_done
         if n_done > last:
             write_manifest.remote(manifest)
+        rep.done()
         print("fingerprinting complete")
     else:
         print("no new files — reusing existing fingerprints")

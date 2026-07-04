@@ -31,6 +31,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+from diskrot.progress import ProgressReporter
+
 PHONEMES_DIR_NAME = "phonemes"
 
 
@@ -142,6 +144,7 @@ def phonemize_corpus(
     t0 = time.time()
     n_done = 0
     tasks = [(b, str(out_dir), songs) for b, songs in sorted(buckets.items())]
+    rep = ProgressReporter(len(tasks), "phonemize", unit="buckets") if verbose else None
     if n_workers <= 1:
         # Inline path — no process pool, so it also works where spawn can't
         # re-import __main__ (e.g. ad-hoc stdin scripts).
@@ -154,13 +157,13 @@ def phonemize_corpus(
             n_done += n_new
             if commit_cb is not None and n_new:
                 commit_cb()
-            if verbose and (n_new or (i + 1) % 32 == 0):
-                print(f"[phonemize] bucket {bucket:03d}: +{n_new} (shard total "
-                      f"{n_total}); {i + 1}/{len(tasks)} buckets, "
-                      f"{time.time() - t0:.0f}s", flush=True)
+            if rep is not None:
+                rep.update(1, extra=f"{n_done:,} songs phonemized")
     finally:
         if n_workers > 1:
             pool.shutdown()
+    if rep is not None:
+        rep.done(extra=f"{n_done:,} songs phonemized")
     if verbose:
         print(f"[phonemize] done: {n_done} songs newly phonemized -> {out_dir} "
               f"({time.time() - t0:.0f}s)", flush=True)

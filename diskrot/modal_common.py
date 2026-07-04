@@ -220,3 +220,11 @@ def assert_stage_produced_output(
             f"missing-dependency / import bug in the worker image (check the stage app "
             f"logs for the per-worker error). NOT marking the stage done."
         )
+
+
+# Re-export the shared progress heartbeat so the Modal fan-out orchestrators can
+# import it from modal_common alongside the other stage helpers. The class itself
+# lives in the dependency-free diskrot.progress (no `modal` import) so the pure
+# per-song modules (pack_cache / key_detect / phonemize / filter_lyrics) can use the
+# SAME reporter without dragging in modal + this module's log-filter side effects.
+from diskrot.progress import ProgressReporter  # noqa: E402,F401  (public re-export)

@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
+from diskrot.progress import ProgressReporter
 from model.lyric_encoder import KEY_LABELS
 
 KEYS_JSON_NAME = "keys.json"
@@ -138,8 +139,11 @@ def detect_keys(
     shards_since_flush = 0
     dirty = False
     t0 = time.time()
+    rep = ProgressReporter(len(index["shards"]), "key_detect", unit="shards") if verbose else None
     for shard_entry in index["shards"]:
         shard_id = shard_entry["shard_id"]
+        if rep is not None:
+            rep.update(1, extra=f"{len(keys):,} keys")
         meta = load_shard_meta(packed_dir, shard_id)
         if not meta.get("has_melody"):
             if verbose:
@@ -171,6 +175,8 @@ def detect_keys(
                   f"(+{n_done} new, {n_skipped_flat} flat/zero skipped, "
                   f"{time.time() - t0:.0f}s)", flush=True)
 
+    if rep is not None:
+        rep.done(extra=f"{len(keys):,} keys")
     if dirty or not out_path.exists():
         flush()
     if verbose:

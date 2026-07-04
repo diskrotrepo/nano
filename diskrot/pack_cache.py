@@ -47,6 +47,8 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+from diskrot.progress import ProgressReporter
+
 try:
     import torch
 except ModuleNotFoundError:
@@ -532,6 +534,7 @@ def pack_append(
     n_mel_missing = 0
     n_stem_missing = 0
     corrupt_files: list[str] = []
+    rep = ProgressReporter(n, "pack", unit="songs") if verbose else None
 
     for local_shard in range(n_new_shards):
         shard_id = base_shard_id + local_shard
@@ -556,6 +559,8 @@ def pack_append(
             })
             n_new_songs += len(existing["names"])
             n_skipped += 1
+            if rep is not None:
+                rep.update(len(existing["names"]), extra=f"shard {shard_id} skipped (valid)")
             if verbose:
                 print(f"[pack-append:shard {shard_id:03d}] skip (already valid, "
                       f"{len(existing['names'])} songs)", flush=True)
@@ -619,10 +624,14 @@ def pack_append(
         })
         n_new_songs += len(member_files)
         _commit()  # persist this shard so a retry skips it
+        if rep is not None:
+            rep.update(len(member_files), extra=f"shard {shard_id} packed")
         if verbose:
             print(f"[pack-append:shard {shard_id:03d}] {len(member_files)} songs "
                   f"in {time.time()-t_shard:.1f}s", flush=True)
 
+    if rep is not None:
+        rep.done(extra=f"{n_new_shards} new shards")
     if n_codebooks is None:
         raise RuntimeError("no shards packed (every wave file corrupt?)")
 
@@ -776,6 +785,7 @@ def pack(
     n_skipped = 0
     first_rebuilt: int | None = None
     corrupt_files: list[str] = []  # .pt files dropped because torch.load failed
+    rep = ProgressReporter(n, "pack", unit="songs") if verbose else None
 
     for shard_id in range(n_shards):
         t_shard = time.time()
@@ -799,6 +809,8 @@ def pack(
             })
             total_songs_done += len(existing["names"])
             n_skipped += 1
+            if rep is not None:
+                rep.update(len(existing["names"]), extra=f"shard {shard_id} skipped (valid)")
             if verbose:
                 size_gb = (out_dir / _shard_bin_name(shard_id)).stat().st_size / 1e9
                 print(f"[pack:shard {shard_id:03d}/{n_shards-1}] skip "
@@ -994,6 +1006,8 @@ def pack(
         total_songs_done += len(member_files)
         # Persist this completed shard so a later preemption+retry skips it.
         _commit()
+        if rep is not None:
+            rep.update(len(member_files), extra=f"shard {shard_id} packed")
         if verbose:
             size_gb = bin_path.stat().st_size / 1e9
             elapsed = time.time() - t_shard
@@ -1004,6 +1018,8 @@ def pack(
                   f"in {elapsed:.1f}s ({rate:.1f}/s, ETA {eta:.0f}s "
                   f"for remaining {n - total_songs_done} songs)", flush=True)
 
+    if rep is not None:
+        rep.done(extra=f"{n_shards} shards")
     if verbose:
         if n_skipped == n_shards:
             print(f"[pack] all {n_shards} shards already valid — "

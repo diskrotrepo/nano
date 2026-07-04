@@ -37,6 +37,7 @@ import json
 import os
 from pathlib import Path
 
+from diskrot.progress import ProgressReporter
 from diskrot.transcribe_lyrics import _atomic_write_json, is_valid_word
 
 # Below this many valid words a "transcript" is a caption artifact, not lyrics.
@@ -115,7 +116,9 @@ def filter_lyrics(
     n_checked = n_flagged = n_shards = n_null = 0
     by_reason: dict[str, int] = {}
 
-    for shard in sorted(lyrics_dir.glob("lyrics_*.json")):
+    shards = sorted(lyrics_dir.glob("lyrics_*.json"))
+    rep = ProgressReporter(len(shards), "filter_lyrics", unit="shards") if verbose else None
+    for shard in shards:
         data = json.loads(shard.read_text())
         flagged = []
         for name, entry in data.items():
@@ -140,7 +143,11 @@ def filter_lyrics(
         if verbose and flagged:
             print(f"[filter] {shard.name}: {len(flagged)} hallucinated"
                   f"{' -> nulled' if apply else ' (dry run)'}", flush=True)
+        if rep is not None:
+            rep.update(1, extra=f"checked {n_checked:,}, flagged {n_flagged:,}")
 
+    if rep is not None:
+        rep.done(extra=f"checked {n_checked:,}, flagged {n_flagged:,}")
     n_ready = n_checked - n_flagged
     n_total = n_null + n_checked
     if verbose:

@@ -44,7 +44,11 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import assert_stage_produced_output, corpus_mount
+from diskrot.modal_common import (
+    ProgressReporter,
+    assert_stage_produced_output,
+    corpus_mount,
+)
 
 
 def _sample_keep(stem: str, sample_pct: int) -> bool:
@@ -322,13 +326,11 @@ def orchestrate(batch: int = _BATCH, wave_id: str = "", limit: int = 0,
     chunks = [pending[i:i + batch] for i in range(0, len(pending), batch)]
     print(f"Dispatching {len(pending)} songs in {len(chunks)} batches of {batch}...")
     extractor = StemExtractor(subdir=sub)
-    t0 = time.time()
+    rep = ProgressReporter(len(pending), "stems", unit="songs")
     tot_done = tot_missing = tot_failed = 0
-    n_chunks_seen = 0
     for res in extractor.extract_batch.map(
         chunks, order_outputs=False, return_exceptions=True
     ):
-        n_chunks_seen += 1
         if isinstance(res, Exception):
             print(f"BATCH FAILED (stays pending): {type(res).__name__}: {str(res)[:140]}")
             continue
@@ -336,10 +338,9 @@ def orchestrate(batch: int = _BATCH, wave_id: str = "", limit: int = 0,
         tot_done += d
         tot_missing += m
         tot_failed += f
-        if n_chunks_seen % 10 == 0:
-            rate = (tot_done + tot_failed) / max(time.time() - t0, 1e-6)
-            print(f"{n_chunks_seen}/{len(chunks)} batches  done={tot_done} "
-                  f"missing={tot_missing} failed={tot_failed}  ({rate:.2f}/s)", flush=True)
+        rep.update(d + m + f,
+                   extra=f"stems {tot_done:,} missing {tot_missing:,} failed {tot_failed:,}")
+    rep.done(extra=f"stems {tot_done:,} missing {tot_missing:,} failed {tot_failed:,}")
     print(f"\nDONE: stems={tot_done}  missing_inputs={tot_missing}  failed={tot_failed}")
     assert_stage_produced_output("stems", tot_done, len(pending), tot_failed)
 

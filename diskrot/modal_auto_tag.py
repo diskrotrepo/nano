@@ -33,7 +33,12 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import assert_stage_produced_output, corpus_mount, list_wave_mp3s
+from diskrot.modal_common import (
+    ProgressReporter,
+    assert_stage_produced_output,
+    corpus_mount,
+    list_wave_mp3s,
+)
 from diskrot.sharded_store import load_json_shards, shard_index, write_json_shards
 
 app = modal.App("nano-auto-tag")
@@ -346,6 +351,7 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
     n_done = n_failed = 0
     n_batch_errors = 0
     batch_idx = 0
+    rep = ProgressReporter(len(pending), "auto_tag", unit="songs")
     # order_outputs=False: a preempted batch must not head-of-line-block the
     # in-order yield (that idles the other containers while they still bill).
     # Results are merged into tags.json by stem, so order doesn't matter.
@@ -373,14 +379,13 @@ def run_auto_tag(batch_size: int, flush_every_batches: int, wave_id: str = "",
                 touched.add(shard_index(stem))
                 n_done += 1
         batch_idx += 1
+        rep.update(len(batch), extra=f"captioned {n_done:,}, failed {n_failed:,}")
+        # flush() persists the tags shard store on its OWN cadence (decoupled from
+        # the progress heartbeat above).
         if batch_idx % flush_every_batches == 0:
             flush()
-            done = n_done + n_failed
-            pct = 100.0 * done / len(pending)
-            print(f"  progress {done:,}/{len(pending):,} ({pct:.1f}%) "
-                  f"— captioned {n_done:,}, failed {n_failed:,} "
-                  f"(saved to the tags shard store)", flush=True)
 
+    rep.done(extra=f"captioned {n_done:,}, failed {n_failed:,}")
     flush()
     # Compat write for the single-file readers (modal_train's tags_path, the
     # audit/eval scripts): one O(corpus) merged tags.json per stage run instead

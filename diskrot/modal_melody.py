@@ -44,7 +44,11 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import assert_stage_produced_output, corpus_mount
+from diskrot.modal_common import (
+    ProgressReporter,
+    assert_stage_produced_output,
+    corpus_mount,
+)
 
 app = modal.App("nano-melody")
 
@@ -177,16 +181,14 @@ def orchestrate(batch: int = _BATCH, wave_id: str = ""):
     chunks = [pending[i:i + batch] for i in range(0, len(pending), batch)]
     print(f"Dispatching {len(pending)} songs in {len(chunks)} batches of {batch}...")
     extractor = MelodyExtractor(subdir=sub)
-    t0 = time.time()
+    rep = ProgressReporter(len(pending), "melody", unit="songs")
     tot_done = tot_missing = tot_failed = 0
-    n_chunks_seen = 0
     # order_outputs=False so a slow batch doesn't head-of-line-block; each batch
     # commits its own files, so order is irrelevant. return_exceptions=True so a
     # hard worker crash counts and continues (those stems stay pending).
     for res in extractor.extract_batch.map(
         chunks, order_outputs=False, return_exceptions=True
     ):
-        n_chunks_seen += 1
         if isinstance(res, Exception):
             print(f"BATCH FAILED (stays pending): {type(res).__name__}: {str(res)[:140]}")
             continue
@@ -194,10 +196,9 @@ def orchestrate(batch: int = _BATCH, wave_id: str = ""):
         tot_done += d
         tot_missing += m
         tot_failed += f
-        if n_chunks_seen % 20 == 0:
-            rate = (tot_done + tot_failed) / max(time.time() - t0, 1e-6)
-            print(f"{n_chunks_seen}/{len(chunks)} batches  done={tot_done} "
-                  f"missing={tot_missing} failed={tot_failed}  ({rate:.1f}/s)", flush=True)
+        rep.update(d + m + f,
+                   extra=f"chroma {tot_done:,} missing {tot_missing:,} failed {tot_failed:,}")
+    rep.done(extra=f"chroma {tot_done:,} missing {tot_missing:,} failed {tot_failed:,}")
     print(f"\nDONE: chroma={tot_done}  missing_inputs={tot_missing}  failed={tot_failed}")
     # Hard-stop a silent no-op (the exact failure mode this stage just had: the
     # worker image missing "model" → 0 chroma while marked done).

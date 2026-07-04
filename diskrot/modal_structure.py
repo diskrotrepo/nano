@@ -22,7 +22,12 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import assert_stage_produced_output, corpus_mount, wave_subdir
+from diskrot.modal_common import (
+    ProgressReporter,
+    assert_stage_produced_output,
+    corpus_mount,
+    wave_subdir,
+)
 
 app = modal.App("nano-structure")
 
@@ -291,6 +296,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
     batch: list = []
     n_seen = 0
     n_errors = 0
+    rep = ProgressReporter(len(pending), "structure", unit="files")
     # order_outputs=False: a preempted chunk must not head-of-line-block the yield
     # (idling other billing containers); results flush by key so order is moot.
     # return_exceptions=True: a poison chunk must not crash the orchestrator
@@ -305,6 +311,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
                       f"{type(result).__name__}: {str(result)[:140]}")
             continue
         n_seen += len(result)
+        rep.update(len(result))
         batch.extend(result)
         if len(batch) >= flush_every:
             print(f"flushing {len(batch)} results ({n_seen}/{len(pending)} done)")
@@ -313,6 +320,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
     if batch:
         print(f"final flush of {len(batch)} results ({n_seen}/{len(pending)} done)")
         save_results.remote(batch)
+    rep.done()
     if n_errors:
         print(f"chunk errors: {n_errors} "
               f"(transient — affected files stay pending; re-run to finish them)")

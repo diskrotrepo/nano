@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import ProgressReporter, corpus_mount, wave_subdir
 
 app = modal.App("nano-align-lyrics")
 
@@ -226,6 +226,7 @@ def run_align(
         touched.update(pending_by_shard)
         pending_by_shard.clear()
 
+    rep = ProgressReporter(len(eligible), "align_lyrics", unit="entries")
     for batch in Aligner().align_batch.map(
         chunks, kwargs={"use_demucs": use_demucs}, order_outputs=False
     ):
@@ -234,12 +235,12 @@ def run_align(
                 _lyric_bucket(r["stem"]), {})[r["stem"]] = r["entry"]
             n_changed += int(r["changed"])
         n_done += len(batch)
+        rep.update(len(batch), extra=f"changed {n_changed:,}")
         # Checkpoint periodically so a preemption doesn't lose hours of alignment.
         if n_done % 5_000 < batch_size:
             flush()
-            print(f"  aligned {n_done:,}/{len(eligible):,} "
-                  f"(changed {n_changed:,})")
 
+    rep.done(extra=f"changed {n_changed:,}")
     flush()
     print(f"done: aligned {n_done:,} entries, {n_changed:,} had timestamps refined; "
           f"rewrote {len(touched):,} shards")

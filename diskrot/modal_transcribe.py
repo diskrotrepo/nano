@@ -19,7 +19,7 @@ from pathlib import Path
 
 import modal
 
-from diskrot.modal_common import corpus_mount, wave_subdir
+from diskrot.modal_common import ProgressReporter, corpus_mount, wave_subdir
 
 app = modal.App("nano-transcribe")
 
@@ -440,6 +440,9 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                   f"Demucs-free: Whisper on raw mix)...")
 
             n_seen = n_errors = n_inband = 0
+            # Per-sweep heartbeat (pending is re-listed each sweep and shrinks, so
+            # the ETA is for THIS sweep — most work is the first one).
+            rep = ProgressReporter(len(pending), "transcribe", unit="files")
             # n_inband: per-file errors (returned, not raised) — these stay
             # pending and are NOT written; surfacing the count here is what
             # makes a poisoned-container storm visible (2026-06-11: 146k of
@@ -460,6 +463,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                     chunk, order_outputs=False, return_exceptions=True
                 ):
                     n_seen += 1
+                    rep.update(1, extra=f"transcribed {n_seen - n_errors - n_inband:,}, "
+                                        f"in-band-fail {n_inband:,}, errored {n_errors:,}")
                     if isinstance(result, Exception):
                         n_errors += 1
                         if n_errors <= 20:
@@ -484,6 +489,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = 
                           f"{n_inband} failed in-band, "
                           f"{n_errors} cancelled/errored)")
                     save_results.remote(batch)
+            rep.done(extra=f"transcribed {n_seen - n_errors - n_inband:,}, "
+                           f"in-band-fail {n_inband:,}, errored {n_errors:,}")
             print(f"sweep {sweep} complete: {n_seen} seen, "
                   f"{n_seen - n_errors - n_inband} transcribed, "
                   f"{n_inband} failed in-band, {n_errors} cancelled/errored"
