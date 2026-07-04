@@ -456,12 +456,18 @@ def run_prepare(
             manifest["files"][s]["status"] = "duplicate"
             manifest["files"][s]["duplicate_of"] = keeper
 
-    on_disk = set(all_names)
+    # Build the deletion list by cross-referencing the wave's ACTUAL on-disk paths
+    # (stem -> wave-prefixed relative name) against the manifest status keyed by
+    # stem — NOT by the manifest's stored `name`. The manifest is global and keyed
+    # by bare stem, and older entries stored a BARE filename (pre-wave-prefix), so
+    # `v["name"] in on_disk` (on_disk being today's wave-prefixed paths) matched
+    # nothing and silently deleted zero flagged files. Keying off on_disk also
+    # guarantees the emitted key is the correct R2 path for THIS wave's copy.
+    _DELETE = ("undecodable", "too_short", "duplicate", "too_long", "low_quality")
+    on_disk_by_stem = {Path(n).stem: n for n in all_names}
     deletion_names = [
-        v["name"] for v in manifest["files"].values()
-        if v.get("status") in (
-            "undecodable", "too_short", "duplicate", "too_long", "low_quality")
-        and v["name"] in on_disk
+        name for stem, name in on_disk_by_stem.items()
+        if manifest["files"].get(stem, {}).get("status") in _DELETE
     ]
 
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
