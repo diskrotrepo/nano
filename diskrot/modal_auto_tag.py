@@ -120,6 +120,16 @@ image = (
     # version above so the resolver can't drift back onto a FlashInfer default.
     .env({
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        # Quiet vLLM's per-container INFO firehose (EngineCore config dumps,
+        # api_utils, scheduler). At 50 workers it floods the app logs and BURIES
+        # the orchestrator's single [auto_tag] progress heartbeat, so the stage
+        # looks dead ("no progress") when it's actually captioning. WARNING keeps
+        # real errors (e.g. the nvcc/FlashInfer crash) visible; NO_USAGE_STATS
+        # drops the startup usage line. (The `Rendering prompts` tqdm bars come
+        # from llm.generate(use_tqdm=...) in audio_llm_captioner — silence those
+        # there for a fully clean log.)
+        "VLLM_LOGGING_LEVEL": "WARNING",
+        "VLLM_NO_USAGE_STATS": "1",
         # Throughput knobs, baked from the deploying shell (override there to
         # calibrate). max_num_seqs=32 (the engine default in audio_llm_captioner)
         # left the already-reserved KV cache under-filled on the bandwidth-bound

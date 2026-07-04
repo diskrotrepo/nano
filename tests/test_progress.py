@@ -73,3 +73,48 @@ def test_time_trigger_fires_without_count(monkeypatch):
     clock["t"] += 46.0  # cross the 45s time trigger
     rep.update(1)
     assert len(lines) == 1
+
+
+def test_keepalive_emits_when_stream_stalls(monkeypatch):
+    # The keep-alive fires when the result stream goes quiet (no update() calls) —
+    # a preempted-worker / cold-restart stall must not read as a hang.
+    import diskrot.progress as pmod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pmod.time, "time", lambda: clock["t"])
+    lines, log = _sink()
+    rep = ProgressReporter(100, "k", every=10_000, secs=45.0, log=log)
+    rep.update(5)  # below count + time triggers → no emit
+    assert lines == []
+
+    clock["t"] += 46.0  # stream stalls; only wall-clock advances
+    rep._heartbeat_if_stalled()  # what the daemon loop calls each wake
+    assert len(lines) == 1
+    assert "5/100" in lines[0]  # flat count = the stall is visible
+
+    rep._heartbeat_if_stalled()  # no time since last emit → no duplicate
+    assert len(lines) == 1
+
+
+def test_keepalive_quiet_while_stream_flows(monkeypatch):
+    # If update() keeps emitting, the keep-alive must NOT add duplicate lines.
+    import diskrot.progress as pmod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pmod.time, "time", lambda: clock["t"])
+    lines, log = _sink()
+    rep = ProgressReporter(100, "f", every=1, secs=45.0, log=log)
+    rep.update(1)  # every=1 → emits immediately, resets _last_t
+    assert len(lines) == 1
+    rep._heartbeat_if_stalled()  # 0s since the update emit → silent
+    assert len(lines) == 1
+
+
+def test_done_stops_keepalive_thread():
+    # done() must set the stop event so the daemon exits promptly.
+    rep = ProgressReporter(10, "s", every=1, log=lambda *a, **k: None)
+    rep.update(1)  # starts the watchdog thread
+    assert rep._watch is not None and rep._watch.is_alive()
+    rep.done()
+    rep._watch.join(timeout=5.0)
+    assert not rep._watch.is_alive()

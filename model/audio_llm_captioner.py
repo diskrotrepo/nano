@@ -396,7 +396,12 @@ class VLLMAudioCaptioner:
                 # vLLM Qwen2-Audio wants raw (waveform, sr) tuples, not tensors.
                 "multi_modal_data": {"audio": [(w, sr) for w in windows]},
             })
-        outputs = self._llm.generate(requests, self._sampling)
+        # use_tqdm=False: the per-batch "Rendering/Processed prompts" tqdm bars
+        # (one set PER worker) are the dominant log-flood source across the ~50
+        # captioner containers — they bury the orchestrator's [auto_tag] progress
+        # heartbeat, making a healthy run look dead. The orchestrator's own
+        # ProgressReporter is the intended progress signal.
+        outputs = self._llm.generate(requests, self._sampling, use_tqdm=False)
         result: list[tuple[str, str | None, dict[str, str]]] = []
         for o in outputs:
             rest, stems = parse_stems(o.outputs[0].text)
