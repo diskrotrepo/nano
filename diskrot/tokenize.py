@@ -10,16 +10,17 @@ Usage:
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Literal
 
-import librosa
 import numpy as np
 import torch
 from tqdm import tqdm
 
+from diskrot.audio_io import decode_pcm
 from model.codec import DACodec, get_codec
 
 
@@ -30,6 +31,16 @@ TokenizeStatus = Literal["done", "skipped_existing", "skipped_short", "failed"]
 # wildly varying source levels so the codec tokens have consistent statistics.
 # Env-overridable; the same value must be used across the whole corpus.
 _LOUDNORM_LUFS = float(os.environ.get("NANO_LOUDNORM_LUFS", "-14.0"))
+
+# Optional loudness-measurement speedup: measure the integrated LUFS on a boxcar-
+# decimated mono copy (factor D) instead of the full 48 kHz stereo signal — the
+# K-weighting IIR + gating then runs over ~1/D the samples. LUFS is low-frequency
+# weighted and robust, so the measured gain shifts <~0.1 dB vs full-rate, and the
+# gain is applied to the FULL-res signal (only the tiny gain differs, like the
+# resampler delta). 1 = off (measure at full rate). Small lever — loudnorm is only
+# a slice of the CPU tail and is hidden behind the GPU encode when GPU-bound — so
+# it defaults OFF; enable per-corpus (uniformly) only if profiling shows CPU-bound.
+_LOUDNORM_DECIMATE = max(1, int(os.environ.get("NANO_LOUDNORM_DECIMATE", "1")))
 
 # Conservative source-quality gate (checked on the RAW pre-normalization signal,
 # where level is meaningful — after loudness-norm everything is ~-14 LUFS). Tuned
@@ -120,9 +131,18 @@ def _normalize_loudness(y: np.ndarray, sr: int) -> np.ndarray:
     try:
         import pyloudnorm as pyln
 
-        meter = pyln.Meter(sr)
-        mono = y.mean(axis=0) if y.ndim == 2 else y
-        loud = meter.integrated_loudness(np.ascontiguousarray(mono))
+        mono = np.ascontiguousarray(y.mean(axis=0) if y.ndim == 2 else y)
+        meter_sr = sr
+        if _LOUDNORM_DECIMATE > 1:
+            d = _LOUDNORM_DECIMATE
+            trimmed = mono[: (mono.shape[-1] // d) * d]
+            if trimmed.size:
+                # boxcar (mean-pool) decimation — cheap anti-alias before the LUFS
+                # K-weighting; the measured gain is applied to the full-res signal.
+                mono = trimmed.reshape(-1, d).mean(axis=1).astype(np.float32)
+                meter_sr = sr // d
+        meter = pyln.Meter(meter_sr)
+        loud = meter.integrated_loudness(mono)
         if np.isfinite(loud):
             y = y * (10.0 ** ((_LOUDNORM_LUFS - loud) / 20.0))
         else:
@@ -142,18 +162,17 @@ def _load_audio(
 
     Returns ``[n_channels, samples]`` float32: mono -> [1, N]; stereo -> [2, N]
     (a mono source is duplicated to L=R, so it round-trips to a stable centered
-    image)."""
-    y, _ = librosa.load(str(mp3_path), sr=sample_rate, mono=(n_channels == 1))
-    if n_channels == 2 and y.ndim == 1:
-        y = np.stack([y, y], axis=0)  # mono source -> L=R
+    image). Decodes via the shared ffmpeg PCM path (``diskrot.audio_io.decode_pcm``)
+    — the SAME decoder inference uses, so corpus tokens and prompt-encode tokens
+    stay on-distribution — which also avoids librosa's slow/noisy audioread
+    fallback on the corpus's junk-header MP3s."""
+    y = decode_pcm(mp3_path, sample_rate, n_channels)  # [C, N] float32
     # Conservative quality gate on the RAW signal (level is meaningful pre-norm).
     reason = _audio_quality_reason(y, sample_rate)
     if reason is not None:
         raise QualitySkip(reason)
     if normalize:
         y = _normalize_loudness(y, sample_rate)
-    if y.ndim == 1:
-        y = y[None, :]  # [1, samples]
     return torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
 
 
@@ -217,7 +236,7 @@ def tokenize_files_streaming(
         (>1 amortizes kernel launches but multiplies peak GPU memory); for
         SpectroStream ``encode_batch`` just loops per file, so batch_size has no
         GPU/memory effect there.
-      - ``prefetch`` — how many files' CPU audio (librosa decode + loudness-norm)
+      - ``prefetch`` — how many files' CPU audio (ffmpeg decode + loudness-norm)
         are loaded *ahead* by a background thread pool. This is what hides decode
         latency behind the GPU/TF encode: while the main thread is blocked in
         ``encode_batch``, the pool keeps the next ~``prefetch`` files decoded and
@@ -228,9 +247,20 @@ def tokenize_files_streaming(
     Yields one TokenizeResult per input item, in input order. Encode grouping is
     per ``batch_size`` window of input items: the ready items in a window go into a
     single ``encode_batch`` call (skipped/failed items in the window don't split
-    it), keeping output deterministic and order-stable."""
+    it), keeping output deterministic and order-stable.
+
+    Stage-0 profiling: with ``NANO_TOKENIZE_PROFILE=1`` set, accumulate wall time
+    spent BLOCKED on decode (``.result()`` waits — nonzero means the prefetch pool
+    can't keep the GPU fed → CPU-decode-bound) vs in ``encode_batch`` (GPU) vs
+    ``_save_tokens`` (volume I/O), and print a one-line summary when the generator
+    is exhausted. This is the gate that decides whether decode-side or GPU-side
+    levers move wall-clock — it writes the normal ``.pt`` output, so it's safe to
+    run over a throwaway wave subset."""
     if not items:
         return
+
+    _profile = os.environ.get("NANO_TOKENIZE_PROFILE", "").lower() in ("1", "true", "yes")
+    _prof = {"decode_wait": 0.0, "encode": 0.0, "save": 0.0, "n_encoded": 0}
 
     def _maybe_load(
         item: tuple[Path, Path],
@@ -282,8 +312,12 @@ def tokenize_files_streaming(
             # files decode while this window encodes.
             _submit_through(win_end + prefetch)
 
-            # Phase 1: collect this window's loads, in input order.
+            # Phase 1: collect this window's loads, in input order. The time spent
+            # here IS the decode-starvation signal: ~0 when prefetch stays ahead
+            # (GPU-bound), large when the loader pool can't keep up (CPU-bound).
+            _t0 = time.perf_counter()
             loaded = [futures.pop(idx).result() for idx in range(win_start, win_end)]
+            _prof["decode_wait"] += time.perf_counter() - _t0
 
             # Phase 2: batched encode for everything that loaded successfully.
             encodable = [(idx, audio) for idx, (_, audio, status, _) in enumerate(loaded)
@@ -292,7 +326,10 @@ def tokenize_files_streaming(
             encode_error: str | None = None
             if encodable:
                 try:
+                    _t0 = time.perf_counter()
                     codes_list = codec.encode_batch([audio for _, audio in encodable])
+                    _prof["encode"] += time.perf_counter() - _t0
+                    _prof["n_encoded"] += len(encodable)
                     for (idx, _), codes in zip(encodable, codes_list):
                         codes_by_idx[idx] = codes
                 except Exception as e:
@@ -332,8 +369,22 @@ def tokenize_files_streaming(
                 if codes.shape[1] < min_frames:
                     yield TokenizeResult(status="skipped_short", frames=int(codes.shape[1]))
                     continue
+                _t0 = time.perf_counter()
                 frames = _save_tokens(codes, out_path)
+                _prof["save"] += time.perf_counter() - _t0
                 yield TokenizeResult(status="done", frames=frames)
+
+    if _profile:
+        n_enc = max(1, _prof["n_encoded"])
+        print(
+            f"[tokenize-profile] decode_wait={_prof['decode_wait']:.1f}s "
+            f"encode={_prof['encode']:.1f}s save={_prof['save']:.1f}s "
+            f"n_encoded={_prof['n_encoded']} "
+            f"(encode {1000 * _prof['encode'] / n_enc:.0f}ms/file; "
+            f"decode_wait/encode={_prof['decode_wait'] / max(1e-9, _prof['encode']):.2f}) "
+            f"— >1 means CPU-decode-bound, ~0 means GPU-encode-bound",
+            flush=True,
+        )
 
 
 def tokenize_corpus(

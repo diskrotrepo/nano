@@ -13,11 +13,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
 
+from diskrot.audio_io import decode_pcm
 from model.codec import DACodec, get_codec
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
@@ -983,11 +983,10 @@ class InferenceEngine:
         count (mono for DAC, stereo for SpectroStream; a mono source is duplicated
         to L=R) so prompt-encode and the kept-prefix stitch stay channel-consistent
         with the decoded output."""
-        y, _ = librosa.load(path, sr=self.codec.SAMPLE_RATE, mono=(self.n_channels == 1))
-        if self.n_channels == 2 and y.ndim == 1:
-            y = np.stack([y, y], axis=0)  # mono source -> L=R
-        if y.ndim == 1:
-            y = y[None, :]
+        # Shared ffmpeg decoder — the SAME one tokenize uses, so prompt-encode
+        # tokens stay on-distribution with the trained corpus. Returns [C, N]
+        # (mono source upmixed to L=R for a stereo codec).
+        y = decode_pcm(path, self.codec.SAMPLE_RATE, self.n_channels)
         return torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
 
     def _decode_chunk(
@@ -1360,14 +1359,12 @@ class InferenceEngine:
             f.write(audio_bytes)
             in_path = f.name
         try:
-            # Demucs is a stereo model — load stereo (mono->stereo if needed).
-            audio, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=False)
+            # Demucs is a stereo model — decode stereo (mono upmixed to L=R by
+            # the shared ffmpeg decoder, matching the old librosa mono->stereo).
+            audio = decode_pcm(in_path, self.codec.SAMPLE_RATE, 2)  # [2, T] f32
         finally:
             os.unlink(in_path)
-        wav = torch.from_numpy(audio)  # [2, T] or [T]
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0).repeat(2, 1)  # mono -> stereo
-        wav = wav.unsqueeze(0).to(self.device)  # [1, 2, T]
+        wav = torch.from_numpy(audio).unsqueeze(0).to(self.device)  # [1, 2, T]
 
         sources = apply_fn(model, wav, device=self.device)  # [1, S, 2, T]
         mixed = sources[0, keep_idx].sum(dim=0)  # [2, T] — sum kept stems

@@ -303,6 +303,119 @@ def measure_overflow(start_s: int = 180, stop_s: int = 480, step_s: int = 10,
           flush=True)
 
 
+@app.function(
+    image=image,
+    gpu=os.environ.get("NANO_SPIKE_GPU", "A100-40GB"),
+    timeout=60 * 30,
+    volumes={"/cache": cache_vol},
+)
+def bucket_check(depth: int = 32, bucket_frames: int = 256) -> None:
+    """Validate the frame-alignment crash fix + gate the cuFFT-thrash speedup.
+
+    (1) ALIGNMENT (the crash fix): encode several NON-frame-aligned lengths (the
+        remainder that made the ffmpeg-decoded corpus fail with the internal
+        "(1,T,256) vs (1,T-1,256)" mismatch). With `encode` now padding the tail up to
+        a whole frame, each must SUCCEED and return exactly ceil(samples/hop) frames.
+        A raised exception here means aligning did NOT fix the codec off-by-one.
+    (2) EQUIVALENCE (the speed gate): a COARSER grid (bucket_frames) must give
+        BYTE-IDENTICAL codes to minimal 1-frame alignment — i.e. tail padding beyond
+        the true frames never perturbs the real codes — before enabling
+        NANO_SS_BUCKET_FRAMES for cuFFT-plan reuse.
+    (3) TIMING: encode a spread of DISTINCT lengths at grid=1 vs grid=bucket_frames;
+        the coarse grid should be faster once the encoder stops "constantly creating
+        new plans" (the cuFFT-cache thrash seen in the live logs).
+    """
+    import time
+
+    import numpy as np
+    import torch
+
+    from model.codec import SpectroStreamCodec, bucket_target_samples
+
+    sr = 48000
+    hop = sr // 25  # 1920
+    codec = SpectroStreamCodec(device="cuda", depth=depth)
+
+    def _stereo(secs: float) -> torch.Tensor:
+        n = int(secs * sr)
+        t = np.linspace(0, secs, n, endpoint=False, dtype=np.float32)
+        return torch.from_numpy(
+            np.stack([0.2 * np.sin(2 * np.pi * 220 * t), 0.2 * np.sin(2 * np.pi * 277 * t)], 0)
+        )
+
+    # Lengths whose final frame is PARTIAL (n not a multiple of hop) — the class that
+    # crashed. 250.7s ≈ a real failure (ceil has a partial tail frame).
+    non_aligned = (7.3, 31.7, 63.1, 100.02, 156.55, 250.7)
+    print(f"=== (1) alignment / crash fix (depth={depth}) ===", flush=True)
+    codec._bucket_frames = 1  # minimal frame-alignment (prod default)
+    align_ok = True
+    aligned_codes = {}
+    for secs in non_aligned:
+        n = int(secs * sr)
+        want = (n + hop - 1) // hop
+        try:
+            c = codec.encode(_stereo(secs))
+            got = int(c.shape[1])
+            good = got == want and n % hop != 0  # confirm it WAS non-aligned
+            aligned_codes[secs] = c
+            print(f"  {secs:>7}s: want_frames={want} got={got} non_aligned={n % hop != 0} "
+                  f"{'OK' if good else 'BAD'}", flush=True)
+            align_ok = align_ok and (got == want)
+        except Exception as e:  # noqa: BLE001 — the whole point is to catch the crash
+            align_ok = False
+            print(f"  {secs:>7}s: STILL CRASHES — {type(e).__name__}: {str(e)[:120]}", flush=True)
+    print("ALIGNMENT: " + ("PASS — frame-align fixes the off-by-one crash"
+                           if align_ok else "FAIL — aligning did NOT fix it"), flush=True)
+
+    print(f"\n=== (2) bucket equivalence (grid=1 vs {bucket_frames}) ===", flush=True)
+    ok = True
+    for secs in non_aligned:
+        x = _stereo(secs)
+        a = aligned_codes.get(secs)
+        if a is None:
+            continue
+        codec._bucket_frames = bucket_frames
+        b = codec.encode(x)  # coarser grid, SAME production path
+        codec._bucket_frames = 1
+        same = tuple(a.shape) == tuple(b.shape) and bool(torch.equal(a, b))
+        mism = int((a != b).sum()) if a.shape == b.shape else -1
+        n = int(secs * sr)
+        tgt_frames = bucket_target_samples(n, hop, bucket_frames, codec._max_encode_samples) // hop
+        print(f"  {secs:>7}s: true_frames={(n + hop - 1)//hop} padded_frames={tgt_frames} "
+              f"identical={same} mismatched_codes={mism}", flush=True)
+        ok = ok and same
+    print("EQUIVALENCE: " + ("PASS — safe to set NANO_SS_BUCKET_FRAMES"
+                             if ok else "FAIL — coarse bucketing drifts (keep grid=1)"), flush=True)
+
+    # Timing: a spread of DISTINCT lengths (what thrashes the plan cache in prod).
+    xs = [_stereo(30 + (i * 7) % 300) for i in range(40)]
+
+    def _run(grid: int) -> float:
+        codec._bucket_frames = grid
+        codec.encode(xs[0])  # warm this config
+        t0 = time.perf_counter()
+        for x in xs:
+            codec.encode(x)
+        return time.perf_counter() - t0
+
+    grid1 = _run(1)  # minimal frame-align (prod default) — distinct length per song
+    coarse = _run(bucket_frames)  # coarse grid → few distinct lengths → plan reuse
+    codec._bucket_frames = 1
+    print(f"\n=== (3) TIMING over {len(xs)} distinct-length encodes ===", flush=True)
+    print(f"grid=1={grid1:.1f}s  grid={bucket_frames}={coarse:.1f}s  "
+          f"speedup={grid1 / max(1e-9, coarse):.2f}x", flush=True)
+
+
+@app.local_entrypoint()
+def check_bucket(depth: int = 32, bucket_frames: int = 256):
+    # Verify NANO_SS_BUCKET_FRAMES is byte-identical (the gate) + measure the win.
+    # NANO_SPIKE_GPU also picks the GPU, so this doubles as the GPU A/B: run it on
+    # A100-40GB / L40S / H100 and compare the per-length encode timing + $/s.
+    print(f"checking SS length-bucketing (bucket_frames={bucket_frames}, depth={depth}) "
+          f"on {os.environ.get('NANO_SPIKE_GPU', 'A100-40GB')}...")
+    bucket_check.remote(depth=depth, bucket_frames=bucket_frames)
+
+
 @app.local_entrypoint()
 def measure(start_s: int = 180, stop_s: int = 480, step_s: int = 10, depth: int = 32):
     # .spawn() (NOT .remote()) so the sweep runs fully server-side and survives the

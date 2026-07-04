@@ -103,6 +103,12 @@ if _IS_SS:
             "python -c 'from magenta_rt import spectrostream; "
             "spectrostream.SpectroStream(max_rvq_depth=32)'"
         )
+        # Stage-0 profiling knob (decode-wait vs encode vs commit split), baked from
+        # the local shell like the other NANO_ vars so `NANO_TOKENIZE_PROFILE=1 modal
+        # run/deploy ...` reaches the container. Placed AFTER the SavedModel bake so
+        # toggling it never invalidates that expensive layer — only the cheap
+        # add_local_python_source below rebuilds.
+        .env({"NANO_TOKENIZE_PROFILE": os.environ.get("NANO_TOKENIZE_PROFILE", "")})
         .add_local_python_source("model", "diskrot")
     )
     _GPU = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
@@ -135,6 +141,9 @@ else:
         # eats the rest. PyTorch's own CUDA-OOM error suggests setting this.
         .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
         .run_function(_cache_dac)
+        # Stage-0 profiling knob, after the DAC weight cache so toggling it doesn't
+        # re-run _cache_dac (see the SS image note above).
+        .env({"NANO_TOKENIZE_PROFILE": os.environ.get("NANO_TOKENIZE_PROFILE", "")})
         .add_local_python_source("model", "diskrot")
     )
     _GPU = "L4"
@@ -167,12 +176,26 @@ class Tokenizer:
 
     @modal.enter()
     def load_codec(self):
+        import torch
+
         from model.codec import get_codec
 
         # NANO_CODEC (baked into the image env): dac -> DACodec, spectrostream ->
         # SpectroStreamCodec (stereo, stored depth NANO_SS_DEPTH).
         self.codec = get_codec(device="cuda")
         self.min_frames = int(self.min_seconds * self.codec.FRAME_RATE_HZ)
+        # Warmup encode: pay the TF/XLA graph-build + cuDNN/cuFFT autotune ONCE here
+        # instead of on the first real file's critical path. Most effective paired
+        # with length bucketing (NANO_SS_BUCKET_FRAMES), which keeps the encoder to a
+        # few input shapes so the compiled plans get reused instead of thrashed. Wrapped
+        # so a warmup failure never blocks the container from processing real files.
+        try:
+            sr = int(self.codec.SAMPLE_RATE)
+            ch = int(getattr(self.codec, "N_CHANNELS", 1))
+            self.codec.encode(torch.zeros((ch, sr * 30), dtype=torch.float32))
+            print("[tokenize] codec warmup encode done", flush=True)
+        except Exception as e:  # noqa: BLE001 — warmup is best-effort
+            print(f"[tokenize] codec warmup skipped ({type(e).__name__}: {e})", flush=True)
 
     @modal.method()
     def tokenize_batch(
@@ -214,6 +237,7 @@ class Tokenizer:
         # so a storage blip doesn't fail the whole batch and bubble up through
         # the orchestrator's .map() loop — which would crash run_tokenize and
         # trigger a full restart + fleet re-spawn (see run_tokenize).
+        _commit_t0 = time.perf_counter()
         for attempt in range(3):
             try:
                 tokens_vol.commit()
@@ -223,6 +247,11 @@ class Tokenizer:
                     raise
                 print(f"commit failed ({e}); retry {attempt + 1}/2", flush=True)
                 time.sleep(2.0 * (attempt + 1))
+        # Stage-0 profiling: volume.commit() cost per batch (see
+        # tokenize_files_streaming's NANO_TOKENIZE_PROFILE decode/encode split).
+        if os.environ.get("NANO_TOKENIZE_PROFILE", "").lower() in ("1", "true", "yes"):
+            print(f"[tokenize-profile] commit={time.perf_counter() - _commit_t0:.2f}s "
+                  f"for {len(out)} results in batch", flush=True)
         return out
 
 
@@ -308,8 +337,15 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
     # the orchestrator has no flush to piggyback on — we print a progress line
     # every PROGRESS_EVERY processed files instead.
     n_seen = 0
-    PROGRESS_EVERY = 10_000
+    t_start = time.time()
+    # Progress heartbeat: report every PROGRESS_EVERY files OR every PROGRESS_SECS of
+    # wall time, whichever comes first — so a small wave still gets steady updates
+    # (time-driven) and a large one isn't spammed (count-driven), each line carrying a
+    # live throughput + ETA so overall progress is visible at a glance.
+    PROGRESS_EVERY = 2_000
+    PROGRESS_SECS = 45.0
     next_report = PROGRESS_EVERY
+    last_report_t = t_start
     # Sample a handful of "other" errors at the start so users can still
     # debug novel failure modes — after that, just count by category.
     OTHER_SAMPLES = 20
@@ -358,13 +394,22 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
                 n_done += 1
                 total_frames += frames
         n_seen += len(batch)
-        if n_seen >= next_report:
+        now = time.time()
+        if n_seen >= next_report or (now - last_report_t) >= PROGRESS_SECS:
             processed = n_done + n_short + n_failed
             pct = 100.0 * processed / len(pending)
+            elapsed = max(1e-6, now - t_start)
+            rate = processed / elapsed  # files/sec across the whole fleet
+            remaining = max(0, len(pending) - processed)
+            eta_s = int(remaining / rate) if rate > 0 else 0
+            eta_h, rem = divmod(eta_s, 3600)
+            eta_m, eta_sec = divmod(rem, 60)
             print(f"  progress {processed:,}/{len(pending):,} ({pct:.1f}%) "
-                  f"— tokenized {n_done:,}, short {n_short:,}, failed {n_failed:,}",
-                  flush=True)
-            next_report += PROGRESS_EVERY
+                  f"— tokenized {n_done:,}, short {n_short:,}, failed {n_failed:,} "
+                  f"| {rate * 60:,.0f} files/min | elapsed {int(elapsed // 60)}m "
+                  f"| ETA {eta_h}h{eta_m:02d}m", flush=True)
+            next_report = n_seen + PROGRESS_EVERY  # next count trigger from here
+            last_report_t = now
 
     print(f"\ndone:                {n_done}", flush=True)
     print(f"skipped (too short): {n_short} "

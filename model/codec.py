@@ -139,6 +139,31 @@ class DACodec:
 SS_DEFAULT_DEPTH = 32
 
 
+def bucket_target_samples(
+    n_samples: int, hop: int, bucket_frames: int, max_samples: int
+) -> int:
+    """Padded sample count that rounds a clip's frame count UP to a multiple of
+    ``bucket_frames``, so the SpectroStream STFT front-end sees only a HANDFUL of
+    distinct input lengths (its cuFFT plans are keyed by length — hundreds of unique
+    song lengths overflow the 512-plan cache and thrash "constantly creating new
+    plans"; bucketing collapses that to a few reused plans).
+
+    Clamped so the padded length never exceeds ``max_samples`` (the int32
+    launch-config ceiling). Returns ``n_samples`` UNCHANGED when bucketing is off
+    (``bucket_frames <= 0``), when the clip already lands on the grid, or when
+    padding would breach the cap. The caller pads with zeros to this length,
+    encodes, then crops the codes back to ``ceil(n_samples / hop)`` — crop-equivalent
+    to an unpadded encode (guarded by ``modal_spectrostream_spike.bucket_check``)."""
+    if bucket_frames <= 0:
+        return n_samples
+    true_frames = (n_samples + hop - 1) // hop
+    tgt_frames = ((true_frames + bucket_frames - 1) // bucket_frames) * bucket_frames
+    tgt_samples = tgt_frames * hop
+    if tgt_samples <= n_samples or tgt_samples > max_samples:
+        return n_samples
+    return tgt_samples
+
+
 class SpectroStreamCodec:
     """Magenta RealTime SpectroStream codec — 48kHz, joint stereo, 25 Hz, 1024 vocab.
 
@@ -171,6 +196,20 @@ class SpectroStreamCodec:
         )
         if not (0 < self.N_CODEBOOKS <= self.MAX_DEPTH):
             raise ValueError(f"depth must be in (0, {self.MAX_DEPTH}], got {self.N_CODEBOOKS}")
+        # Frame-alignment / length-bucketing grid (in frames). `encode` ALWAYS pads a
+        # clip's tail up to a whole frame (at least 1-frame alignment) — this is a
+        # CORRECTNESS guard, not just a speed knob: SpectroStream floors a partial
+        # final frame while a downstream stage expects ceil, so a non-frame-aligned
+        # length crashes with an internal "(1,T,256) vs (1,T-1,256)" mismatch for a
+        # subset of files. NANO_SS_BUCKET_FRAMES>1 aligns to a COARSER grid so the
+        # encoder also reuses cuFFT plans across songs (the tokenize speedup); 0 or 1
+        # both mean minimal frame-alignment. Crop-back keeps the output frame count
+        # exact; equivalence across grids is checked by
+        # modal_spectrostream_spike.bucket_check.
+        self._bucket_frames = int(os.environ.get("NANO_SS_BUCKET_FRAMES", "1"))
+        self._max_encode_samples = int(
+            float(os.environ.get("NANO_MAX_ENCODE_SECONDS_SS", "360.0")) * self.SAMPLE_RATE
+        )
         from magenta_rt import audio, spectrostream
 
         self._audio = audio
@@ -198,10 +237,35 @@ class SpectroStreamCodec:
         return wav.resample(self.SAMPLE_RATE).as_stereo()
 
     def encode(self, source: str | Path | torch.Tensor) -> torch.Tensor:
-        """Encode stereo audio to SpectroStream codes -> LongTensor[depth, T]."""
+        """Encode stereo audio to SpectroStream codes -> LongTensor[depth, T].
+
+        The waveform is zero-padded so its length is a whole number of codec frames
+        before the TF forward, then the codes are cropped back to the true frame count
+        (``ceil(samples / hop)``). This is REQUIRED for correctness, not just speed:
+        SpectroStream floors a partial final frame while a downstream stage expects
+        ceil, so a non-frame-aligned input length crashes with an internal
+        ``(1, T, 256) vs (1, T-1, 256)`` shape mismatch for a subset of files. Aligning
+        the tail to a full frame (optionally to a coarser ``NANO_SS_BUCKET_FRAMES`` grid,
+        which also lets the encoder reuse cuFFT plans across songs) makes the framing
+        unambiguous. Shared by train + inference, so both encode a given file
+        identically."""
+        import numpy as np
+
         wav = self._to_waveform(source)
-        codes = self.model.encode(wav)  # [S, depth] int32, frame-major
-        return torch.from_numpy(codes).to(torch.long).T.contiguous()  # [depth, S]
+        hop = self.SAMPLE_RATE // self.FRAME_RATE_HZ  # 1920
+        n = int(wav.samples.shape[0])
+        true_frames = (n + hop - 1) // hop
+        grid = max(1, self._bucket_frames)  # >=1 → always at least frame-aligned
+        tgt = bucket_target_samples(n, hop, grid, self._max_encode_samples)
+        if tgt > n:
+            pad = np.zeros((tgt - n, wav.samples.shape[1]), dtype=np.float32)
+            wav = self._audio.Waveform(
+                np.ascontiguousarray(np.concatenate([wav.samples, pad], axis=0), dtype=np.float32),
+                self.SAMPLE_RATE,
+            )
+        codes = self.model.encode(wav)  # [>=true_frames, depth] int32, frame-major
+        codes = np.ascontiguousarray(codes[:true_frames])  # crop to true frame count
+        return torch.from_numpy(codes).to(torch.long).T.contiguous()  # [depth, T]
 
     def encode_batch(self, audios: list[torch.Tensor]) -> list[torch.Tensor]:
         """Encode multiple audios. Loops encode() per item (one TF forward each);
