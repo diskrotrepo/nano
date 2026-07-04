@@ -121,6 +121,12 @@ def ingest_wave(
         os.replace(tmp, status_path)  # atomic: never a torn status file
         tokens_vol.commit()
 
+    from modal.exception import NotFoundError
+
+    def _module_for(app_name: str) -> str:
+        # nano-tokenize -> modal_tokenize.py; nano-audio-dedup -> modal_audio_dedup.py
+        return "modal_" + app_name.replace("nano-", "", 1).replace("-", "_") + ".py"
+
     def run(stage: str, app_name: str, fn_name: str, **kwargs) -> None:
         if status.get(stage) == "done":
             print(f"[wave {wave_id}] SKIP {stage} (already done)", flush=True)
@@ -128,10 +134,64 @@ def ingest_wave(
         print(f"[wave {wave_id}] >>> {stage}  ({app_name}.{fn_name})", flush=True)
         # from_name resolves a DEPLOYED function; .remote() blocks until its full
         # pass returns, which is what sequences the stages (and the GPU usage).
-        fn = modal.Function.from_name(app_name, fn_name)
-        fn.remote(**kwargs)
+        try:
+            fn = modal.Function.from_name(app_name, fn_name)
+            fn.remote(**kwargs)
+        except NotFoundError as e:
+            raise RuntimeError(
+                f"[wave {wave_id}] stage '{stage}' cannot run: app '{app_name}' is "
+                f"not deployed (stages are resolved by name, which only finds "
+                f"DEPLOYED apps). Deploy it, then re-run the ingest — it resumes via "
+                f"status.json:\n    modal deploy diskrot/{_module_for(app_name)}\n"
+                f"(codec stages tokenize/stems: prefix NANO_CODEC=spectrostream)"
+            ) from e
         _mark(stage)
         print(f"[wave {wave_id}] <<< {stage} done", flush=True)
+
+    # Preflight: verify every stage app THIS run will still call is deployed BEFORE
+    # running anything — so a missing deploy fails in seconds (with the exact fix
+    # command) instead of mid-pipeline, after prepare/dedup have already burned
+    # hours. Skips stages already marked done (a resume won't call them).
+    _required = [
+        ("prepare", "nano-prepare", "run_prepare"),
+        *([("audio_dedup", "nano-audio-dedup", "run_dedup")] if with_dedup else []),
+        ("tokenize", "nano-tokenize", "run_tokenize"),
+        *([("melody", "nano-melody", "orchestrate")] if with_melody else []),
+        *([("stems", "nano-stems", "orchestrate")] if with_stems else []),
+        *([("auto_tag", "nano-auto-tag", "run_auto_tag")] if with_tags else []),
+        *([("transcribe", "nano-transcribe", "orchestrate")] if with_lyrics else []),
+        *([("filter_lyrics", "nano-filter-lyrics", "filter_remote")]
+          if (with_lyrics and with_filter) else []),
+        *([("align_lyrics", "nano-align-lyrics", "run_align")]
+          if (with_lyrics and with_align) else []),
+        *([("structure", "nano-structure", "orchestrate")] if with_structure else []),
+        *([("tempo", "nano-tempo", "orchestrate")] if with_tempo else []),
+        ("pack", "nano-pack", "pack_append_remote"),
+        ("cleanup", "nano-wave-cleanup", "cleanup_remote"),
+        *([("phonemize", "nano-phonemize", "phonemize_remote")] if with_lyrics else []),
+        ("key_detect", "nano-key-detect", "detect_remote"),
+    ]
+    _missing: list[str] = []
+    for _stage, _app, _fn in _required:
+        if status.get(_stage) == "done":
+            continue
+        try:
+            modal.Function.from_name(_app, _fn).hydrate()
+        except NotFoundError:
+            _missing.append(_app)
+        except Exception:
+            pass  # transient/API hiccup — don't false-block; run() re-checks anyway
+    if _missing:
+        _uniq = sorted(set(_missing))
+        _cmds = "\n".join(f"    modal deploy diskrot/{_module_for(a)}" for a in _uniq)
+        raise RuntimeError(
+            f"[wave {wave_id}] PREFLIGHT FAILED — stage app(s) not deployed: "
+            f"{', '.join(_uniq)}. The orchestrator resolves stages by name "
+            f"(from_name), which only finds DEPLOYED apps. Deploy the missing "
+            f"one(s), then re-run the ingest (resumes via status.json):\n{_cmds}\n"
+            f"(codec-sensitive stages tokenize/stems: prefix the deploy with "
+            f"NANO_CODEC=spectrostream so they build the SpectroStream image.)"
+        )
 
     # CPU/GPU stages serialized by the blocking .remote() calls above.
     # prepare: validate/dedupe/length-drop (+ optional content quality gate). The
