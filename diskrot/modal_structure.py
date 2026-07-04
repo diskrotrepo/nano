@@ -111,7 +111,17 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     # bottleneck (the silent gap after the fast GPU stages). 4 cores cover the two
     # concurrent batches' beat tracking (one core each) plus Demucs/torch CPU work.
     cpu=4.0,
-    timeout=60 * 60,
+    # allin1 HANGS (not crashes) on rare pathological files, and a hung chunk stalls
+    # its container until the timeout — the old 1h ceiling froze the whole fan-out at
+    # ~99% for up to an hour (observed on base_2: stuck at 4,450/4,498, never
+    # recovering before a manual stop). 10 min bounds that: a healthy 8-song chunk
+    # runs ~4 min (≈20s allin1 setup + the CPU-bound madmom beat tracking), so this
+    # keeps normal chunks safe while killing a hang fast — Modal returns it as a
+    # per-input error (return_exceptions=True) and the pass completes. Collateral: a
+    # timed-out chunk drops ALL its songs (incl. any legit ones sharing it with the
+    # hung file) to <no_section> — acceptable for this optional, sampled stage. Cut
+    # batch_size if that collateral matters more than the per-chunk setup amortization.
+    timeout=10 * 60,
     max_containers=100,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     # allin1 pulls its checkpoint from the HF Hub at runtime; the token lifts the
@@ -132,8 +142,20 @@ class Analyzer:
     def load_models(self):
         # Importing allin1 + warming demucs amortizes model load across the many
         # files this container will process.
+        import logging
+
         import allin1  # noqa: F401
         from demucs.pretrained import get_model
+
+        # allin1's beat/segment backbone calls NATTEN's OLD op names
+        # (natten1dqkrpb/…), which natten 0.17.1 (pinned above) warns about several
+        # times PER model forward. Across the fan-out that's a log flood that buries
+        # the stage's real progress. The pin means the deprecated ops still work, so
+        # the warning is pure noise — silence NATTEN's logger AFTER importing allin1
+        # (which imports natten and configures the logger), so this is the last word.
+        # Both the parent and the emitting child, since natten sets the child level.
+        for _name in ("natten", "natten.functional"):
+            logging.getLogger(_name).setLevel(logging.ERROR)
 
         get_model("htdemucs")
         # Pre-build allin1's segment model once so two concurrent first-calls don't

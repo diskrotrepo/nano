@@ -236,16 +236,49 @@ def list_pending(wave_id: str = "", redo_missing_language: bool = False) -> list
     # The orchestrator now calls this repeatedly (sweep loop) — a warm-reused
     # container must see the shards committed by save_results since it started.
     tokens_vol.reload()
-    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
+    sub = wave_subdir(wave_id)
+    mp3s = sorted((Path("/corpus") / sub).glob("*.mp3"))
     existing = load_lyrics_shards(LYRICS_DIR)
-    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
-               if mp3.stem not in existing
-               or (redo_missing_language and _needs_lang_redo(existing.get(mp3.stem)))]
-    n_redo = sum(1 for mp3 in mp3s if mp3.stem in existing
-                 and redo_missing_language and _needs_lang_redo(existing.get(mp3.stem)))
+
+    # Gate on successful tokenization. A song with no ``.pt`` failed the tokenize
+    # stage (undecodable / codec error), so it will never be packed or trained on
+    # — transcribing it burns GPU (Whisper decodes the same file through the same
+    # ffmpeg path and fails identically), and for the rare decode-ok/encode-fail
+    # file it would only write an orphaned lyrics entry no dataset ever reads
+    # (no tokens -> not in the packed corpus). In the wave pipeline
+    # (tokenize -> ... -> transcribe -> pack -> cleanup) the ``.pt`` files are
+    # still on the volume when transcribe runs, so this narrows the work to
+    # exactly the songs that survived tokenize — mirroring how melody/stems
+    # already derive their pending set from ``.pt`` stems.
+    #
+    # FALLBACK: if the wave has NO ``.pt`` at all, we can't distinguish "every
+    # file failed" from "tokenize hasn't run yet" or "pack+cleanup already pruned
+    # the loose .pt" — and unlike melody/stems, transcribe reads the mp3 directly
+    # so it *can* legitimately run after cleanup. In that case we don't gate and
+    # fall back to the prior corpus-glob behavior, so a standalone post-cleanup
+    # (or global --redo) run never silently transcribes nothing.
+    tokenized = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
+    gate = bool(tokenized)
+
+    pending: list[str] = []
+    n_redo = 0
+    n_untok = 0
+    for mp3 in mp3s:
+        if gate and mp3.stem not in tokenized:
+            n_untok += 1  # failed tokenize (no .pt) — skip, it can't be trained on
+            continue
+        is_redo = (redo_missing_language and mp3.stem in existing
+                   and _needs_lang_redo(existing.get(mp3.stem)))
+        if mp3.stem not in existing or is_redo:
+            pending.append(str(mp3.relative_to("/corpus")))
+            if is_redo:
+                n_redo += 1
+
     extra = f" (incl. {n_redo} language-redo)" if redo_missing_language else ""
+    gate_note = (f", {n_untok} skipped (no .pt — failed/not-yet tokenized)"
+                 if n_untok else "")
     print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, "
-          f"{len(pending)} pending{extra}")
+          f"{len(pending)} pending{extra}{gate_note}")
     return pending
 
 
