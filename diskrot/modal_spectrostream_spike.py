@@ -406,6 +406,201 @@ def bucket_check(depth: int = 32, bucket_frames: int = 256) -> None:
           f"speedup={grid1 / max(1e-9, coarse):.2f}x", flush=True)
 
 
+@app.function(
+    image=image,
+    gpu=os.environ.get("NANO_SPIKE_GPU", "A100-40GB"),
+    timeout=60 * 30,
+    volumes={"/corpus": corpus_vol, "/cache": cache_vol},
+)
+def bench_gpu(n_songs: int = 16, gpu_label: str = "") -> None:
+    """Fixed-file GPU encode benchmark — the clean cross-GPU $/file instrument.
+
+    Encodes the SAME deterministic set of real base_13 songs (so runs on different
+    GPUs are apples-to-apples, unlike a fan-out over a resumable/picked-over wave)
+    at grid=1 (the prod default), timing ONLY codec.encode(). Decode is the prod
+    ffmpeg path (audio_io.decode_pcm); loudness-norm is skipped since it changes
+    sample VALUES not COUNT, so it can't affect encode time. Warms once (like the
+    prod @enter warmup) so file-1's initial XLA graph build isn't charged to it;
+    each real file then pays its own per-length cuFFT/XLA recompile — the real cost.
+    Per-file (frames, encode_s) is printed so steady-state (encode_s/frames ~const)
+    vs recompile-dominated (encode_s ~const regardless of frames) is visible. Set
+    NANO_SPIKE_GPU to pick the card."""
+    import time
+
+    import numpy as np
+    import torch
+
+    from diskrot.audio_io import decode_pcm
+    from model.codec import SpectroStreamCodec
+
+    # NANO_SPIKE_GPU is a LOCAL var (picks the gpu= decorator at modal-run parse);
+    # it is NOT in the container env, so the label must come in as an arg.
+    gpu = gpu_label or os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
+    depth = int(os.environ.get("NANO_SS_DEPTH", "32"))
+    codec = SpectroStreamCodec(device="cuda", depth=depth)
+    sr, ch = int(codec.SAMPLE_RATE), int(codec.N_CHANNELS)
+
+    # Deterministic pick: sort the wave, stride across it (spans the wave, so a
+    # natural length mix), take up to n_songs successful encodes. Identical set on
+    # every GPU because the corpus + ordering are static. No os.stat() (per-file
+    # HEAD over R2 is slow at 100k files); over-sample the stride to absorb dregs.
+    all_mp3 = sorted(Path("/corpus/waves/wave_base_13").glob("*.mp3"))
+    if not all_mp3:
+        print("no base_13 mp3s found", flush=True)
+        return
+    step = max(1, len(all_mp3) // (n_songs * 3))
+    cands = all_mp3[::step]
+    print(f"=== bench_gpu on {gpu}: target {n_songs} songs "
+          f"(of {len(all_mp3)} in wave, striding {len(cands)} candidates) depth={depth} ===",
+          flush=True)
+
+    # Warm once — pay the initial XLA graph build off the measured path.
+    codec.encode(torch.zeros((ch, sr * 30), dtype=torch.float32))
+    print("[warmup] done", flush=True)
+
+    rows = []
+    for p in cands:
+        if len(rows) >= n_songs:
+            break
+        try:
+            y = decode_pcm(p, sr, ch)  # [C, N] float32, prod decode
+            x = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
+            t0 = time.perf_counter()
+            codes = codec.encode(x)  # TF/JAX blocks until the host array is ready
+            dt = time.perf_counter() - t0
+            frames = int(codes.shape[1])
+            if frames < 500:  # < ~20s: prod min_frames skip; don't count dregs
+                continue
+            rows.append((frames, dt))
+            print(f"  {frames:>6}f ({frames / codec.FRAME_RATE_HZ:>5.0f}s)  "
+                  f"encode {dt:6.2f}s  {1000 * dt / frames:6.2f} ms/frame  {p.name[:48]}",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001 — surface + skip (the off-by-one crash etc.)
+            print(f"  FAILED {p.name[:48]}: {type(e).__name__}: {str(e)[:80]}", flush=True)
+
+    if not rows:
+        print(f"=== {gpu}: NO successful encodes ===", flush=True)
+        return
+    tot = sum(dt for _, dt in rows)
+    totf = sum(f for f, _ in rows)
+    n = len(rows)
+    per = sorted(dt for _, dt in rows)
+    med = per[n // 2]
+    print(f"\n=== {gpu} SUMMARY: {n} songs | total encode {tot:.1f}s | "
+          f"mean {tot / n:.2f}s/file | median {med:.2f}s/file | "
+          f"{1000 * tot / totf:.2f} ms/frame overall ({totf} frames, "
+          f"{totf / codec.FRAME_RATE_HZ / 60:.1f} min audio) ===", flush=True)
+
+
+@app.function(image=image, timeout=60 * 10, volumes={"/cache": cache_vol})
+def inspect_ss(lo: int = 100, hi: int = 200) -> None:
+    """Dump SpectroStream.encode source + the module lines around the assertion so
+    we can root-cause the grid=1 off-by-one crash (`Expected (1,T,256) got
+    (1,T-1,256)`). CPU-only (no gpu on this fn) — just reads source, no model build."""
+    import inspect
+
+    from magenta_rt import spectrostream
+
+    print("===== SpectroStream.encode source =====", flush=True)
+    try:
+        print(inspect.getsource(spectrostream.SpectroStream.encode), flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"(couldn't getsource of .encode: {e})", flush=True)
+    path = spectrostream.__file__
+    print(f"\n===== {path} lines {lo}..{hi} =====", flush=True)
+    lines = open(path).read().splitlines()
+    for i in range(max(0, lo - 1), min(len(lines), hi)):
+        print(f"{i + 1:>4}: {lines[i]}", flush=True)
+
+
+@app.local_entrypoint()
+def inspect_source(lo: int = 100, hi: int = 200):
+    inspect_ss.remote(lo=lo, hi=hi)
+
+
+@app.function(
+    image=image,
+    gpu=os.environ.get("NANO_SPIKE_GPU", "L40S"),
+    timeout=60 * 20,
+    volumes={"/cache": cache_vol},
+)
+def verify_offbyone_fix(depth: int = 32) -> None:
+    """Validate the codec.encode float-ceil off-by-one guard end-to-end on GPU:
+    (1) the RAW SpectroStream crashes on frame-aligned boundary lengths (F*hop where
+        int(ceil((T/sr)*fr)) == F+1); (2) the PATCHED codec.encode succeeds on those
+        exact lengths and returns F frames after crop; (3) a non-boundary length is
+        unaffected. Proves the conv-output proxy (ceil_int(T/hop)) the guard relies
+        on actually holds on the real model."""
+    import numpy as np
+    import torch
+
+    from model.codec import SpectroStreamCodec
+
+    codec = SpectroStreamCodec(device="cuda", depth=depth)
+    sr, ch = int(codec.SAMPLE_RATE), int(codec.N_CHANNELS)
+    hop, fr = sr // int(codec.FRAME_RATE_HZ), int(codec.FRAME_RATE_HZ)
+
+    def ss_exp(t):
+        return int(np.ceil((t / float(sr)) * float(fr)))
+
+    def stereo(nsamp):
+        t = np.linspace(0, nsamp / sr, nsamp, endpoint=False, dtype=np.float32)
+        return torch.from_numpy(
+            np.stack([0.2 * np.sin(2 * np.pi * 220 * t), 0.2 * np.sin(2 * np.pi * 277 * t)], 0)
+        )
+
+    bad_F = [F for F in range(2, 4000) if ss_exp(F * hop) != F][:8]
+    print(f"=== off-by-one fix validation (depth={depth}) ===", flush=True)
+    print(f"bad frame-aligned F (float-ceil = F+1): {bad_F}", flush=True)
+
+    # (1) RAW SS crashes on the frame-aligned boundary lengths (no guard).
+    n_crash = 0
+    for F in bad_F:
+        wav = codec._to_waveform(stereo(F * hop))  # exactly F*hop samples
+        try:
+            codec.model.encode(wav)
+            print(f"  raw F={F:>5}: NO crash (unexpected!)", flush=True)
+        except AssertionError as e:
+            n_crash += 1
+            print(f"  raw F={F:>5}: crashes as expected — {str(e)[:60]}", flush=True)
+    print(f"(1) RAW SS crashed on {n_crash}/{len(bad_F)} boundary lengths", flush=True)
+
+    # (2) PATCHED codec.encode succeeds on those same lengths + returns F frames.
+    ok = 0
+    for F in bad_F:
+        try:
+            codes = codec.encode(stereo(F * hop))  # through the new guard
+            got = int(codes.shape[1])
+            good = got == F
+            ok += int(good)
+            print(f"  fixed F={F:>5}: frames={got} want={F} {'OK' if good else 'BAD'}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  fixed F={F:>5}: STILL FAILS — {type(e).__name__}: {str(e)[:60]}", flush=True)
+    print(f"(2) PATCHED encode OK on {ok}/{len(bad_F)}", flush=True)
+
+    # (3) a non-boundary length is unaffected (guard must not fire).
+    good_F = next(F for F in range(100, 4000) if ss_exp(F * hop) == F)
+    c = codec.encode(stereo(good_F * hop))
+    gf = int(c.shape[1])
+    print(f"(3) good F={good_F}: frames={gf} want={good_F} {'OK' if gf == good_F else 'BAD'}",
+          flush=True)
+    verdict = "PASS" if (n_crash == len(bad_F) and ok == len(bad_F) and gf == good_F) else "CHECK"
+    print(f"=== VERDICT: {verdict} ===", flush=True)
+
+
+@app.local_entrypoint()
+def verify_fix(depth: int = 32):
+    print(f"validating off-by-one fix on {os.environ.get('NANO_SPIKE_GPU', 'L40S')}...")
+    verify_offbyone_fix.remote(depth=depth)
+
+
+@app.local_entrypoint()
+def bench(n_songs: int = 16):
+    gpu = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
+    print(f"fixed-file GPU encode bench on {gpu} ({n_songs} songs)...")
+    bench_gpu.remote(n_songs=n_songs, gpu_label=gpu)
+
+
 @app.local_entrypoint()
 def check_bucket(depth: int = 32, bucket_frames: int = 256):
     # Verify NANO_SS_BUCKET_FRAMES is byte-identical (the gate) + measure the win.

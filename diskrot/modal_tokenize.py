@@ -115,7 +115,13 @@ if _IS_SS:
         .env({"NANO_TOKENIZE_PROFILE": os.environ.get("NANO_TOKENIZE_PROFILE", "")})
         .add_local_python_source("model", "diskrot")
     )
-    _GPU = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
+    # L40S is the measured cost/perf winner for SS encode: a fixed-file bench
+    # (modal_spectrostream_spike.py::bench, 16 real songs) found L40S ~2.8x FASTER
+    # than A100-40GB and ~3.0x cheaper per song ($5.4 vs $16.0/1k songs) — SS's
+    # FP32 STFT/conv encode doesn't use A100's HBM/tensor-core/FP64 strengths, so the
+    # Ada L40S wins on both axes, with 48GB leaving mem headroom. Override with
+    # NANO_SPIKE_GPU to re-bench other cards.
+    _GPU = os.environ.get("NANO_SPIKE_GPU", "L40S")
     # SS codec weights baked into the image (above) → no runtime cache volume
     # (mounting one at /cache would shadow the baked /cache/hf and re-trigger the
     # per-cold-start HF download this bake exists to kill).
@@ -162,7 +168,7 @@ if _cache_vol is not None:
 
 @app.cls(
     image=image,
-    gpu=_GPU,  # L4 for DAC; A100-40GB for the SpectroStream TF/JAX stack
+    gpu=_GPU,  # L4 for DAC; L40S for the SpectroStream TF/JAX stack (bench winner)
     timeout=60 * 60,
     max_containers=50,
     volumes=_VOLUMES,
@@ -228,12 +234,19 @@ class Tokenizer:
         # ready, so the GPU/TF encode never stalls on librosa — the expensive
         # (A100) SpectroStream GPU would otherwise sit idle through every file's
         # decode.
-        for (mp3_path, _), result in zip(
-            items,
+        # Materialize the generator fully (list()) rather than consuming it via
+        # zip(items, gen): zip stops as soon as `items` (its first, equal-length
+        # iterable) is exhausted and never resumes the generator past its final
+        # yield — so tokenize_files_streaming's end-of-stream NANO_TOKENIZE_PROFILE
+        # summary (the decode_wait/encode/save split) would never run. list()
+        # drives the generator to StopIteration, which prints that summary. Output
+        # is unchanged (tokenize_batch buffers all results into `out` anyway).
+        results = list(
             tokenize_files_streaming(
                 self.codec, items, self.min_frames, batch_size=1, prefetch=8
-            ),
-        ):
+            )
+        )
+        for (mp3_path, _), result in zip(items, results):
             out.append((mp3_path.stem, result.status, result.frames, result.error))
         # One commit per batch — each container writes independent .pt files so
         # commits don't conflict; batching them amortizes commit overhead.

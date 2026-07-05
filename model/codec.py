@@ -22,6 +22,7 @@ for v9).
 """
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -164,6 +165,29 @@ def bucket_target_samples(
     return tgt_samples
 
 
+def frame_safe_target_samples(tgt: int, hop: int, sample_rate: int, frame_rate: int) -> int:
+    """Nudge a padded sample count off SpectroStream's float-ceil off-by-one boundary.
+
+    ``SpectroStream.encode`` asserts ``embeddings.shape[1] == int(np.ceil(
+    (T/sample_rate) * frame_rate))`` computed in float64 — but for ~4.8% of
+    frame-aligned ``T`` that expression rounds ONE ABOVE the conv encoder's true
+    frame count ``ceil(T/hop)`` (e.g. ``(13440/48000)*25 == 7.000000000000001 ->
+    ceil 8``) and aborts the container with ``Expected (1,F+1,256) but got
+    (1,F,256)``. When ``tgt`` sits on such a boundary, add half-frames until SS's
+    float ``expected`` matches ``ceil(tgt/hop)`` — one half-frame always suffices.
+    Returns ``tgt`` UNCHANGED for the other ~95% (guard inert → byte-identical
+    encode). The caller crops codes back to ``true_frames``, so the extra frame is
+    dropped. Pure integer/float arithmetic (no model) — unit-tested; the crash + fix
+    are GPU-validated by ``modal_spectrostream_spike.py::verify_offbyone_fix``."""
+    def _ss_expected(t: int) -> int:  # SS's exact float computation
+        return math.ceil((t / float(sample_rate)) * float(frame_rate))
+    guard = 0
+    while _ss_expected(tgt) != (tgt + hop - 1) // hop and guard < 8:
+        tgt += hop // 2
+        guard += 1
+    return tgt
+
+
 class SpectroStreamCodec:
     """Magenta RealTime SpectroStream codec — 48kHz, joint stereo, 25 Hz, 1024 vocab.
 
@@ -257,6 +281,11 @@ class SpectroStreamCodec:
         true_frames = (n + hop - 1) // hop
         grid = max(1, self._bucket_frames)  # >=1 → always at least frame-aligned
         tgt = bucket_target_samples(n, hop, grid, self._max_encode_samples)
+        # Dodge SpectroStream's float-ceil off-by-one (see frame_safe_target_samples):
+        # a frame-aligned `tgt` lands on the unstable boundary for ~4.8% of lengths,
+        # aborting the encode; a half-frame nudge fixes it and the crop below drops
+        # the extra frame. Guard inert (byte-identical) for the other ~95%.
+        tgt = frame_safe_target_samples(tgt, hop, self.SAMPLE_RATE, self.FRAME_RATE_HZ)
         if tgt > n:
             pad = np.zeros((tgt - n, wav.samples.shape[1]), dtype=np.float32)
             wav = self._audio.Waveform(
