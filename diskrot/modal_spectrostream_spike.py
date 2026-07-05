@@ -594,6 +594,71 @@ def verify_fix(depth: int = 32):
     verify_offbyone_fix.remote(depth=depth)
 
 
+@app.function(
+    image=image,
+    gpu=os.environ.get("NANO_SPIKE_GPU", "L40S"),
+    timeout=60 * 20,
+    volumes={"/cache": cache_vol},
+)
+def measure_recompile(depth: int = 32) -> None:
+    """Decompose SS encode time into per-shape recompile (fixed) vs steady-state
+    (per-frame): encode each distinct length 3x back-to-back. cold=1st call (new
+    shape → pays any XLA/cuFFT recompile), warm=2nd/3rd (shape cached in-process).
+    A big cold→warm drop means the fixed cost IS recompile and is in-process-cached
+    → a persistent XLA compilation cache across containers could reclaim it with NO
+    token change. A ~0 drop means the fixed cost is per-call launch/transfer, not
+    reclaimable. The bench already showed cost ≈ fixed + ~const·frames (steady-state
+    dominated); this pins how much of `fixed` is recompile."""
+    import time
+
+    import numpy as np
+    import torch
+
+    from model.codec import SpectroStreamCodec
+
+    codec = SpectroStreamCodec(device="cuda", depth=depth)
+    sr, ch = int(codec.SAMPLE_RATE), int(codec.N_CHANNELS)
+
+    def stereo(secs: float) -> torch.Tensor:
+        n = int(secs * sr)
+        t = np.linspace(0, secs, n, endpoint=False, dtype=np.float32)
+        return torch.from_numpy(
+            np.stack([0.2 * np.sin(2 * np.pi * 220 * t), 0.2 * np.sin(2 * np.pi * 277 * t)], 0)
+        )
+
+    codec.encode(stereo(30.0))  # warm the general graph once
+    print("=== recompile decomposition (cold vs warm per distinct length) ===", flush=True)
+    print(f"{'secs':>6} {'frames':>6} {'cold_s':>7} {'warm1_s':>7} {'warm2_s':>7}  recompile(cold-warm2)",
+          flush=True)
+    lens = [31.3, 47.9, 63.1, 88.7, 121.5, 156.2, 203.4, 251.9]
+    cold_sum = warm_sum = 0.0
+    for L in lens:
+        x = stereo(L)
+        ts = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            c = codec.encode(x)
+            ts.append(time.perf_counter() - t0)
+        frames = int(c.shape[1])
+        cold_sum += ts[0]
+        warm_sum += ts[2]
+        print(f"{L:>6} {frames:>6} {ts[0]:7.2f} {ts[1]:7.2f} {ts[2]:7.2f}   {ts[0] - ts[2]:+.2f}",
+              flush=True)
+    n = len(lens)
+    share = 100 * (cold_sum - warm_sum) / max(1e-9, cold_sum)
+    print(f"\navg cold={cold_sum / n:.2f}s  avg warm2={warm_sum / n:.2f}s  "
+          f"→ recompile ≈ {(cold_sum - warm_sum) / n:.2f}s/file, ~{share:.0f}% of a cold encode",
+          flush=True)
+    print("(large & in-process-cached → persistent XLA cache reclaims it; "
+          "~0 → fixed cost is per-call, irreducible)", flush=True)
+
+
+@app.local_entrypoint()
+def recompile(depth: int = 32):
+    print(f"measuring SS recompile share on {os.environ.get('NANO_SPIKE_GPU', 'L40S')}...")
+    measure_recompile.remote(depth=depth)
+
+
 @app.local_entrypoint()
 def bench(n_songs: int = 16):
     gpu = os.environ.get("NANO_SPIKE_GPU", "A100-40GB")
