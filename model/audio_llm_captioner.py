@@ -121,10 +121,21 @@ def load_song_windows(
     evenly-spaced offsets (skipping the very intro/outro) so the caption reflects
     the whole arc, not one 10 s slice. The single train==inference contract for
     "what audio the captioner sees" — mirror it if a non-Modal path captions.
-    """
-    import librosa
 
-    audio, _ = librosa.load(path, sr=sr, mono=True)
+    Decodes via the shared ffmpeg PCM path (``diskrot.audio_io.decode_pcm``), NOT
+    ``librosa.load``: the corpus is junk-header MP3s that libsndfile can't read, so
+    librosa silently falls back to audioread + libmpg123 — slow, and a per-song
+    stderr storm (``id3.c: No comment text``, ``Weird tag size``, ``Xing stream
+    size off``) that buries the progress line. ffmpeg decodes them natively and
+    quietly, the same contract tokenize/melody/stems/inference already use.
+    """
+    from diskrot.audio_io import decode_pcm
+
+    audio = decode_pcm(path, sr=sr, n_channels=1)[0]  # [1, N] -> [N]
+    if audio.size == 0:
+        # ffmpeg produced no samples (unreadable/empty file). Raise so the caller's
+        # per-file guard marks it failed, matching the old librosa-raises behavior.
+        raise ValueError(f"decoded 0 samples from {path}")
     audio = audio.astype(np.float32)
     n = sr * window_seconds
     total = audio.shape[-1]

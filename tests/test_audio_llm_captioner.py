@@ -2,17 +2,14 @@
 
 The Qwen2-Audio model (~7B) can't run in CI, so this covers everything around it:
 - load_song_windows: the train==inference "what audio the captioner sees" contract
-  (window count / length / padding / offsets), exercised with a fake librosa so no
-  audio decode or librosa install is needed.
+  (window count / length / padding / offsets), exercised with a fake decode_pcm so
+  no ffmpeg/audio decode is needed.
 - _clean / _build_conversation: backend-agnostic helpers shared by both engines
   (so the vLLM prompt is byte-identical to the HF one).
 - load_captioner: NANO_CAPTIONER_BACKEND selects the engine; construction is lazy
   (no torch/vllm import), so we can assert the class without the heavy deps.
 """
 from __future__ import annotations
-
-import sys
-import types
 
 import numpy as np
 
@@ -35,16 +32,16 @@ from model.audio_llm_captioner import (
 )
 
 
-def _patch_librosa(monkeypatch, audio: np.ndarray) -> None:
-    """Inject a fake ``librosa`` whose ``load`` returns *audio* — load_song_windows
-    imports librosa lazily, so this tests the pure windowing math with no decode."""
-    fake = types.ModuleType("librosa")
+def _patch_decode(monkeypatch, audio: np.ndarray) -> None:
+    """Patch ``diskrot.audio_io.decode_pcm`` to return *audio* as ``[1, N]`` —
+    load_song_windows imports it lazily, so this tests the pure windowing math with
+    no ffmpeg/decode. (Mirrors decode_pcm's ``[n_channels, samples]`` contract.)"""
+    import diskrot.audio_io as audio_io
 
-    def _load(path, sr=SAMPLE_RATE, mono=True):
-        return np.asarray(audio, dtype=np.float32), sr
+    def _decode(path, sr=SAMPLE_RATE, n_channels=1):
+        return np.asarray(audio, dtype=np.float32)[None, :]
 
-    fake.load = _load
-    monkeypatch.setitem(sys.modules, "librosa", fake)
+    monkeypatch.setattr(audio_io, "decode_pcm", _decode)
 
 
 # ----------------------------- load_song_windows -----------------------------
@@ -52,7 +49,7 @@ def _patch_librosa(monkeypatch, audio: np.ndarray) -> None:
 def test_short_song_single_padded_window(monkeypatch):
     total = SAMPLE_RATE * 10  # 10 s < 30 s window
     audio = np.linspace(-1.0, 1.0, total, dtype=np.float32)
-    _patch_librosa(monkeypatch, audio)
+    _patch_decode(monkeypatch, audio)
 
     wins = load_song_windows("x.wav")
 
@@ -65,7 +62,7 @@ def test_short_song_single_padded_window(monkeypatch):
 
 def test_long_song_uses_max_windows(monkeypatch):
     total = SAMPLE_RATE * 130  # 130 // 30 = 4 windows fit
-    _patch_librosa(monkeypatch, np.zeros(total, dtype=np.float32))
+    _patch_decode(monkeypatch, np.zeros(total, dtype=np.float32))
 
     wins = load_song_windows("x.wav")
 
@@ -75,14 +72,14 @@ def test_long_song_uses_max_windows(monkeypatch):
 
 def test_max_windows_param_caps_count(monkeypatch):
     total = SAMPLE_RATE * 130
-    _patch_librosa(monkeypatch, np.zeros(total, dtype=np.float32))
+    _patch_decode(monkeypatch, np.zeros(total, dtype=np.float32))
 
     assert len(load_song_windows("x.wav", max_windows=2)) == 2
 
 
 def test_medium_song_single_window(monkeypatch):
     total = SAMPLE_RATE * 45  # 45 // 30 = 1 -> single 25%-offset window
-    _patch_librosa(monkeypatch, np.zeros(total, dtype=np.float32))
+    _patch_decode(monkeypatch, np.zeros(total, dtype=np.float32))
 
     wins = load_song_windows("x.wav")
 

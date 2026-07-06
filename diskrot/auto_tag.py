@@ -16,7 +16,6 @@ import json
 import os
 from pathlib import Path
 
-import librosa
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -37,9 +36,15 @@ def _marker(kind: str) -> str:
 
 
 def _load_audio_clip(path: str | Path, sr: int, duration: int) -> np.ndarray:
-    """Legacy BART path: a single representative 10-second crop (25 % in)."""
+    """Legacy BART path: a single representative 10-second crop (25 % in).
+
+    Decodes via the shared ffmpeg PCM path (``diskrot.audio_io.decode_pcm``) — same
+    reason as everywhere else: librosa.load falls back to audioread + libmpg123 on
+    the corpus's junk-header MP3s and floods stderr. See load_song_windows."""
+    from diskrot.audio_io import decode_pcm
+
     n_samples = sr * duration
-    audio, _ = librosa.load(path, sr=sr, mono=True)
+    audio = decode_pcm(path, sr=sr, n_channels=1)[0]  # [1, N] -> [N]
     if audio.shape[-1] > n_samples:
         offset = int(audio.shape[-1] * 0.25)
         offset = min(offset, audio.shape[-1] - n_samples)

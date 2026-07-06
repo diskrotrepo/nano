@@ -91,6 +91,18 @@ image = (
     .run_commands(
         "python -c \"from demucs.pretrained import get_model; get_model('htdemucs')\""
     )
+    # Kill the FutureWarning flood that buries the stage's real progress lines.
+    # Two offenders, both routed through Python's `warnings` module (NOT logging,
+    # so the natten-logger silencing in @enter below can't reach them):
+    #   * natten's @custom_fwd/@custom_bwd decorators warn at IMPORT of
+    #     natten.functional (torch.cuda.amp.custom_* deprecation), and
+    #   * allin1's loaders warn on every torch.load(weights_only=False).
+    # An in-process warnings.filterwarnings() wouldn't cover it — demucs/allin1
+    # spawn child processes that re-import natten fresh, re-emitting the
+    # import-time warnings. PYTHONWARNINGS is inherited by every subprocess, so it
+    # silences parent and children alike. Both are FutureWarning from pinned deps
+    # we don't develop, so blanket-ignoring that one category is pure noise removal.
+    .env({"PYTHONWARNINGS": "ignore::FutureWarning"})
     .add_local_python_source("model", "diskrot")
 )
 
