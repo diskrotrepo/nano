@@ -43,7 +43,14 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 @app.function(
     image=image,
     cpu=16.0,
-    memory=16 * 1024,
+    # 32 GB, not 16: each of the 16 worker processes imports model.lyric_encoder
+    # for text_to_word_phoneme_groups, which pulls in torch at module top (~0.5 GB
+    # RSS/worker ≈ 8 GB just for torch, though phonemization never uses it) on top
+    # of the parent's loaded lyric words (~2.7 GB, COW-shared to the forks) and a
+    # per-language espeak backend built lazily in each worker (v9 multilingual).
+    # That sum crept past a 16 GB cap a little into the run (OOM SIGKILL 137 at
+    # bucket ~5/256), so give it headroom rather than starving the fan-out.
+    memory=32 * 1024,
     # ~322k songs at ~20-200ms each across 16 worker processes ≈ 1-2 h.
     timeout=60 * 60 * 8,
     retries=modal.Retries(max_retries=5, backoff_coefficient=1.0, initial_delay=5.0),
