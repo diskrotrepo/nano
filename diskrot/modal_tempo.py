@@ -169,7 +169,8 @@ def orchestrate(batch_size: int = 200, limit: int = 0, wave_id: str = "",
         return
 
     chunks = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
-    print(f"Dispatching {len(pending)} songs as {len(chunks)} batches of <= {batch_size} "
+    n_pending = len(pending)
+    print(f"Dispatching {n_pending} songs as {len(chunks)} batches of <= {batch_size} "
           f"(flush_every={flush_every})...")
     extractor = TempoExtractor(subdir=wave_subdir(wave_id))
     batch: list = []
@@ -188,7 +189,12 @@ def orchestrate(batch_size: int = 200, limit: int = 0, wave_id: str = "",
         if len(batch) >= flush_every:
             save_tempo.remote(batch)  # awaited (serial) — single shared file, no race
             rate = n_seen / max(time.time() - t0, 1e-6)
-            print(f"flushed ({n_seen} estimated, {rate:.1f}/s)", flush=True)
+            # rate is the cumulative avg since t0 (includes cold-start warmup), so
+            # the ETA runs slightly conservative early and tightens as it stabilizes.
+            eta_min = (n_pending - n_seen) / max(rate, 1e-6) / 60
+            pct = 100.0 * n_seen / max(n_pending, 1)
+            print(f"flushed ({n_seen}/{n_pending}, {pct:.0f}%, {rate:.1f}/s, "
+                  f"ETA {eta_min:.0f}m)", flush=True)
             batch = []
     if batch:
         save_tempo.remote(batch)
