@@ -62,7 +62,12 @@ melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
 @app.function(
     image=image,
     volumes={"/tokens": tokens_vol, "/corpus": corpus_vol, "/melody": melody_vol},
-    timeout=60 * 30,
+    # 30 min timed out at the ~1M-song corpus (R2 rglob + 1GB tags.json + the
+    # full lyric-shard merge); the sweep is sequential, so give it room.
+    timeout=60 * 60 * 3,
+    # The lyric/phoneme shard merges live in RAM (word-level timestamps for
+    # every vocal song) — same OOM class as phonemize's memory=32GB fix.
+    memory=32 * 1024,
     # Modal's spontaneous platform cancellations (the same waves that hit the
     # big .map fleets) can kill this single .remote() call mid-sweep — retry.
     retries=modal.Retries(max_retries=3, initial_delay=10.0),
@@ -352,4 +357,11 @@ def audit():
 
 @app.local_entrypoint()
 def main():
-    audit.remote()
+    # spawn (not remote) + `modal run --detach`: a blocking .remote() is owned by
+    # the local client, so a client drop CANCELS the in-flight sweep even with
+    # --detach (bit us at the ~1M-song scale, where the sweep outlives the
+    # client). Spawned, the audit survives; read the report via
+    # `modal app logs <app-id>`.
+    fc = audit.spawn()
+    print(f"audit launched (detached) — function call id: {fc.object_id}")
+    print("report goes to the app logs:  modal app logs <app-id from above> ")
