@@ -84,6 +84,8 @@ Each stream drops independently for classifier-free guidance (10% each during tr
 - `modal_key_detect.py` — Modal CPU wrapper around `key_detect.py` (one container, sequential mmap sweep over /tokens/packed → /tokens/keys.json). Runs after pack. `modal run --detach diskrot/modal_key_detect.py`.
 - `modal_phonemize.py` — Modal CPU wrapper around `phonemize.py` (one container, process-parallel across shard buckets, /tokens/lyrics → /tokens/phonemes). Runs after transcribe. `modal run --detach diskrot/modal_phonemize.py`.
 - `modal_inspect_ckpts.py` — Inspect a checkpoint trajectory on the volume. `modal run diskrot/modal_inspect_ckpts.py --prefix v7_1500m`.
+- `backup.py` — pure laptop-bundle helpers for the backup stage: collect the gitignored planning docs / eval logs / Claude memory+plans dirs and tar them (stdlib-only; `tests/test_backup.py`).
+- `modal_backup.py` — R2 backup of the GPU-expensive derived data: rclone-syncs the nano-tokens conditioning metadata (`tags/`, `lyrics/`, `structure/`, `phonemes/`, `waves/*/status.json`, top-level JSONs) + `packed/` into the **nano-backup** bucket, ships the laptop-only bundle, and (`--with-ckpts`) copies named best-model files. Volumes mount read-only; each prefix syncs with a `--max-delete` guard; `--verify` is a size-only volume-vs-bucket audit. `modal run --detach diskrot/modal_backup.py`.
 
 ### Server (`server/`)
 - `main.py` — FastAPI app with endpoints: GET /health, POST /generate, POST /extend, POST /cover, POST /infill, POST /stem, POST /addstem. /generate and /extend accept optional text, lyrics, style_audio, and style_weight params. (`/extend` continues a clip forward from a cut point `from_seconds`, defaulting to the clip tail.) `/cover` takes a required `melody_audio` upload (the hum), conditions on its chromagram (the audio never appears in the output), and uses the prompt for timbre — needs a melody-trained checkpoint; supports `melody_cfg_scale`. `/infill` takes required `before_audio` + `after_audio` uploads and a `gap_seconds`, and generates the bridge between them (returns `before | middle | after`); `prompt` drives timbre, an optional `melody_audio` guides the gap's contour, lyrics are unused — needs a FIM-trained checkpoint (`use_fim`). `/stem` is the odd one out — **pure Demucs source separation, no model**: takes an `audio` upload + `remove` (default `vocals`) or `keep` stem lists (drums/bass/other/vocals) and returns the kept stems summed to a mono mixdown (`remove=vocals` → instrumental, `keep=vocals` → a-cappella); works with any checkpoint and needs the `demucs` package. This is only the *remove/isolate* direction. `/addstem` is the generative *add* direction: takes an `audio` upload + `target_stem` (drums/bass/vocals/other) + `prompt` (the desired stem's vibe), Demucs-separates the upload, conditions on its OTHER stems + the prompt, and generates the target stem — `output=mix` (default) returns the song with the new stem summed in, `output=stem` the isolated stem; supports `stem_cfg_scale`. Needs a stem-trained checkpoint (`use_stem_conditioning`) and the `demucs` package.
@@ -157,6 +159,16 @@ past the old ~500k-file ceiling. Everything else is on Modal Volumes:
 | nano-stems | `<name>.stems.npy` stem-token sidecars (`[4,K,T]` int16; own volume, same inode rationale as nano-melody) |
 | nano-ckpts | Training checkpoints (step_*.pt, latest.pt, best.pt) |
 | nano-output | Generations from the Modal inference server (every /generate /extend /cover /infill result, written via `NANO_OUTPUT_DIR=/outputs`) |
+| `nano-backup` (R2 bucket) | Backups: `tokens/` (conditioning metadata + packed shards), `ckpts/` (opt-in best-model copies), `local/` (laptop bundle: gitignored runbooks, eval logs, Claude memory/plans) |
+
+**Backup**: everything GPU-expensive-to-recreate is mirrored into the `nano-backup`
+R2 bucket by `modal run --detach diskrot/modal_backup.py` (incremental rclone;
+`--verify` audits volume-vs-bucket). Cadence: re-run after each wave ingest and
+after any `--redo`/`--apply` sweep that rewrites `lyrics/` or `tags/`. Deliberately
+NOT backed up: raw audio (single R2 copy, trusted — 2026-07-11 decision), the
+nano-melody/nano-stems intermediates, caches, nano-output, and checkpoint `step_*`
+history. Code is safe on GitHub; the laptop-only planning docs ride the bundle
+because the repo is public.
 
 ## Checkpoints
 
