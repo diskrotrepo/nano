@@ -58,16 +58,21 @@ modal run scripts/lyrics_audit.py        # prints the report to the logs
    problem to curate away.
 2. **Per-stream coverage of trainable songs** — tags / structure / keys /
    lyrics / phonemes / **melody**, each as `n / trainable (pct)`.
-3. **Melody source vs packed** — `.mel.npy` on nano-melody (real contour
-   extracted) vs `.mel.bin` folded into a `has_melody` pack shard. **Both**
-   must hold for melody to train. Source-without-packed → re-pack with
-   `--mel-cache-dir`. Packed-but-zero-filled → in a melody shard but missing
-   source chroma (silent rows).
-4. **Song-duration distribution** — from the packed offsets, plus the share
-   shorter than the 60s Modal training crop.
-5. **Model settings vs data scale** — the default 400k-step run translated into
-   **effective epochs of unique audio** (`steps × batch × 60s ÷ total trainable
-   audio`), with an under/over-training verdict. nano is *one* fixed-shape ~2.0B
+3. **Melody packed + realness probe** — `.mel.bin` folded into a `has_melody`
+   pack shard is the trainability signal, and the audit samples packed chroma
+   rows directly to confirm they carry a real (nonzero) contour. Source
+   `.mel.npy` counts are informational only: the wave pipeline **prunes them
+   after pack** (modal_wave_cleanup), so near-zero source is normal.
+   Source-without-packed → re-pack with `--mel-cache-dir`. A failing probe
+   (zero rows) → songs packed before their chroma was extracted.
+4. **Song-duration distribution** — from the packed offsets (frame rate
+   auto-detected from the pack's `n_codebooks`: SpectroStream 25 Hz vs DAC
+   86 Hz), plus the share shorter than the DEFAULTS training crop.
+5. **Model settings vs data scale** — the configured run (steps / batch / crop
+   length imported live from `DEFAULTS`, so they can't go stale) translated into
+   **effective epochs of unique audio** (`steps × batch × segment_seconds ÷
+   total trainable audio`), with an under/over-training verdict. nano is *one*
+   fixed-shape ~2.0B
    net (no family of sizes — the `DEFAULTS` dict in `diskrot/modal_train.py` is
    the source of truth), so the step count is the lever that has to match the
    trainable-song scale; this is where you confirm it does.
@@ -134,11 +139,11 @@ genre is not.
 | Effective epochs under ~2× | Raise `steps` in `DEFAULTS` (or add data) — re-audit. |
 | Effective epochs over ~15× | Lower `steps` in `DEFAULTS` (or add data) to avoid memorization. |
 | tags / structure / keys / lyrics low | Run the missing prep stage — **add-songs**. |
-| melody source low | Let `modal run --detach diskrot/modal_melody.py` finish. |
-| melody source high but packed low | Re-pack with `--mel-cache-dir` (**add-songs** pack step) so the chroma reaches the dataset. |
+| melody packed low | Run `modal run --detach diskrot/modal_melody.py`, then re-pack with `--mel-cache-dir` (**add-songs** pack step) so the chroma reaches the dataset. (Low *source* alone is normal — sources are pruned after pack.) |
+| melody probe failing (zero rows) | Songs were packed before their chroma existed — re-run melody for those waves, then re-pack. |
 | phonemes ≪ vocal-ready lyrics | Phonemize hasn't run since the last transcribe — **eval-lyrics** / **add-songs**. |
 | hallucinated lyrics > 0 | Run the filter — **eval-lyrics** owns the order (transcribe → filter → phonemize). |
-| Many songs < 60s | Expected for short clips; only worrying if it's most of the corpus (crops get padded/wrapped). |
+| Many songs shorter than the crop | Expected for short clips; only worrying if it's most of the corpus (`pad_short_songs` masks the tail). |
 | Genre gap OPEN (`genre_gap_eval`) | Add more of that genre — **add-songs** (a data gap; settings can't close it). |
 
 ## Prereqs
