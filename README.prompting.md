@@ -48,19 +48,43 @@ usually **want this on** for terse prompts — but a long / already-detailed pro
 (>~60 words) is passed through **verbatim** (sweetening would only discard your detail),
 and you can force verbatim any time with `sweeten: false`.
 
-The register to aim for (real captions from the training set):
+The register to aim for (real v5 audio-LLM captions from the training set):
 
-> *"The low quality recording features a passionate male vocal singing over punchy kick
-> and snare hits, shimmering hi hats, synth pad and groovy bass. It sounds energetic,
-> groovy and hypnotic."*
+> *"The track has a chill, relaxing mood with a blend of electronic and instrumental
+> elements. It features a groovy bass line and a soothing melody played on a piano. The
+> drums and percussion add a subtle rhythm to the background. Vocals are sparse, with
+> occasional crooned notes adding texture to the sound. The production and mix character
+> is clean, with no overpowering elements."*
 
-> *"This music is instrumental. The tempo is fast with a groovy bass line, rhythmic
-> acoustic guitar strumming. The music is upbeat, catchy, punchy and vivacious."*
+> *"The music is a lively punk rock track … The guitars are raw and distorted … the bass
+> follows a simple yet effective bassline … The drums play a steady and driving beat …
+> Vocals are sparse, featuring occasional shouting and screaming … The production is
+> lo-fi, with a raw and unpolished sound that adds to the punk rock aesthetic."*
 
-Useful vocabulary to reach for: instruments (*electric piano, analog synth pad, distorted
-guitar, upright bass, brushed drums, strings*), groove (*steady boom-bap, four-on-the-floor,
-driving, laid-back, syncopated*), mood (*energetic, melancholic, dreamy, aggressive, warm,
-hypnotic*), production (*lo-fi, vinyl crackle, lush reverb, punchy, mono, tape saturation*).
+The captioner writes one facet per sentence in a fixed arc — **genre/mood → drums →
+bass → harmony/lead → vocals → production → build** — so a prompt that follows the same
+arc pools one clean facet per CLAP chunk.
+
+Vocabulary with real weight in the corpus (share of captions; 13.6k-caption random
+sample of the v5 tag store, 2026-07-11):
+
+- **genres**: *electronic* 37%, *guitar* 24%, *lo-fi* 19%, *pop* 17%, *rock* 17%,
+  *dance* 17%, *ambient* 8%, *techno* 6%, *rap* 5%, *folk* 5%, *jazz* 5%
+- **moods**: *haunting* 28%, *energetic* 20%, *upbeat* 20%, *groovy* 10%,
+  *aggressive* 10%, *dreamy* 9%, *uplifting* 8%, *eerie* 7%, *melancholic* 5%
+- **vocal styles the captioner actually names**: *screaming, crooned, soulful, rapped,
+  belted, harmonized*
+- **blends it names**: *pop+electronic, classical+electronic, electronic+rock,
+  rap+electronic, jazz+electronic, orchestral+electronic, strings+synthesizers*
+- **color instruments with real presence**: flute, bells, trumpet, cello, accordion,
+  harp, harmonica, banjo, sitar, tabla
+
+Two consequences. (1) Prompts built from these words adhere strongest — and because
+*haunting*, *lo-fi*, and *sparse vocals* saturate the data, counter them explicitly
+("clean, polished production", "bright and joyful") when you don't want that default
+vibe. (2) Words the captions never use condition weakly: e.g. *vocoder* and *talkbox*
+appear **zero** times in the sample; the nearest real handles are "auto-tune" (rare) and
+rap+electronic phrasing.
 
 `negative_prompt` discourages a vibe (it is **not** sweetened) — e.g. `negative_prompt: "muffled, noisy, amateur recording"`.
 
@@ -136,132 +160,253 @@ are a good starting point.**
 
 ## Example library
 
-Paste these into the matching fields. Blank fields are omitted. Each notes *why it's
-robust*.
+Paste these into the matching fields. Blank fields are omitted. The `/generate` examples
+are **grounded in the live corpus captions** (the same 13.6k-caption v5 sample as above,
+2026-07-11): each is written in the captioner's own register — one facet per sentence,
+its actual vocabulary, several near-verbatim from real captions — so it conditions on
+phrasing CLAP saw at train time. All are >60 words, so the sweetener passes them through
+**verbatim**. Instrumental prompts say "there are no vocals" in the prose *and* carry
+`[instrumental]` in lyrics — belt and suspenders against unwanted singing.
 
-### `/generate` — instrumentals
+### `/generate` — the corpus's center of gravity
 
-**Lofi study beat**
+**Haunting electronic with crooned female vocal** — *haunting* (28%) + *crooned* + sparse
+vocals is the single most common vibe in the data
 ```
-prompt:  mellow lofi hip hop instrumental, jazzy electric piano, warm sub bass, soft
-         boom-bap drums, vinyl crackle, relaxed and nostalgic
-lyrics:  [instrumental] [85bpm]
+prompt:  The track has a haunting, hypnotic mood built on electronic elements. The drums and
+         percussion carry a slow, steady rhythm. The bass line is deep and resonates throughout.
+         A synth adds an eerie melody that lingers. Vocals are sparse, with a haunting female
+         lead delivered in a crooned style. The production is clean and balanced, and the track
+         builds from a foreboding opening to an intense finale.
+lyrics:  [female] [90bpm] [a minor] [verse]
+         shadows gather where you used to stand
+         i hold the cold light in my hand
 ```
-*Why:* caption-style tags + explicit `[instrumental]` so the model commits to no vocals.
 
-**Ambient pad**
+**Classical + electronic blend** — one of the top blends the captioner names
 ```
-prompt:  slow evolving ambient soundscape, lush analog synth pads, deep reverb, no
-         drums, calm and meditative, cinematic
-lyrics:  [instrumental] [slow]
-```
-*Why:* "no drums" + slow tempo steers away from beats; ambient is well-represented data.
-
-**Aggressive metal**
-```
-prompt:  aggressive heavy metal, fast double-kick drums, distorted down-tuned guitars,
-         driving bass, intense and powerful
-lyrics:  [instrumental] [fast] [e minor]
-```
-*Why:* fast tempo + minor key reinforce the genre; metal is a strong data cluster.
-
-**Cinematic strings**
-```
-prompt:  epic cinematic orchestral score, soaring string section, swelling brass,
-         timpani hits, dramatic and emotional
+prompt:  The music is a blend of classical and electronic elements with a melancholic, dreamy
+         mood. Soaring strings and a delicate piano carry the lead melody over a deep electronic
+         bass line. The drums are subtle and smooth. There are no vocals. The production is
+         top-notch, with a clear and balanced sound, and the track builds from an introspective
+         opening into a sweeping, emotional climax.
 lyrics:  [instrumental] [medium] [d minor]
 ```
 
-**House groove**
+**Groovy lo-fi chill with piano** — near-verbatim from a real caption
 ```
-prompt:  energetic house track, four-on-the-floor kick, crisp hi hats, deep rolling
-         bassline, bright synth stabs, danceable and hypnotic
-lyrics:  [instrumental] [125bpm]
-```
-
-**Acoustic folk**
-```
-prompt:  warm acoustic folk, fingerpicked steel-string guitar, gentle brushed drums,
-         soft upright bass, intimate and earthy
-lyrics:  [instrumental] [95bpm] [g major]
+prompt:  The track has a chill, relaxing mood blending electronic and instrumental elements. It
+         features a groovy bass line and a soothing melody played on a piano. The drums and
+         percussion add a subtle rhythm in the background. There are no vocals. The production
+         has a warm lo-fi character with a raw, unpolished charm, and the track maintains a
+         consistent tempo and tranquil energy throughout.
+lyrics:  [instrumental] [82bpm]
 ```
 
-**Boom-bap hip hop instrumental**
+**Energetic dance-pop + electronic** — the #1 blend in the corpus
 ```
-prompt:  classic boom-bap hip hop beat, dusty vinyl drum break, chopped soul sample,
-         warm bass, head-nodding and gritty
-lyrics:  [instrumental] [90bpm]
-```
-
-**Jazz trio**
-```
-prompt:  laid-back jazz trio, brushed drums, walking upright bass, smooth piano
-         comping, late-night and smoky
-lyrics:  [instrumental] [110bpm]
-```
-
-**Synthwave**
-```
-prompt:  retro synthwave, pulsing analog arpeggios, gated reverb drums, neon synth
-         lead, nostalgic and driving
-lyrics:  [instrumental] [115bpm] [a minor]
-```
-
-### `/generate` — vocal songs
-
-**Female pop ballad**
-```
-prompt:  tender pop ballad, emotional female vocal, soft piano, swelling strings,
-         gentle drums, heartfelt and intimate
-lyrics:  [female] [72bpm] [a minor] [verse]
-         i still hear the echo of your voice
-         in the quiet of the empty room
+prompt:  The track is an upbeat blend of pop and electronic music with a danceable rhythm. The
+         drums drive a steady four-on-the-floor beat with crisp hi-hats. The bass line is
+         prominent and groovy. Bright synths carry a catchy lead melody. The vocals feature a
+         strong, belted female lead with harmonized backing. The production is clean and punchy,
+         and the track builds into a euphoric final chorus.
+lyrics:  [female] [124bpm] [c major] [verse]
+         heartbeat racing down the boulevard
+         we came too far to fall apart
          [chorus]
-         but i'll carry the light you left behind
-         till the morning breaks through the gloom
+         so turn it up, we're not going home
 ```
-*Why:* slow tempo + minor key + verse/chorus structure match the ballad form.
 
-**Male rock anthem**
+**Rap + electronic**
 ```
-prompt:  uplifting rock anthem, passionate male vocal, driving electric guitars,
-         punchy drums, big chorus, energetic and triumphant
-lyrics:  [male] [128bpm] [e major] [verse]
-         we were born in the static and the noise
-         chasing something we could never name
+prompt:  The track is a blend of rap and electronic music with a dark, energetic mood. The drums
+         hit hard with a booming kick and crisp, rolling hi-hats. The bass is deep and heavy,
+         providing a solid foundation. A sparse, eerie synth melody floats over the beat. The
+         vocals are rapped with a confident, aggressive delivery. The production is clean and
+         modern with plenty of low end.
+lyrics:  [male] [142bpm] [verse]
+         concrete dreams under a static sky
+         count the reasons, watch the seasons fly
+```
+
+### `/generate` — guitar-land (24% of captions)
+
+**Post-hardcore / post-rock in B minor** — near-verbatim from a real caption
+```
+prompt:  The track is a fast-paced post-hardcore and post-rock track with a dynamic, intense
+         mood. The drums are intense with heavy cymbal work. The bass follows a repetitive
+         pattern under a complex guitar arrangement that shifts between tension and release.
+         Vocals are sparse, with occasional screaming. The production is clean and well-mixed,
+         focused on the instruments, and the track moves between quiet passages and explosive
+         climaxes.
+lyrics:  [male] [fast] [b minor] [verse]
+         we carved our names in falling ash
+         and waited for the sky to crash
+```
+
+**Nu-metal / hard rock**
+```
+prompt:  The track is a fast-paced hard rock track with elements of nu metal and a gritty,
+         aggressive mood. The drums drive a complex, heavy beat. The bass line is deep and heavy.
+         The harmony is a mix of down-tuned guitars and synthesizers, creating an expansive,
+         intense sonic landscape. Vocals feature aggressive delivery with occasional screaming.
+         The production is clear and balanced, building into an intense middle section.
+lyrics:  [male] [fast] [e minor] [verse]
+         bite down on the wire, swallow the spark
+         everything you promised got lost in the dark
+```
+
+**Raw lo-fi punk**
+```
+prompt:  The music is a lively punk rock track with raw, distorted guitars and a driving beat.
+         The bass follows a simple, effective line that adds to the energy. The drums are steady
+         and relentless. Vocals feature shouted, aggressive delivery with gang backing. The
+         production is lo-fi, with a raw and unpolished sound that adds to the punk aesthetic.
+lyrics:  [male] [130bpm] [a major] [chorus]
+         no more waiting, no more lies
+         tear it down before it dies
+```
+
+**Dreamy guitar-pop, harmonized**
+```
+prompt:  The track has a dreamy, nostalgic mood blending indie pop and electronic textures.
+         Shimmering, reverb-washed guitars carry the harmony over a warm, round bass line. The
+         drums are soft and steady. Vocals feature a gentle female lead with lush harmonized
+         backing vocals. The production is hazy and warm, and the track drifts from a sparse
+         verse into a blissful, layered chorus.
+lyrics:  [female] [105bpm] [c major] [verse]
+         polaroids fading on the wall
+         i kept the summer, kept it all
          [chorus]
-         so raise it up, let the whole world hear
-         we are louder than the fading flame
+         and if you call, i'll drift away
 ```
 
-**Rap verse**
-```
-prompt:  hard-hitting hip hop, confident male rap vocal, booming 808 bass, crisp trap
-         hi hats, dark and energetic
-lyrics:  [male] [140bpm] [verse]
-         started from the bottom of a borrowed dream
-         now the city lights flicker on my team
-```
-*Why:* fast tempo + trap production cue the rap delivery.
+### `/generate` — genre blends the captioner names
 
-**Dreamy female indie**
+**Electronic + Arabic strings** — near-verbatim from a real caption
 ```
-prompt:  dreamy indie pop, airy female vocal, shimmering reverb-drenched guitars,
-         steady drums, warm bass, wistful and hazy
-lyrics:  [female] [108bpm] [c major] [verse]
-         sunlight pooling on the kitchen floor
-         we don't talk about it anymore
-         [chorus]
-         oh, let it go, let it drift away
-         we'll find another ordinary day
+prompt:  The track is a blend of electronic and Arabic music elements with a melancholic mood.
+         The drums and percussion have a subtle, smooth rhythm. The bass line is deep and
+         resonates throughout the song. The harmony features a beautiful blend of Arabic strings
+         and plucked instruments carrying a captivating melody. Vocals are sparse, with a
+         haunting female voice. The track builds from a slow, introspective opening into a more
+         energetic section.
+lyrics:  [female] [100bpm] [d minor]
+```
+*Why the odd lyrics:* `[female]` with no words leaves the vocal slot `<unknown_vocals>`,
+matching the caption's *sparse, wordless* vocals — neither forced singing nor forced
+instrumental.
+
+**Brazilian funk-rock with belted female lead** — near-verbatim from a real caption
+```
+prompt:  The music is a lively Brazilian funk track with a danceable rhythm and a distinct rock
+         influence. It has an upbeat mood, with a prominent bassline and driving drums. The
+         vocals are delivered in a belted style by a strong, dynamic female lead. Guitars and
+         keyboards provide the harmony with a prominent lead melody. The production is lo-fi,
+         raw and unpolished, which adds to its charm.
+lyrics:  [female] [112bpm] [chorus]
+         dança comigo até o sol chegar
+         não deixa a noite acabar
 ```
 
-**Explicitly instrumental (vocal-genre tags)**
+**Indian classical + electronic** — sitar/tabla have real corpus presence
 ```
-prompt:  smooth r&b groove, electric piano, finger-snaps, mellow bass, no vocals
+prompt:  The track is a blend of traditional Indian and electronic music with a hypnotic,
+         meditative mood. Tabla percussion carries an intricate rhythm over a deep electronic
+         bass line. A sitar leads with an ornamented, winding melody, answered by warm synth
+         pads. There are no vocals. The production is clean and spacious, and the track builds
+         slowly in intensity without ever breaking its trance.
 lyrics:  [instrumental] [95bpm]
 ```
-*Why:* even with an R&B prompt that usually implies singing, `[instrumental]` forces no vocals.
+
+**Jazz + electronic**
+```
+prompt:  The track is a blend of jazz and electronic music with a late-night, groovy mood. The
+         drums mix brushed acoustic textures with programmed hi-hats. A walking upright bass
+         anchors the harmony while a smoky trumpet carries the lead melody over warm electric
+         piano chords. There are no vocals. The production is clean and intimate, like a dim
+         club after midnight.
+lyrics:  [instrumental] [98bpm]
+```
+
+**Orchestral + electronic epic**
+```
+prompt:  The track is a blend of orchestral and electronic music with an epic, suspenseful mood.
+         Thundering percussion and a deep electronic pulse drive the rhythm. Soaring strings and
+         brass carry the harmony while a choir adds a haunting texture. There are no vocals in
+         the lead. The production is massive and cinematic, and the track builds relentlessly
+         from an ominous opening to a triumphant, explosive finale.
+lyrics:  [instrumental] [medium] [d minor]
+```
+
+### `/generate` — color instruments & quirky corners
+
+**French accordion waltz**
+```
+prompt:  The music is a charming French folk waltz with a nostalgic, romantic mood. An accordion
+         carries the lead melody, supported by a gently strummed acoustic guitar and a soft
+         upright bass. The percussion is light and brushed. There are no vocals. The production
+         is warm and intimate, like a street café recording, and the track sways gracefully from
+         start to finish.
+lyrics:  [instrumental] [slow] [g major]
+```
+
+**Banjo & harmonica folk stomp**
+```
+prompt:  The track is a lively folk and country stomp with an upbeat, festive mood. A banjo
+         drives the rhythm with rapid picking while a harmonica trades lead lines with an
+         acoustic guitar. The bass is a simple, bouncing upright line and the drums are a
+         stomping kick and clap. Vocals feature a raspy male lead with harmonized gang choruses.
+         The production is raw and energetic.
+lyrics:  [male] [140bpm] [g major] [chorus]
+         raise your glass to the river town
+         we ain't ever gonna slow it down
+```
+
+**Cello + harp chamber piece**
+```
+prompt:  The track is a delicate neoclassical chamber piece with a somber, haunting mood. A solo
+         cello carries the lead melody with long, mournful phrases. A harp plays gentle arpeggios
+         beneath it, and soft bells add sparse, glassy accents. There are no drums and no vocals.
+         The production is intimate and spacious with a natural hall reverb, and the piece swells
+         gently before fading to silence.
+lyrics:  [instrumental] [slow] [e minor]
+```
+
+**Reggaeton**
+```
+prompt:  The track is an energetic reggaeton song with a danceable, festive mood. The drums lock
+         into the signature dembow rhythm with a punchy kick and crisp snare. The bass is deep
+         and round. Bright synth plucks and a marimba-like melody carry the harmony. The vocals
+         are a confident male lead delivered in a rhythmic, half-rapped style. The production is
+         modern, clean and loud.
+lyrics:  [male] [96bpm] [verse]
+         baila conmigo bajo la luna llena
+         la noche es nuestra, vale la pena
+```
+
+**8-bit / chiptune** — a real cluster (~1% of captions)
+```
+prompt:  The track is an upbeat chiptune piece built from 8-bit video game sounds with a playful,
+         energetic mood. Square-wave leads carry a catchy, fast melody over an arpeggiated pulse
+         bass. The percussion is crunchy programmed noise-channel drums. There are no vocals. The
+         production is intentionally lo-fi and bright, and the track loops through rising,
+         triumphant phrases like a level theme.
+lyrics:  [instrumental] [150bpm] [c major]
+```
+
+**Dark suspenseful electronic-rock hybrid** — near-verbatim from a real caption
+```
+prompt:  The track has an ominous, suspenseful mood with a blend of electronic and rock elements.
+         The drums have a driving rhythm that creates urgency and tension. The bass underpins the
+         percussion with a steady pulse. A synth adds a haunting melody that lingers in the
+         listener's mind while distorted guitars swell underneath. Vocals are sparse, with a
+         haunting female lead in a crooned style. The track builds from a foreboding tone to a
+         thrilling, intense finale.
+lyrics:  [female] [110bpm] [f# minor] [verse]
+         sirens sleeping in the wires
+         city breathing through the fires
+```
 
 ### `/extend` — continue a clip
 
