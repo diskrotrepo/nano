@@ -51,9 +51,9 @@ class _RMSNorm(mnn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        xf = x.astype(mx.float32)
-        norm = mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
-        return (xf * norm).astype(x.dtype) * self.weight
+        # Fused kernel; accumulates in fp32 internally — the fused equivalent of
+        # the explicit-upcast reduction this used to spell out op by op.
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class _SelfAttention(mnn.Module):
@@ -111,8 +111,8 @@ class _LyricEncLayer(mnn.Module):
 
 class _LyricEncoder(mnn.Module):
     """MLX mirror of model.lyric_encoder.LyricEncoder (params only; the
-    sinusoidal positional table is non-persistent and recomputed on the parent,
-    like the RoPE cos/sin tables)."""
+    sinusoidal positional table is non-persistent and recomputed on the
+    parent)."""
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -174,20 +174,27 @@ class _LayerCache:
         self.pos = 0
 
 
-def _rotate_half(x: mx.array) -> mx.array:
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return mx.concatenate([-x2, x1], axis=-1)
+class _CrossKV:
+    """Cached projected (+ k-normed) K/V for one cross-attention over a FIXED
+    conditioning sequence. Mirrors the torch CrossKVCache: `cond` never changes
+    across decode steps, so kv_proj(cond) runs once at prefill and is reused —
+    it was the dominant per-token cost with a long lyric stream."""
+
+    __slots__ = ("k", "v")
+
+    def __init__(self):
+        self.k: mx.array | None = None
+        self.v: mx.array | None = None
 
 
-def _apply_rotary(q: mx.array, k: mx.array, cos: mx.array, sin: mx.array):
-    # q/k: [B, H, T, D]; cos/sin: [T, D]
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
-    q_rot = (q * cos) + (_rotate_half(q) * sin)
-    k_rot = (k * cos) + (_rotate_half(k) * sin)
-    return q_rot, k_rot
+class _BlockCrossKV:
+    """The two cross-attention caches for one decoder block (tag + lyric)."""
+
+    __slots__ = ("text", "lyric")
+
+    def __init__(self):
+        self.text = _CrossKV()
+        self.lyric = _CrossKV()
 
 
 class MLXNanoAudioGPT(mnn.Module):
@@ -226,13 +233,10 @@ class MLXNanoAudioGPT(mnn.Module):
         # reshape+transpose recovers [B, K, T, V]).
         self.head = mnn.Linear(cfg.d_model, K * cfg.vocab_with_pad, bias=False)
 
-        # RoPE tables (non-persistent in torch — recomputed here, not loaded).
-        inv_freq = 1.0 / (cfg.rope_base ** (np.arange(0, self.head_dim, 2) / self.head_dim))
-        t = np.arange(cfg.max_seq_len)
-        freqs = np.outer(t, inv_freq)  # [max_seq_len, head_dim/2]
-        emb = np.concatenate([freqs, freqs], axis=-1)  # [max_seq_len, head_dim]
-        self._cos = mx.array(np.cos(emb)).astype(dtype)
-        self._sin = mx.array(np.sin(emb)).astype(dtype)
+        # RoPE via the fused mx.fast.rope kernel (non-traditional = the same
+        # split-half rotation as torch's rotate_half with concatenated freqs);
+        # angles are computed in the kernel, so no cos/sin tables are stored.
+        self._rope_base = float(cfg.rope_base)
 
         # Lyric sinusoidal positional table (non-persistent in torch — recomputed,
         # stored as an underscore attr so it stays out of the loaded param tree).
@@ -351,7 +355,7 @@ class MLXNanoAudioGPT(mnn.Module):
             x = x + self.tok_embeds[k](tokens[:, k])
         return x
 
-    def _self_attn(self, attn: _SelfAttention, x: mx.array, cos, sin, cache: _LayerCache | None):
+    def _self_attn(self, attn: _SelfAttention, x: mx.array, start_pos: int, cache: _LayerCache | None):
         B, T, D = x.shape
         qkv = attn.qkv(x)
         q, k, v = mx.split(qkv, 3, axis=-1)
@@ -362,7 +366,10 @@ class MLXNanoAudioGPT(mnn.Module):
         if attn.q_norm is not None:
             q = attn.q_norm(q)
             k = attn.k_norm(k)
-        q, k = _apply_rotary(q, k, cos, sin)
+        q = mx.fast.rope(q, attn.head_dim, traditional=False,
+                         base=self._rope_base, scale=1.0, offset=start_pos)
+        k = mx.fast.rope(k, attn.head_dim, traditional=False,
+                         base=self._rope_base, scale=1.0, offset=start_pos)
 
         if cache is not None:
             old_pos = cache.pos
@@ -381,18 +388,27 @@ class MLXNanoAudioGPT(mnn.Module):
         return attn.proj(y)
 
     def _cross_attn(
-        self, ca: _CrossAttention, x: mx.array, cond: mx.array, mask: mx.array | None = None,
+        self, ca: _CrossAttention, x: mx.array, cond: mx.array,
+        mask: mx.array | None = None, cache: _CrossKV | None = None,
     ) -> mx.array:
         B, T, D = x.shape
-        T_c = cond.shape[1]
         q = ca.q_proj(x).reshape(B, T, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
-        kv = ca.kv_proj(cond)
-        k, v = mx.split(kv, 2, axis=-1)
-        k = k.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
         if ca.q_norm is not None:
             q = ca.q_norm(q)
-            k = ca.k_norm(k)
+        if cache is not None and cache.k is not None:
+            k, v = cache.k, cache.v
+        else:
+            T_c = cond.shape[1]
+            kv = ca.kv_proj(cond)
+            k, v = mx.split(kv, 2, axis=-1)
+            k = k.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
+            # k_norm is position-independent, so caching the post-norm K is exactly
+            # the value a recompute would produce (mirrors the torch cache).
+            if ca.k_norm is not None:
+                k = ca.k_norm(k)
+            if cache is not None:
+                cache.k, cache.v = k, v
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=ca.scale, mask=mask)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return ca.out_proj(y)
@@ -458,6 +474,7 @@ class MLXNanoAudioGPT(mnn.Module):
         lyric_emb: mx.array | None = None,
         lyric_kv_mask: mx.array | None = None,
         melody_emb: mx.array | None = None,
+        cross_caches: list[_BlockCrossKV] | None = None,
     ) -> mx.array:
         """tokens: [B, K, T] int32. Returns logits [B, K, T, V]."""
         B, K, T = tokens.shape
@@ -468,19 +485,20 @@ class MLXNanoAudioGPT(mnn.Module):
                 x = x + melody_emb[:, start_pos:start_pos + T, :]
             else:
                 x = x + self.melody_encoder.null  # learned null (dropped/uncond)
-        cos = self._cos[start_pos:start_pos + T]
-        sin = self._sin[start_pos:start_pos + T]
 
         for i, block in enumerate(self.blocks):
             cache = caches[i] if caches is not None else None
-            x = x + self._self_attn(block.attn, block.ln1(x), cos, sin, cache)
+            ckv = cross_caches[i] if cross_caches is not None else None
+            x = x + self._self_attn(block.attn, block.ln1(x), start_pos, cache)
             if block.has_cross_attn and text_emb is not None:
                 x = x + self._cross_attn(
-                    block.cross_attn, block.ln_cross(x), text_emb, mask=text_kv_mask
+                    block.cross_attn, block.ln_cross(x), text_emb, mask=text_kv_mask,
+                    cache=ckv.text if ckv is not None else None,
                 )
             if block.has_lyric_attn and lyric_emb is not None:
                 x = x + self._cross_attn(
-                    block.lyric_attn, block.ln_lyric(x), lyric_emb, mask=lyric_kv_mask
+                    block.lyric_attn, block.ln_lyric(x), lyric_emb, mask=lyric_kv_mask,
+                    cache=ckv.lyric if ckv is not None else None,
                 )
             x = x + block.mlp.fc2(mnn.gelu(block.mlp.fc1(block.ln2(x))))
 
@@ -515,31 +533,61 @@ class MLXNanoAudioGPT(mnn.Module):
 
     # ---- sampling -------------------------------------------------------------
 
-    def _sample_codebook(self, logits: mx.array, temp, top_k, top_p) -> mx.array:
-        """logits: [B, V] -> [B] sampled token ids (int32)."""
-        if temp == 0:
-            return mx.argmax(logits, axis=-1).astype(mx.int32)
-        logits = logits / temp
+    def _sample_codebooks(self, logits: mx.array, temps, top_ks, top_ps) -> mx.array:
+        """logits: [B, Kv, V] for a contiguous run of codebooks -> [B, Kv] sampled
+        ids (int32). temps/top_ks/top_ps are the matching length-Kv slices of the
+        per-codebook sampling params.
 
-        if top_p is not None and 0.0 < top_p < 1.0:
-            order = mx.argsort(-logits, axis=-1)  # descending
-            sorted_logits = mx.take_along_axis(logits, order, axis=-1)
-            probs = mx.softmax(sorted_logits, axis=-1)
-            cum = mx.cumsum(probs, axis=-1)
-            cutoff = cum > top_p
-            # keep the first token that crosses the threshold (shift right by 1)
-            shifted = mx.concatenate(
-                [mx.zeros_like(cutoff[..., :1]), cutoff[..., :-1]], axis=-1
-            )
-            sorted_logits = mx.where(shifted, NEG_INF, sorted_logits)
-            inv = mx.argsort(order, axis=-1)  # permutation back to original order
-            logits = mx.take_along_axis(sorted_logits, inv, axis=-1)
+        One batched kernel sequence instead of a Python loop over codebooks —
+        at v9's K=24 the old per-codebook loop was ~150 tiny kernel launches per
+        decode step. Filtering semantics are identical per row: temp==0 -> argmax
+        of the raw logits; else temp-scale, nucleus (top_p) filter, then top_k
+        threshold on the filtered logits. Rows without a top_p/top_k pass through
+        (p=2.0 never crosses; k=V keeps everything)."""
+        B, Kv, V = logits.shape
+        greedy = mx.argmax(logits, axis=-1).astype(mx.int32)
+        if all(t == 0 for t in temps):
+            return greedy
 
-        if top_k is not None:
-            kth = mx.sort(logits, axis=-1)[..., -top_k]  # kth largest threshold
-            logits = mx.where(logits < kth[..., None], NEG_INF, logits)
+        safe_t = mx.array([float(t) if t else 1.0 for t in temps]).astype(logits.dtype)
+        x = logits / safe_t[None, :, None]
 
-        return mx.random.categorical(logits, axis=-1).astype(mx.int32)
+        # Sort descending once; both filters work in the sorted domain, then one
+        # inverse permutation restores original order.
+        order = mx.argsort(-x, axis=-1)
+        xs = mx.take_along_axis(x, order, axis=-1)
+
+        # top_p (nucleus): keep the first token that crosses the threshold
+        # (shift right by 1). cum > p is monotone, so the masked set is a suffix
+        # and xs stays descending-sorted afterwards.
+        p_arr = mx.array(
+            [p if (p is not None and 0.0 < p < 1.0) else 2.0 for p in top_ps]
+        ).astype(x.dtype)
+        probs = mx.softmax(xs, axis=-1)
+        cum = mx.cumsum(probs, axis=-1)
+        cutoff = cum > p_arr[None, :, None]
+        shifted = mx.concatenate(
+            [mx.zeros_like(cutoff[..., :1]), cutoff[..., :-1]], axis=-1
+        )
+        xs = mx.where(shifted, NEG_INF, xs)
+
+        # top_k: threshold = kth largest of the (top_p-filtered) row — index k-1
+        # in the descending sort. Same value-comparison (ties kept) as the old
+        # mx.sort(...)[..., -top_k] form.
+        k_idx = mx.array(
+            [min(int(k), V) - 1 if k is not None else V - 1 for k in top_ks],
+            dtype=mx.int32,
+        ).reshape(1, Kv, 1)
+        kth = mx.take_along_axis(xs, mx.broadcast_to(k_idx, (B, Kv, 1)), axis=-1)
+        xs = mx.where(xs < kth, NEG_INF, xs)
+
+        inv = mx.argsort(order, axis=-1)  # permutation back to original order
+        x = mx.take_along_axis(xs, inv, axis=-1)
+        sampled = mx.random.categorical(x, axis=-1).astype(mx.int32)
+        if any(t == 0 for t in temps):
+            tz = mx.array([t == 0 for t in temps])
+            sampled = mx.where(tz[None, :], greedy, sampled)
+        return sampled
 
     # ---- generate -------------------------------------------------------------
 
@@ -780,6 +828,10 @@ class MLXNanoAudioGPT(mnn.Module):
         mel_b = _stack_melody()
         lemb_b, lkv_b = _stack_lyric()
         caches_b = self._new_caches(S * B, T_delay)
+        # One cross-attention K/V cache per block: text_b / lemb_b are FIXED for
+        # the whole decode, so kv_proj(cond) runs once at prefill instead of on
+        # every step (the torch BlockCrossKV port — dominant cost w/ long lyrics).
+        cross_b = [_BlockCrossKV() for _ in range(cfg.n_layers)]
 
         def _run(inp, start):
             inp_b = mx.tile(inp, (S, 1, 1)) if S > 1 else inp
@@ -787,6 +839,7 @@ class MLXNanoAudioGPT(mnn.Module):
                 inp_b, caches=caches_b, start_pos=start,
                 text_emb=text_b, text_kv_mask=tkv_b,
                 lyric_emb=lemb_b, lyric_kv_mask=lkv_b, melody_emb=mel_b,
+                cross_caches=cross_b,
             )
 
         def _combine(logits_b):
@@ -821,11 +874,23 @@ class MLXNanoAudioGPT(mnn.Module):
             # torch path's `step_logits[..., vocab_per_codebook:] = -inf`.
             step[:, :, cfg.vocab_per_codebook:] = NEG_INF
 
-            for k in range(K):
-                if k + T_prompt <= pos < k + T_total:
-                    tok = self._sample_codebook(step[:, k, :], temps[k], top_ks[k], top_ps[k])
-                    tokens[:, k, pos] = tok
-            mx.eval(tokens[:, :, pos])
+            # The delay pattern makes the codebooks live at this pos a CONTIGUOUS
+            # range (cb k samples while k + T_prompt <= pos < k + T_total), so all
+            # of them sample in one batched call + one scatter write.
+            k0 = max(0, pos - T_total + 1)
+            k1 = min(K, pos - T_prompt + 1)
+            if k1 > k0:
+                toks = self._sample_codebooks(
+                    step[:, k0:k1, :], temps[k0:k1], top_ks[k0:k1], top_ps[k0:k1]
+                )
+                tokens[:, k0:k1, pos] = toks
+            # Dispatch without blocking so the GPU works through this step while
+            # Python builds the next step's graph; hard-sync every 8 steps to
+            # bound the in-flight queue. (A per-step mx.eval serialized the two.)
+            if (pos - prefill_len) % 8 == 7:
+                mx.eval(tokens)
+            else:
+                mx.async_eval(tokens)
 
             # Emit any new frames now fully known: frame f completes at pos=f+K-1.
             n_complete = min(pos - (K - 1), T_total - 1) - T_prompt + 1

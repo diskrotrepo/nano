@@ -25,21 +25,34 @@ pytest -v                       # verbose (override the quiet default)
 ```
 
 Run from the repo root so the flat top-level packages (`model`, `diskrot`,
-`server`) import correctly. No GPU or real corpus is required — tests use
-synthetic tokens.
+`server`) import correctly. Use the project venv (`.venv/bin/python -m pytest`
+or `uv run pytest`). No GPU or real corpus is required — tests use synthetic
+tokens.
 
-## What's covered (11 files)
+## Environment gotchas
 
-- **Delay pattern** — `test_delay_pattern.py` (MusicGen delay build/revert).
-- **Dataset** — `test_dataset.py`, `test_dataset_mmap.py`,
-  `test_dataset_v2_autodetect.py` (loading, splits, mmap, sharded-layout autodetect).
-- **Model config** — `test_gpt_config.py`.
-- **RoPE** — `test_rope_equivalence.py`.
-- **Packing** — `test_pack_cache.py` (sharding + atomic/resumable pack).
-- **Tokenization** — `test_tokenize_streaming.py` (DAC encode, prefetch, batching).
-- **Training loss** — `test_train_loss.py` (per-codebook loss, cosine LR).
-- **Pipeline audit** — `test_pipeline_audit.py` (end-to-end correctness invariants).
-- **Prompt sweetener** — `test_prompt_sweetener.py`.
+- **Unset `NANO_CODEC` (or set `=dac`) before running the suite.** A leftover
+  `NANO_CODEC=spectrostream` export changes the codec constants module-wide
+  (frame rate 25 vs 86, K=32 vs 9) and fails DAC-assuming tests *falsely* —
+  the code is fine, the env is wrong.
+- **`g2p_en` is not a project dep**, so the lyric/structure tests — including
+  the load-bearing train==inference marker guard in
+  `test_structure_markers.py` — **silently skip** without it. Install it
+  (`uv pip install g2p_en`) when touching anything on the lyric path, then
+  check the skip count.
+
+## What's covered
+
+~49 test files (see `ls tests/`), spanning the model core (delay pattern, RoPE,
+GPTConfig, qk-norm, cross-KV cache, CFG), the data pipeline (dataset/mmap,
+pack + sidecars, tokenize streaming, phonemize, filter/align lyrics, audio
+quality/dedup/io), training (loss, param groups, init stability), the
+conditioning streams and their **train==inference equivalence guards**
+(`test_structure_markers.py`, `test_melody.py`, `test_stem.py`, `test_fim.py`,
+`test_chunked_tags.py`), LoRA (`test_lora.py`), MLX backend parity
+(`test_mlx_parity.py`), and the server endpoints (generate batch/stream,
+sweetener). When you change a conditioning stream, its equivalence guard is
+the test that matters.
 
 ## Fixtures
 

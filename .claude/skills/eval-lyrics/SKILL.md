@@ -50,8 +50,12 @@ Expected rates from the 2026-06 full-corpus sweeps: ~48% instrumental(null),
 vocal-ready. A hallucination rate far above ~25% or a vocal-ready share far
 below ~⅓ deserves investigation before training.
 
-`gender: unset` means a pre-gender (v7-era) entry — the field is written by
-the transcribe pass itself, so only re-running transcribe adds it.
+**Vocal gender now comes from the auto_tag captioner**, not transcribe: the
+audio-LLM writes a `GENDER:` tag into `tags.json` and the dataset reads that
+first, falling back to the legacy F0 `gender` field in `lyrics/` (only written
+when transcribe runs with `estimate_gender=True` — the Modal stage doesn't).
+So a missing gender is backfilled by re-captioning (`modal_auto_tag --redo`),
+NOT by re-running transcribe.
 
 ### Acting on the audit
 
@@ -63,7 +67,9 @@ the transcribe pass itself, so only re-running transcribe adds it.
   memory and the next flush would clobber concurrent edits. Dry-run is
   read-only and always safe; `--apply` is the dangerous one.
 - Required order: transcribe → `modal run --detach diskrot/modal_filter_lyrics.py
-  --apply` → `modal run --detach diskrot/modal_phonemize.py` → re-audit →
+  --apply` → optional forced alignment (`modal run --detach
+  diskrot/modal_align_lyrics.py --wave-id N --apply`, sharpens word onsets
+  in place) → `modal run --detach diskrot/modal_phonemize.py` → re-audit →
   train. Phonemize after the filter, so junk never enters the phoneme store.
 
 ## Prereqs

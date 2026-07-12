@@ -72,10 +72,10 @@ modal run scripts/lyrics_audit.py        # prints the report to the logs
    length imported live from `DEFAULTS`, so they can't go stale) translated into
    **effective epochs of unique audio** (`steps × batch × segment_seconds ÷
    total trainable audio`), with an under/over-training verdict. nano is *one*
-   fixed-shape ~2.0B
-   net (no family of sizes — the `DEFAULTS` dict in `diskrot/modal_train.py` is
-   the source of truth), so the step count is the lever that has to match the
-   trainable-song scale; this is where you confirm it does.
+   fixed-shape ~2.0B net (no family of sizes — the `DEFAULTS` dict in
+   `diskrot/modal_train.py` is the source of truth), so the step count is the
+   lever that has to match the trainable-song scale; this is where you confirm
+   it does.
 6. **Lyric breakdown / gender / word-count / language / keys** — the lyric
    detail; **eval-lyrics** is the skill that interprets these in depth.
 
@@ -101,11 +101,18 @@ compute the genre mix — run the dedicated tool as a second step (below).
   `steps`); over ~15× invites repetition/memorization (cut `steps` or add data).
   Because the model shape is fixed, the only knob the verdict points at is the
   step count in `DEFAULTS` — adjust there, not the architecture.
+
 ## Genre mix — `eval/genre_gap_eval.py`
 
 The genre picture is a **second step**, not part of the Modal audit: it needs
 CLAP (torch), runs locally, and pulls the latest `tags.json` off nano-tokens
 itself. Run it after the audit for the authoritative distribution.
+
+**Staleness caveat**: auto_tag rewrites the monolithic `tags.json` only at
+end-of-stage (the durable mid-sweep progress lives in the sharded
+`/tokens/tags/` dir) — so while a caption/`--redo` sweep is in flight, this
+eval reads the pre-sweep snapshot. Fine for coverage counts; don't use it to
+judge an in-progress re-caption.
 
 ```bash
 python -m eval.genre_gap_eval            # regex + CLAP zero-shot (default)
