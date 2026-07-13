@@ -72,7 +72,10 @@ DEFAULT_CKPT_CANDIDATES = [
 # empty there and the .env() layer is a no-op.)
 _FORWARDED_ENV = {
     k: v for k in ("NANO_CKPT", "NANO_MODELS", "NANO_DEFAULT_MODEL", "NANO_BITS",
-                   "NANO_WARMUP_SECONDS", "TORCH_LOGS", "NANO_COMPILE", "NANO_WARMUP_CFG")
+                   "NANO_WARMUP_SECONDS", "TORCH_LOGS", "NANO_COMPILE", "NANO_WARMUP_CFG",
+                   # v9/SpectroStream serving: the codec choice must reach the
+                   # container (it also selects the SS image variant below).
+                   "NANO_CODEC", "NANO_SS_DEPTH")
     if (v := os.environ.get(k))
 }
 
@@ -112,7 +115,85 @@ def _prefetch_g2p() -> None:
     G2p()("warm up the cache")
 
 
-image = (
+# --- SpectroStream (v9) image variant -------------------------------------
+# model/codec.py imports magenta_rt on the SS path, which only exists in the
+# magenta-rt GPU image (TF + JAX stack). Selecting NANO_CODEC=spectrostream at
+# `modal serve`/`deploy` time swaps the image base; the DAC image below stays
+# the default. Same base + CuDNN reconciliation as diskrot/modal_stems.py —
+# see the long comment there for the 9.1-vs-9.3 abort trap.
+_IS_SS = os.environ.get("NANO_CODEC", "").strip().lower() == "spectrostream"
+_MAGENTA_GPU_IMAGE = "us-docker.pkg.dev/brain-magenta/magenta-rt/magenta-rt:gpu"
+
+
+def _prefetch_weights_ss() -> None:
+    """SS-image twin of _prefetch_weights: CLAP + sweetener only. The SS codec
+    SavedModels are baked by a run_commands step (the exact runtime fetch
+    path); DAC isn't installed on this image."""
+    from msclap import CLAP
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # Must match prompt_sweetener.DEFAULT_MODEL (see _prefetch_weights).
+    sweetener_model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+    CLAP(version="2023", use_cuda=False)
+    AutoTokenizer.from_pretrained(sweetener_model)
+    AutoModelForCausalLM.from_pretrained(sweetener_model)
+
+
+_ss_image = (
+    modal.Image.from_registry(_MAGENTA_GPU_IMAGE)
+    .apt_install("ffmpeg", "libsndfile1")
+    # torch pinned to the stems-proven combo (cu121); newer torch re-breaks the
+    # CuDNN dance below. torchao pinned to a torch-2.4-compatible release.
+    .pip_install(
+        "torch==2.4.1", "torchaudio==2.4.1",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "librosa>=0.10", "numpy>=1.26", "soundfile>=0.12",
+        "fastapi>=0.115", "python-multipart>=0.0.12",
+        "msclap", "transformers>=4.35", "torchao==0.7.0", "g2p_en==2.1.0",
+    )
+    # CuDNN reconciliation: torch+cu121 pins nvidia-cudnn-cu12==9.1.0.70 and
+    # downgrades the 9.3 wheel magenta-rt's TF was compiled against, which
+    # aborts every codec decode. Force 9.3 back (satisfies both).
+    .run_commands(
+        "pip install --no-deps --force-reinstall 'nvidia-cudnn-cu12==9.3.0.75'"
+    )
+    .env(
+        {
+            "NANO_CODEC": "spectrostream",
+            "NANO_SS_DEPTH": os.environ.get("NANO_SS_DEPTH", "32"),
+            # TF/JAX must share the GPU with the ~4GB torch model + KV cache:
+            # no preallocation, modest fraction, growth on demand.
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.3",
+            "TF_FORCE_GPU_ALLOW_GROWTH": "true",
+            "TF_CPP_MIN_LOG_LEVEL": "2",
+            "GRPC_VERBOSITY": "ERROR",
+            "GLOG_minloglevel": "2",
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+            # The sweetener/CLAP run on torch — transformers must not touch the
+            # image's TensorFlow.
+            "USE_TF": "0",
+        }
+    )
+    # Bake the SpectroStream SavedModels into the image so cold containers
+    # don't re-fetch them from HF (same fetch path the codec uses at runtime;
+    # CPU-only — the builder has no GPU).
+    .run_commands(
+        "JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES=-1 TF_CPP_MIN_LOG_LEVEL=2 "
+        "python -c 'from magenta_rt import spectrostream; "
+        "spectrostream.SpectroStream(max_rvq_depth=32)'"
+    )
+    .run_function(_prefetch_weights_ss)
+    .run_function(_prefetch_g2p)
+    .env(_FORWARDED_ENV)
+    .add_local_python_source("model", "diskrot", "server")
+) if _IS_SS else None
+
+_dac_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
     .pip_install(
@@ -142,6 +223,9 @@ image = (
     .env(_FORWARDED_ENV)
     .add_local_python_source("model", "diskrot", "server")
 )
+
+# NANO_CODEC=spectrostream at serve/deploy time selects the SS variant.
+image = _ss_image if _IS_SS else _dac_image
 
 ckpts_vol = modal.Volume.from_name("nano-ckpts", create_if_missing=True)
 # Every generation is also persisted here (server/main.py:_save_output via

@@ -234,11 +234,21 @@ class SpectroStreamCodec:
         self._max_encode_samples = int(
             float(os.environ.get("NANO_MAX_ENCODE_SECONDS_SS", "360.0")) * self.SAMPLE_RATE
         )
-        from magenta_rt import audio, spectrostream
+        from magenta_rt import audio
 
         self._audio = audio
         # Construct at the stored depth: encode then yields exactly [S, depth].
-        self.model = spectrostream.SpectroStream(max_rvq_depth=self.N_CODEBOOKS)
+        try:
+            # v1 stack (TF/JAX, Linux+CUDA — the Modal images that tokenize the corpus).
+            from magenta_rt import spectrostream
+
+            self.model = spectrostream.SpectroStream(max_rvq_depth=self.N_CODEBOOKS)
+        except ImportError:
+            # magenta-rt 2.x dropped the top-level module but ships an MLX port of
+            # the SAME codec (token-parity verified) — the Apple-Silicon path.
+            from model.spectrostream_mlx import MLXSpectroStream
+
+            self.model = MLXSpectroStream(max_rvq_depth=self.N_CODEBOOKS)
 
     def _to_waveform(self, source: str | Path | torch.Tensor):
         """Resolve a path or [C, samples]/[samples] tensor to a stereo Waveform."""
