@@ -59,8 +59,14 @@ app = modal.App("nano-serve")
 # Prefer the slim inference export; fall back to the raw training checkpoints.
 # Override with the NANO_CKPT env var at `modal serve`/`modal deploy` time.
 # (v7_1500m checkpoints predate the fused output head and cannot load on this
-# code — don't list them as fallbacks.)
+# code — don't list them as fallbacks.) v8 is retired (2026-07-13): the SS
+# image defaults to the v9 run's checkpoints; the DAC candidates remain only
+# so the legacy image stays launchable.
 DEFAULT_CKPT_CANDIDATES = [
+    "/ckpts/v9_stereo/best_inference.pt",
+    "/ckpts/v9_stereo/best.pt",
+    "/ckpts/v9_stereo/latest.pt",
+] if os.environ.get("NANO_CODEC", "").strip().lower() == "spectrostream" else [
     "/ckpts/v8_sing/best_inference.pt",
     "/ckpts/v8_sing/best.pt",
     "/ckpts/v8_sing/latest.pt",

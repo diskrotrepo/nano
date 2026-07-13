@@ -1050,6 +1050,29 @@ class NanoAudioGPT(nn.Module):
             if val is None or isinstance(val, (int, float)):
                 return [val] * K
             val = list(val)
+            if len(val) == 1:
+                return val * K
+            if len(val) != K:
+                # A sampling ladder tuned for another codebook count (e.g. the
+                # server's 9-entry DAC sweep winners hitting a 24-codebook
+                # SpectroStream checkpoint) is resampled by linear interpolation
+                # over the ladder positions — preserving its coarse->fine shape
+                # on any K — instead of rejecting the request.
+                L = len(val)
+                if any(v is None for v in val):
+                    val = [val[round(j * (L - 1) / max(K - 1, 1))] for j in range(K)]
+                else:
+                    is_int = all(isinstance(v, int) for v in val)
+                    fit = []
+                    for j in range(K):
+                        pos = j * (L - 1) / max(K - 1, 1)
+                        lo = int(pos)
+                        hi = min(lo + 1, L - 1)
+                        frac = pos - lo
+                        x = val[lo] * (1 - frac) + val[hi] * frac
+                        fit.append(max(1, round(x)) if is_int else x)
+                    val = fit
+                print(f"[generate] {kind} ladder length {L} != K={K} — resampled")
             assert len(val) == K, f"{kind} must be scalar or length {K}, got {len(val)}"
             return val
 
