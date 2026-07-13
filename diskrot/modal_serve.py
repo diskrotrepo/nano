@@ -152,7 +152,11 @@ _ss_image = (
     .pip_install(
         "librosa>=0.10", "numpy>=1.26", "soundfile>=0.12",
         "fastapi>=0.115", "python-multipart>=0.0.12",
-        "msclap", "transformers>=4.35", "torchao==0.7.0", "g2p_en==2.1.0",
+        # HARD-pinned: the magenta base preinstalls transformers 4.57.1, whose
+        # top-level no longer resolves GPT2LMHeadModel (msclap's CLAP text
+        # encoder imports it) — a range pin is "already satisfied" and won't
+        # downgrade. 4.46.3 has the export and supports the Qwen2.5 sweetener.
+        "msclap", "transformers==4.46.3", "torchao==0.7.0", "g2p_en==2.1.0",
     )
     # CuDNN reconciliation: torch+cu121 pins nvidia-cudnn-cu12==9.1.0.70 and
     # downgrades the 9.3 wheel magenta-rt's TF was compiled against, which
