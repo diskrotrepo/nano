@@ -148,7 +148,10 @@ def _prefetch_weights_ss() -> None:
 
 _ss_image = (
     modal.Image.from_registry(_MAGENTA_GPU_IMAGE)
-    .apt_install("ffmpeg", "libsndfile1")
+    # espeak-ng: the v9 multilingual lyric path phonemizes request lyrics via
+    # the `phonemizer` lib (espeak backend) — without it every lyrics= request
+    # 500s (g2p_en is the retired v8 English-only path).
+    .apt_install("ffmpeg", "libsndfile1", "espeak-ng", "libespeak-ng1")
     # torch pinned to the stems-proven combo (cu121); newer torch re-breaks the
     # CuDNN dance below. torchao pinned to a torch-2.4-compatible release.
     .pip_install(
@@ -163,6 +166,7 @@ _ss_image = (
         # encoder imports it) — a range pin is "already satisfied" and won't
         # downgrade. 4.46.3 has the export and supports the Qwen2.5 sweetener.
         "msclap", "transformers==4.46.3", "torchao==0.7.0", "g2p_en==2.1.0",
+        "phonemizer>=3.2",
     )
     # CuDNN reconciliation: torch+cu121 pins nvidia-cudnn-cu12==9.1.0.70 and
     # downgrades the 9.3 wheel magenta-rt's TF was compiled against, which
@@ -184,6 +188,13 @@ _ss_image = (
             "GLOG_minloglevel": "2",
             "HF_HUB_DISABLE_PROGRESS_BARS": "1",
             "HF_HUB_DISABLE_TELEMETRY": "1",
+            # Pin the HF cache to a stable baked path BEFORE the SS SavedModel
+            # bake below, so the runtime codec reads the baked copy instead of
+            # re-downloading at cold start (mirrors modal_stems; no volume is
+            # mounted at /cache in this app, so the baked dir survives).
+            "HF_HOME": "/cache/hf",
+            "HF_HUB_CACHE": "/cache/hf",
+            "XDG_CACHE_HOME": "/cache",
             # The sweetener/CLAP run on torch — transformers must not touch the
             # image's TensorFlow.
             "USE_TF": "0",

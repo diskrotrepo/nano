@@ -554,7 +554,7 @@ class InferenceEngine:
             in_path = f.name
         try:
             full_wav = self._load_wav(in_path)        # [C, samples] (C matches codec)
-            full_tokens = self.codec.encode(full_wav)
+            full_tokens = self._encode_prompt_tokens(full_wav)
         finally:
             os.unlink(in_path)
 
@@ -796,7 +796,7 @@ class InferenceEngine:
             in_path = f.name
         try:
             wav = self._load_wav(in_path)             # [C, samples] (C matches codec)
-            codes = self.codec.encode(wav)
+            codes = self._encode_prompt_tokens(wav)
         finally:
             os.unlink(in_path)
         return wav, codes
@@ -977,6 +977,14 @@ class InferenceEngine:
                 on_item(i, body, mime)
             results.append((body, mime))
         return results
+
+    def _encode_prompt_tokens(self, wav: torch.Tensor) -> torch.Tensor:
+        """codec.encode sliced to the model's codebook count. The codec may store
+        a deeper RVQ stack than the model consumes (SpectroStream stores 32, the
+        model trains on the K=24 prefix — the same slice TokenDataset applies to
+        the packed corpus), so every audio-prompt path must take the prefix or
+        generate()'s K assertion trips."""
+        return self.codec.encode(wav)[: self.model.cfg.n_codebooks]
 
     def _load_wav(self, path: str) -> torch.Tensor:
         """Load an uploaded clip to ``[C, samples]`` matching the codec's channel
@@ -1214,7 +1222,7 @@ class InferenceEngine:
             in_path = f.name
         try:
             full_wav = self._load_wav(in_path)        # [C, samples] (C matches codec)
-            full_tokens = self.codec.encode(full_wav)
+            full_tokens = self._encode_prompt_tokens(full_wav)
         finally:
             os.unlink(in_path)
 
