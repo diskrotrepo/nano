@@ -46,6 +46,7 @@ BLOCKING_OK = {
     "modal_lyrics_stats.py",         # read-only skip-Demucs gate: wave-vs-rest stats, inline
     "modal_r2_wavify.py",            # dry-run blocks inline; apply path spawns
     "modal_clean_dac_pt.py",         # dry-run blocks inline; apply path spawns
+    "modal_copy_conditioning.py",    # ~1k-file codec-subdir copy, seconds; dry-run inline
 }
 
 MODAL_RUN_RE = re.compile(

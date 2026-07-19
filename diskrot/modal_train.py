@@ -651,6 +651,8 @@ def train_remote(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    n_codebooks: int = DEFAULTS["n_codebooks"],
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ):
     from diskrot.train import TrainConfig, train_run
 
@@ -664,11 +666,13 @@ def train_remote(
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
         distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
+        cb0_loss_weight=cb0_loss_weight,
     )
     cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
         dropout=dropout, text_conditioned=text_conditioned,
+        n_codebooks=n_codebooks,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
@@ -734,6 +738,8 @@ def train_remote_multi(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    n_codebooks: int = DEFAULTS["n_codebooks"],
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ):
     import torch
     import torch.multiprocessing as mp
@@ -759,9 +765,11 @@ def train_remote_multi(
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
         distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
+        cb0_loss_weight=cb0_loss_weight,
     )
     model_kwargs = dict(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff, dropout=dropout,
+        n_codebooks=n_codebooks,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
@@ -782,7 +790,7 @@ def train_remote_multi(
     # NANO_CODEC / --data-subdir mistake (e.g. a 24-cb model pointed at the old
     # 9-cb DAC pack, or a stored depth < the chosen K). Fail fast with a clear msg.
     _stored_k = int(load_shard_index(packed_dir)["n_codebooks"])
-    _model_k = int(cfg_kwargs.get("n_codebooks") or DEFAULTS["n_codebooks"])
+    _model_k = int(model_kwargs.get("n_codebooks") or DEFAULTS["n_codebooks"])
     if _stored_k < _model_k:
         raise ValueError(
             f"packed corpus at {packed_dir} stores {_stored_k} codebooks but the "
@@ -921,6 +929,11 @@ def main(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    # Pilot/experiment knobs: model codebook count (RVQ prefix of the stored
+    # depth — checkpoint-incompatible across values) and the cb0 loss up-weight
+    # (training-side only, checkpoint-compatible).
+    n_codebooks: int = DEFAULTS["n_codebooks"],
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ):
     if lora and not init_from:
         raise SystemExit("--lora requires --init-from (e.g. --init-from v8_sing/best.pt)")
@@ -946,6 +959,7 @@ def main(
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
         distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
+        n_codebooks=n_codebooks, cb0_loss_weight=cb0_loss_weight,
     )
     if n_gpus > 1:
         fc = train_remote_multi.spawn(**common, n_gpus=n_gpus)

@@ -44,12 +44,17 @@ _IS_SS = _CODEC in ("spectrostream", "ss")
 _MAGENTA_GPU_IMAGE = "us-docker.pkg.dev/brain-magenta/magenta-rt/magenta-rt:gpu"
 
 
-def _cache_dac():
-    # Pre-download the DAC 44kHz checkpoint at image build time so 50 containers
-    # don't each fetch ~500MB at cold start.
-    import dac
-
-    dac.utils.download(model_type="44khz")
+# Pre-download the DAC 44kHz checkpoint at image build time so 50 containers don't
+# each fetch ~500MB at cold start.
+#
+# This is a `run_commands` string, NOT a `run_function`: Modal imports the DEFINING
+# MODULE to execute a build function, and this module's top-level
+# `from diskrot.modal_common import ...` would then run before
+# `add_local_python_source("model", "diskrot")` has been layered in — a hard
+# ModuleNotFoundError at build time. Keeping the source layer last is deliberate
+# (see the profiling-env note below), so the bake must not depend on it. Mirrors
+# how the SpectroStream branch bakes its SavedModels.
+_CACHE_DAC_CMD = "python -c 'import dac; dac.utils.download(model_type=\"44khz\")'"
 
 
 if _IS_SS:
@@ -150,7 +155,7 @@ else:
         # 22 GiB total even though no single encode needs >5 GiB — fragmentation
         # eats the rest. PyTorch's own CUDA-OOM error suggests setting this.
         .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
-        .run_function(_cache_dac)
+        .run_commands(_CACHE_DAC_CMD)
         # Stage-0 profiling knob, after the DAC weight cache so toggling it doesn't
         # re-run _cache_dac (see the SS image note above).
         .env({"NANO_TOKENIZE_PROFILE": os.environ.get("NANO_TOKENIZE_PROFILE", "")})
@@ -183,6 +188,12 @@ class Tokenizer:
     # are isolated for pack_append + per-wave cleanup. Empty = the flat legacy
     # layout (/corpus/*.mp3 -> /tokens/*.pt).
     subdir: str = modal.parameter(default="")
+    # Codec isolation: re-roots the .pt output under /tokens/<data_subdir>/ so a
+    # second codec's corpus can be built alongside an existing one without
+    # colliding. Empty = /tokens (the original layout, byte-identical behaviour).
+    # The corpus side (/corpus/<subdir>) is NEVER re-rooted — both codecs read the
+    # same mp3s. See diskrot/modal_train.py:301 for the matching train-side flag.
+    data_subdir: str = modal.parameter(default="")
 
     @modal.enter()
     def load_codec(self):
@@ -218,7 +229,7 @@ class Tokenizer:
         from diskrot.tokenize import tokenize_files_streaming
 
         corpus_dir = Path("/corpus") / self.subdir
-        out_dir = Path("/tokens") / self.subdir
+        out_dir = Path("/tokens") / self.data_subdir / self.subdir
         out_dir.mkdir(parents=True, exist_ok=True)
         items = [
             (corpus_dir / name, out_dir / (Path(name).stem + ".pt"))
@@ -290,16 +301,67 @@ def _wave_subdir(wave_id: str) -> str:
     return f"waves/wave_{wave_id}" if wave_id else ""
 
 
+def _token_root(data_subdir: str) -> Path:
+    """The .pt root for this codec: /tokens, or /tokens/<data_subdir>."""
+    return Path("/tokens") / data_subdir if data_subdir else Path("/tokens")
+
+
+def _assert_codec_identity(root: Path) -> None:
+    """Pin a token tree to ONE codec, permanently.
+
+    Filenames are ``<stem>.pt`` regardless of codec — only the tensor's shape
+    differs (DAC 9 codebooks @86 Hz vs SpectroStream 24/32 @25 Hz). So writing a
+    second codec's tokens into an existing tree is silent and unrecoverable: the
+    packer would mix incompatible depths, and nothing downstream re-derives the
+    codec from the data.
+
+    NANO_CODEC is baked into the image at `modal deploy`/`modal run` time, so the
+    realistic failure is deploying a stage app under the wrong codec and only
+    noticing 14 waves later. Stamp it on first write and refuse any mismatch.
+    """
+    import json
+
+    codec = os.environ.get("NANO_CODEC", "dac").lower()
+    is_ss = codec in ("spectrostream", "ss")
+    want = {
+        "codec": "spectrostream" if is_ss else "dac",
+        "frame_rate_hz": 25 if is_ss else 86,
+        "stored_n_codebooks": int(os.environ.get("NANO_SS_DEPTH", "32")) if is_ss else 9,
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = root / "codec.json"
+    if not stamp.exists():
+        tmp = stamp.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(want, indent=2))
+        os.replace(tmp, stamp)
+        tokens_vol.commit()
+        print(f"[tokenize] stamped {stamp} = {want}", flush=True)
+        return
+    try:
+        got = json.loads(stamp.read_text())
+    except Exception:  # noqa: BLE001 — a corrupt stamp must not be silently trusted
+        raise SystemExit(f"CODEC GUARD: {stamp} exists but is unreadable — refusing to write.")
+    if got != want:
+        raise SystemExit(
+            f"CODEC GUARD: {root} was built with {got}, but this container is "
+            f"running {want}. Writing would silently mix incompatible token "
+            f"shapes into one tree.\n"
+            f"Fix: re-deploy the stage apps with the right NANO_CODEC "
+            f"(e.g. `NANO_CODEC={want['codec']} modal deploy diskrot/modal_tokenize.py`), "
+            f"or point --data-subdir at the correct tree."
+        )
+
+
 @app.function(
     image=orchestrator_image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending(wave_id: str = "") -> list[str]:
+def list_pending(wave_id: str = "", data_subdir: str = "") -> list[str]:
     """Return mp3 basenames not yet tokenized (no matching .pt) within the
     (wave) corpus subdir."""
     sub = _wave_subdir(wave_id)
     mp3s = sorted((Path("/corpus") / sub).glob("*.mp3"))
-    existing = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
+    existing = {p.stem for p in (_token_root(data_subdir) / sub).glob("*.pt")}
     pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
     print(f"found {len(mp3s)} total mp3s, {len(existing)} already tokenized, "
           f"{len(pending)} pending")
@@ -318,14 +380,19 @@ def list_pending(wave_id: str = "") -> list[str]:
     nonpreemptible=True,
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
-def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
+def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "",
+                 data_subdir: str = "") -> None:
     """Run the full tokenize pass: list pending, fan out to GPU containers,
     aggregate results, print summary. Designed to be `.spawn()`-ed from the
     local entrypoint so the user can launch and walk away. ``wave_id`` scopes
-    the pass to /corpus/waves/wave_<id> -> /tokens/waves/wave_<id>."""
+    the pass to /corpus/waves/wave_<id> -> /tokens/<data_subdir>/waves/wave_<id>."""
     sub = _wave_subdir(wave_id)
+    root = _token_root(data_subdir)
+    _assert_codec_identity(root)
+    out_dir = root / sub
+    print(f"[tokenize] corpus=/corpus/{sub}  ->  out={out_dir}", flush=True)
     mp3s = sorted((Path("/corpus") / sub).glob("*.mp3"))
-    existing = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
+    existing = {p.stem for p in out_dir.glob("*.pt")}
     pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
     if existing:
         print(f"RESUMING: {len(existing)} of {len(mp3s)} already tokenized, "
@@ -334,6 +401,15 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
         print(f"fresh run: {len(mp3s)} total mp3s, 0 already tokenized, "
               f"{len(pending)} pending", flush=True)
 
+    # "0 mp3s found" and "all already tokenized" are very different: the first is
+    # a path bug (wrong wave_id, un-uploaded wave, wrong corpus mount) that would
+    # otherwise sail through the ingest as a green stage, the second is a legit
+    # resume no-op. Only the latter may return quietly.
+    if not mp3s:
+        raise RuntimeError(
+            f"tokenize found 0 mp3s at /corpus/{sub} — refusing to report success. "
+            f"Check --wave-id and that the wave exists in the corpus bucket."
+        )
     if not pending:
         print("Nothing to tokenize — all files already have .pt cache", flush=True)
         return
@@ -342,7 +418,7 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
               for i in range(0, len(pending), batch_size)]
     print(f"Dispatching {len(pending)} files in {len(chunks)} batches of "
           f"~{batch_size} across parallel containers...", flush=True)
-    tokenizer = Tokenizer(min_seconds=min_seconds, subdir=sub)
+    tokenizer = Tokenizer(min_seconds=min_seconds, subdir=sub, data_subdir=data_subdir)
 
     n_done = n_short = n_failed = 0
     n_oom = n_decode = n_other = 0
@@ -427,13 +503,15 @@ def run_tokenize(min_seconds: int, batch_size: int, wave_id: str = "") -> None:
 
 
 @app.local_entrypoint()
-def main(min_seconds: int = 20, batch_size: int = 64, wave_id: str = ""):
+def main(min_seconds: int = 20, batch_size: int = 64, wave_id: str = "",
+         data_subdir: str = ""):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away.
     # --wave-id N scopes the pass to /corpus/waves/wave_N -> /tokens/waves/wave_N.
     fc = run_tokenize.spawn(
-        min_seconds=min_seconds, batch_size=batch_size, wave_id=wave_id)
+        min_seconds=min_seconds, batch_size=batch_size, wave_id=wave_id,
+        data_subdir=data_subdir)
     print(f"tokenize launched (detached) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "
           f"awk '/nano-tokenize.*ephemeral/{{print $2; exit}}') -f")

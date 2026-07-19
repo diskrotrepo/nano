@@ -63,11 +63,18 @@ stems_vol = modal.Volume.from_name("nano-stems", create_if_missing=True)
 )
 def pack_remote(
     shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True,
-    stems: bool = True,
+    stems: bool = True, data_subdir: str = "",
 ):
     from pathlib import Path
 
     from diskrot.pack_cache import pack
+
+    # Codec isolation: pack /tokens/<data_subdir> -> /tokens/<data_subdir>/packed,
+    # reading sidecars from /melody/<data_subdir> and /stems/<data_subdir>. Empty
+    # = the original /tokens layout.
+    root = f"/tokens/{data_subdir}" if data_subdir else "/tokens"
+    mel_root = f"/melody/{data_subdir}" if data_subdir else "/melody"
+    stem_root = f"/stems/{data_subdir}" if data_subdir else "/stems"
 
     # Pack the parallel chroma sidecar (packed_NNN.mel.bin) when the per-song
     # <name>.mel.npy files from modal_melody.py are present. Auto-skip if none
@@ -75,9 +82,9 @@ def pack_remote(
     # chroma file are zero-filled, so a partial extraction is safe.
     mel_cache_dir = None
     if melody:
-        has_any = next(Path("/melody").glob("*.mel.npy"), None) is not None
+        has_any = next(Path(mel_root).glob("*.mel.npy"), None) is not None
         if has_any:
-            mel_cache_dir = "/melody"
+            mel_cache_dir = mel_root
             print("[pack] melody: chroma sidecars found — packing parallel .mel.bin", flush=True)
         else:
             print("[pack] melody: no *.mel.npy found on nano-melody — packing tokens "
@@ -86,16 +93,16 @@ def pack_remote(
     # Same for the parallel stem sidecar (packed_NNN.stem.bin) from modal_stems.py.
     stem_cache_dir = None
     if stems:
-        has_any = next(Path("/stems").glob("*.stems.npy"), None) is not None
+        has_any = next(Path(stem_root).glob("*.stems.npy"), None) is not None
         if has_any:
-            stem_cache_dir = "/stems"
+            stem_cache_dir = stem_root
             print("[pack] stems: stem sidecars found — packing parallel .stem.bin", flush=True)
         else:
             print("[pack] stems: no *.stems.npy found on nano-stems — packing without "
                   "stems (run modal_stems.py first to add /addstem conditioning)", flush=True)
 
     out_dir = pack(
-        "/tokens",
+        root,
         shard_target_songs=shard_target_songs,
         n_workers=n_workers,
         verbose=True,
@@ -123,7 +130,7 @@ def pack_remote(
 )
 def pack_append_remote(
     wave_id: str, shard_target_songs: int = 5_000, n_workers: int = 16,
-    melody: bool = True, stems: bool = True,
+    melody: bool = True, stems: bool = True, data_subdir: str = "",
 ):
     """Append one wave's tokens (``/tokens/waves/wave_<id>/*.pt``) as NEW shards
     to the existing ``/tokens/packed`` — leaving every prior shard untouched (see
@@ -133,17 +140,41 @@ def pack_append_remote(
 
     from diskrot.pack_cache import SHARD_INDEX_NAME, load_shard_index, pack_append
 
-    wave_dir = f"/tokens/waves/wave_{wave_id}"
+    root = f"/tokens/{data_subdir}" if data_subdir else "/tokens"
+    wave_dir = f"{root}/waves/wave_{wave_id}"
     if next(Path(wave_dir).glob("*.pt"), None) is None:
         raise SystemExit(f"no .pt files in {wave_dir} — tokenize this wave first")
 
     # Match the existing pack's melody flag when a pack already exists; otherwise
     # (first wave) fall back to whether this wave actually has chroma.
-    packed_dir = Path("/tokens/packed")
+    packed_dir = Path(root) / "packed"
+
+    # DEPTH GUARD. A .pt filename is identical across codecs — only the tensor's
+    # codebook count differs (DAC 9 vs SpectroStream 24/32). Appending a wave whose
+    # depth disagrees with the existing pack silently produces a mixed, unusable
+    # corpus, and the packer would not notice. This is the backstop against a
+    # mis-rooted run appending one codec's tokens into the other codec's pack.
+    if (packed_dir / SHARD_INDEX_NAME).exists():
+        import torch
+
+        _probe = next(Path(wave_dir).glob("*.pt"))
+        _wave_k = int(torch.load(_probe, weights_only=True, map_location="cpu").shape[0])
+        _pack_k = int(load_shard_index(packed_dir)["n_codebooks"])
+        if _wave_k != _pack_k:
+            raise SystemExit(
+                f"DEPTH GUARD: {packed_dir} stores n_codebooks={_pack_k} but wave "
+                f"{wave_id} has {_wave_k} ({_probe.name}). Appending would corrupt "
+                f"the pack irreversibly.\n"
+                f"Almost certainly a --data-subdir / NANO_CODEC mismatch: this wave "
+                f"was tokenized with a different codec than the pack it is being "
+                f"appended to."
+            )
+
     existing_has_melody = None
     if (packed_dir / SHARD_INDEX_NAME).exists():
         existing_has_melody = bool(load_shard_index(packed_dir).get("has_melody", False))
-    wave_mel_dir = f"/melody/waves/wave_{wave_id}"
+    wave_mel_dir = (f"/melody/{data_subdir}/waves/wave_{wave_id}" if data_subdir
+                    else f"/melody/waves/wave_{wave_id}")
     wave_has_mel = next(Path(wave_mel_dir).glob("*.mel.npy"), None) is not None
     want_melody = (
         existing_has_melody if existing_has_melody is not None
@@ -159,7 +190,8 @@ def pack_append_remote(
     existing_has_stems = None
     if (packed_dir / SHARD_INDEX_NAME).exists():
         existing_has_stems = bool(load_shard_index(packed_dir).get("has_stems", False))
-    wave_stem_dir = f"/stems/waves/wave_{wave_id}"
+    wave_stem_dir = (f"/stems/{data_subdir}/waves/wave_{wave_id}" if data_subdir
+                     else f"/stems/waves/wave_{wave_id}")
     wave_has_stems = next(Path(wave_stem_dir).glob("*.stems.npy"), None) is not None
     want_stems = (
         existing_has_stems if existing_has_stems is not None
@@ -172,7 +204,7 @@ def pack_append_remote(
 
     out_dir = pack_append(
         wave_dir,
-        "/tokens/packed",
+        str(packed_dir),
         shard_target_songs=shard_target_songs,
         n_workers=n_workers,
         verbose=True,
@@ -188,6 +220,7 @@ def pack_append_remote(
 def main(
     shard_target_songs: int = 5_000, n_workers: int = 16, melody: bool = True,
     stems: bool = True, append: bool = False, wave_id: str = "",
+    data_subdir: str = "",
 ):
     if append:
         if not wave_id:
@@ -195,6 +228,7 @@ def main(
         fc = pack_append_remote.spawn(
             wave_id=wave_id, shard_target_songs=shard_target_songs,
             n_workers=n_workers, melody=melody, stems=stems,
+            data_subdir=data_subdir,
         )
         print(f"pack-append launched (detached) for wave {wave_id} "
               f"-- function call id: {fc.object_id}")

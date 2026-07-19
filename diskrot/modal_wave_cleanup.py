@@ -44,7 +44,8 @@ corpus_vol = corpus_mount(read_only=False)  # R2 bucket; only mounted for --drop
     volumes={"/tokens": tokens_vol, "/melody": melody_vol, "/stems": stems_vol,
              "/corpus": corpus_vol},
 )
-def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) -> int:
+def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False,
+                   data_subdir: str = "") -> int:
     """Delete wave ``wave_id``'s ``.pt`` (+ ``.mel.npy`` + ``.stems.npy``, optionally
     raw ``.mp3``) and remove the now-empty wave dirs. Returns files deleted."""
     from pathlib import Path
@@ -52,15 +53,23 @@ def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) ->
     from diskrot.pack_cache import SHARD_INDEX_NAME
 
     sub = f"waves/wave_{wave_id}"
-    pt_dir = Path("/tokens") / sub
-    mel_dir = Path("/melody") / sub
-    stem_dir = Path("/stems") / sub
+    # Codec isolation: the .pt/.mel.npy/.stems.npy intermediates live under the
+    # per-codec root. The mp3 dir NEVER moves — the corpus is shared by every
+    # codec, which is also why --drop-mp3 must not be used on a second-codec pass.
+    def _root(mount: str) -> Path:
+        return Path(mount) / data_subdir if data_subdir else Path(mount)
+
+    pt_dir = _root("/tokens") / sub
+    mel_dir = _root("/melody") / sub
+    stem_dir = _root("/stems") / sub
     mp3_dir = Path("/corpus") / sub
 
     # Safety: never discard intermediates that were never folded into shards.
     # The orchestrator already sequences cleanup AFTER pack_append, but a stray
     # manual invocation must fail loudly rather than lose tokens.
-    packed_index = Path("/tokens/packed") / SHARD_INDEX_NAME
+    # Must validate against THIS codec's pack — checking /tokens/packed while
+    # cleaning /tokens/<subdir> would green-light deleting un-packed tokens.
+    packed_index = _root("/tokens") / "packed" / SHARD_INDEX_NAME
     if not packed_index.exists():
         raise SystemExit(
             f"refusing cleanup: no packed index at {packed_index} — pack_append "
@@ -103,7 +112,15 @@ def cleanup_remote(wave_id: str, apply: bool = False, drop_mp3: bool = False) ->
 
 
 @app.local_entrypoint()
-def main(wave_id: str = "", apply: bool = False, drop_mp3: bool = False):
+def main(wave_id: str = "", apply: bool = False, drop_mp3: bool = False,
+         data_subdir: str = ""):
     if not wave_id:
         raise SystemExit("--wave-id is required (e.g. --wave-id 17)")
-    cleanup_remote.remote(wave_id=wave_id, apply=apply, drop_mp3=drop_mp3)
+    if drop_mp3 and data_subdir:
+        raise SystemExit(
+            "refusing --drop-mp3 with --data-subdir: the corpus mp3s are shared "
+            "across codecs, so deleting them would strand every OTHER codec's "
+            "corpus (and any wave not yet tokenized)."
+        )
+    cleanup_remote.remote(wave_id=wave_id, apply=apply, drop_mp3=drop_mp3,
+                          data_subdir=data_subdir)

@@ -9,6 +9,7 @@ providing the per-rank ``local_rank``. The Modal entrypoint wires this up via
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import random as _rng
@@ -1163,22 +1164,62 @@ def train_run(
                 chunk_index[desc] = text_encoder.chunk_text(desc)
             unique_chunks = sorted({c for chunks in chunk_index.values() for c in chunks})
             if unique_chunks:
-                if main:
-                    print(f"pre-computing CLAP embeddings for {len(unique_chunks)} unique "
-                          f"chunks ({len(unique_descs)} descriptions)...", flush=True)
-                t0_clap = time.time()
-                with torch.no_grad():
-                    for i, chunk in enumerate(unique_chunks):
-                        emb = text_encoder._clap.get_text_embeddings([chunk])  # [1, 1024]
-                        tag_cache[chunk] = emb.squeeze(0).to(cfg.device)        # [1024]
-                        if main and (i + 1) % 500 == 0:
-                            elapsed = time.time() - t0_clap
-                            rate = (i + 1) / max(elapsed, 1e-6)
-                            eta = (len(unique_chunks) - i - 1) / max(rate, 1e-6)
-                            print(f"  CLAP precompute: {i+1}/{len(unique_chunks)} "
-                                  f"({rate:.0f}/s, ETA {eta:.0f}s)", flush=True)
-                if main:
-                    print(f"cached {len(tag_cache)} chunk embeddings", flush=True)
+                import hashlib
+
+                # Disk cache beside the run dirs (nano-ckpts on Modal — committed
+                # via ckpt_callback, unlike the read-mostly tokens volume), keyed
+                # by the chunk SET: any corpus/tag change gets a fresh key. At
+                # corpus scale the un-batched encode was ~68/s → 7.5 h of idle
+                # GPU per launch; batched is ~20-30 min once, then loads in ~1 min.
+                cache_key = hashlib.sha256(
+                    "\x00".join(unique_chunks).encode("utf-8", "surrogatepass")
+                ).hexdigest()[:16]
+                cache_file = (Path(cfg.ckpt_dir).parent
+                              / f"clap_chunk_cache_{cache_key}.pt")
+                if cache_file.exists():
+                    blob = torch.load(cache_file, map_location="cpu")
+                    for k, row in zip(blob["keys"], blob["emb"].float()):
+                        tag_cache[k] = row.to(cfg.device)
+                    if main:
+                        print(f"loaded {len(tag_cache)} CLAP chunk embeddings from "
+                              f"{cache_file.name}", flush=True)
+                else:
+                    if main:
+                        print(f"pre-computing CLAP embeddings for {len(unique_chunks)} unique "
+                              f"chunks ({len(unique_descs)} descriptions)...", flush=True)
+                    t0_clap = time.time()
+                    BATCH = 512 if cfg.device == "cuda" else 64
+                    autocast_ctx = (
+                        torch.autocast("cuda", dtype=torch.bfloat16)
+                        if cfg.device == "cuda" else contextlib.nullcontext()
+                    )
+                    with torch.no_grad(), autocast_ctx:
+                        for start in range(0, len(unique_chunks), BATCH):
+                            batch_chunks = unique_chunks[start:start + BATCH]
+                            embs = text_encoder._clap.get_text_embeddings(batch_chunks)
+                            embs = embs.float()
+                            for c, e in zip(batch_chunks, embs):
+                                tag_cache[c] = e.to(cfg.device)
+                            done = start + len(batch_chunks)
+                            if main and (done % (BATCH * 8) == 0 or done == len(unique_chunks)):
+                                elapsed = time.time() - t0_clap
+                                rate = done / max(elapsed, 1e-6)
+                                eta = (len(unique_chunks) - done) / max(rate, 1e-6)
+                                print(f"  CLAP precompute: {done}/{len(unique_chunks)} "
+                                      f"({rate:.0f}/s, ETA {eta:.0f}s)", flush=True)
+                    if main:
+                        # Atomic save (tmp+rename) as one stacked fp16 tensor +
+                        # key list — a 1.8M-entry dict of tensors pickles badly.
+                        keys = sorted(tag_cache.keys())
+                        emb = torch.stack([tag_cache[k].detach().cpu() for k in keys]).half()
+                        tmp = cache_file.with_suffix(".tmp")
+                        cache_file.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save({"keys": keys, "emb": emb}, tmp)
+                        os.replace(tmp, cache_file)
+                        print(f"cached {len(tag_cache)} chunk embeddings "
+                              f"(saved {cache_file.name})", flush=True)
+                        if ckpt_callback is not None:
+                            ckpt_callback()
         # Fixed cross-attn width = the corpus's max chunk count (>=1). A terse-tag
         # corpus yields 1 -> identical to the old single-vector path; the same on
         # every rank (same data) so the regional-compiled graph matches.

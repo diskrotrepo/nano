@@ -265,6 +265,35 @@ class InferenceEngine:
                   f"vocab_per_codebook={cfg.vocab_per_codebook}")
             print(f"[inference] model: {self.model.num_params()/1e6:.2f}M params on {self.device}")
 
+            # From-scratch bootstrap seed: ~1s of ENCODED-SILENCE tokens instead of
+            # _resolve_prompt's uniform-random column. The random seed frame sits
+            # far off the training manifold; at K=24/25Hz it poisons the whole
+            # rollout (from-scratch beat ~0.15) and the poison spans the entire
+            # 23-frame delay ramp. A full-ramp silence runway restores structure
+            # (beat ~0.48, matching real-context /extend at 0.52 — 2026-07-13 A/B;
+            # a 1-frame silence seed does NOT help, the ramp must be covered).
+            # v8-era history: a DAC silence seed was removed for collapsing
+            # high-energy prompts to silence — the v9 A/B showed no collapse
+            # (techno cfg5: RMS 0.087, 0% silent frames), so it returns for v9.
+            # Torch backend only; failure degrades to the legacy random seed.
+            self._silence_seed: torch.Tensor | None = None
+            if self.backend == "torch":
+                try:
+                    n_ch = getattr(self.codec, "N_CHANNELS", 1)
+                    n_seed = self.model.cfg.n_codebooks + 1  # cover the delay ramp
+                    sil = torch.zeros(n_ch, int(self.codec.SAMPLE_RATE * 1.5))
+                    seed = self.codec.encode(sil)
+                    if seed.dim() == 3:
+                        seed = seed[0]
+                    self._silence_seed = (
+                        seed[: self.model.cfg.n_codebooks, :n_seed].cpu().long()
+                    )
+                    print(f"[inference] bootstrap seed: encoded silence "
+                          f"({self._silence_seed.shape[1]} frames)")
+                except Exception as e:  # noqa: BLE001 — seed is an enhancement, not load-bearing
+                    print(f"[inference] bootstrap seed unavailable ({type(e).__name__}: {e}); "
+                          "falling back to random seed frame")
+
             # load text encoder if model was trained with text conditioning
             if cfg.use_text_conditioning:
                 self.text_encoder = CLAPTextEncoder(d_out=cfg.d_model, device=self.device)
@@ -657,9 +686,10 @@ class InferenceEngine:
         max_total = self.model.cfg.max_seq_len - K + 1
 
         melody = self._build_melody(melody_audio_bytes)  # [1, T, 12]
-        # prompt=None adds a single seed frame (T_prompt=1), so the melody (placed
-        # at the new-frame positions) can be at most max_total - 1 frames.
-        new_frames = min(melody.shape[1], max_total - 1)
+        # The seed runway occupies T_prompt frames, so the melody (placed at the
+        # new-frame positions) can be at most max_total - seed_frames frames.
+        seed_tokens, seed_frames = self._bootstrap()
+        new_frames = min(melody.shape[1], max_total - seed_frames)
         if new_frames <= 0:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
@@ -668,7 +698,7 @@ class InferenceEngine:
             text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
-            prompt=None, num_new_frames=new_frames,
+            prompt=seed_tokens, num_new_frames=new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=cond_emb, text_emb_neg=neg_emb,
             lyric_ids=cond_lids, lyric_mask=cond_lmask,
@@ -676,9 +706,9 @@ class InferenceEngine:
             cfg_scale=cfg_scale,
             lyric_cfg_scale=lyric_cfg_scale,
             melody=melody, melody_cfg_scale=melody_cfg_scale,
-        )  # [K, 1 + new_frames]
+        )  # [K, seed_frames + new_frames]
 
-        out_tokens = out_tokens[:, 1:]  # strip the seed frame
+        out_tokens = out_tokens[:, seed_frames:]  # strip the seed runway
         wav = self.codec.decode(out_tokens.cpu())
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)
@@ -827,18 +857,18 @@ class InferenceEngine:
         ``text`` and returns it as a third element: (audio_bytes, mime, clap).
         Default stays a 2-tuple so existing callers are unaffected.
 
-        The autoregressive loop is bootstrapped from a single column of random
-        DAC tokens (model.generate picks a fresh seed per call). With the current
-        tight sampling + CFG this produces coherent output the prompt can steer in
-        any direction. (A silence-seed mode existed once but only worked for quiet
-        prompts and collapsed high-energy ones to silence, so it was removed.)
+        The autoregressive loop is bootstrapped from a ~1s runway of encoded-
+        silence tokens (see ``_bootstrap``): the legacy single random seed column
+        sits far off the training manifold and at K=24/25Hz poisons the whole
+        rollout (2026-07-13 A/B: beat ~0.15 random vs ~0.48 silence-seeded). The
+        v8-era silence seed was removed for collapsing high-energy prompts to
+        silence; the v9 A/B showed no such collapse (techno cfg5 RMS 0.087), but
+        watch for it on quiet prompts.
         """
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1  # T_total such that T_total + K - 1 <= max_seq_len
 
-        # Pass None so model.generate() picks a fresh random seed per call.
-        seed_tokens = None
-        seed_frames = 1
+        seed_tokens, seed_frames = self._bootstrap()
 
         new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
         if seed_frames + new_frames > max_total:
@@ -929,7 +959,7 @@ class InferenceEngine:
         B = len(requests)
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
-        seed_frames = 1
+        seed_tokens, seed_frames = self._bootstrap()
         new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
         if seed_frames + new_frames > max_total:
             new_frames = max(0, max_total - seed_frames)
@@ -945,7 +975,10 @@ class InferenceEngine:
         cond_emb, cond_tkv, cond_lids, cond_lmask = self._stack_conditioning(pos)
         neg_emb, neg_tkv, neg_lids, neg_lmask = self._stack_conditioning(neg)
 
-        prompt, _ = self.model._resolve_prompt(None, batch_size=B)  # [B, K, 1]
+        if seed_tokens is not None:
+            prompt = seed_tokens.unsqueeze(0).expand(B, -1, -1).contiguous()
+        else:
+            prompt, _ = self.model._resolve_prompt(None, batch_size=B)  # [B, K, 1]
         has_cond = any(
             x is not None for x in (cond_emb, neg_emb, cond_lids, neg_lids)
         )
@@ -985,6 +1018,15 @@ class InferenceEngine:
         the packed corpus), so every audio-prompt path must take the prefix or
         generate()'s K assertion trips."""
         return self.codec.encode(wav)[: self.model.cfg.n_codebooks]
+
+    def _bootstrap(self) -> tuple[torch.Tensor | None, int]:
+        """From-scratch seed: (silence tokens [K, T] on device, T), or (None, 1)
+        when the silence seed is unavailable (model.generate then falls back to
+        its legacy random column). The runway covers the full K-1 delay ramp —
+        a 1-frame seed measurably does NOT restore bootstrap coherence."""
+        if self._silence_seed is None:
+            return None, 1
+        return self._silence_seed.to(self.device), int(self._silence_seed.shape[1])
 
     def _load_wav(self, path: str) -> torch.Tensor:
         """Load an uploaded clip to ``[C, samples]`` matching the codec's channel
@@ -1167,15 +1209,17 @@ class InferenceEngine:
         is bit-identical to ``generate``; see ``_stream_mp3`` for the topology."""
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
+        seed_tokens, seed_frames = self._bootstrap()
         new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
-        if 1 + new_frames > max_total:  # +1 seed frame
-            new_frames = max(0, max_total - 1)
+        if seed_frames + new_frames > max_total:
+            new_frames = max(0, max_total - seed_frames)
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
         cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
-        prompt, _ = self.model._resolve_prompt(None)  # random seed frame [1, K, 1]
+        prompt = (seed_tokens.unsqueeze(0) if seed_tokens is not None
+                  else self.model._resolve_prompt(None)[0])  # [1, K, T_seed]
         meta = self._gen_metadata(
             "generate", text=text, negative_text=negative_text,
             temperature=temperature, top_k=top_k, top_p=top_p,
@@ -1301,14 +1345,16 @@ class InferenceEngine:
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
         melody = self._build_melody(melody_audio_bytes)  # [1, T, 12]
-        new_frames = min(melody.shape[1], max_total - 1)
+        seed_tokens, seed_frames = self._bootstrap()
+        new_frames = min(melody.shape[1], max_total - seed_frames)
         if new_frames <= 0:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
 
         cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
-        prompt, _ = self.model._resolve_prompt(None)  # seed frame; chroma drives contour
+        prompt = (seed_tokens.unsqueeze(0) if seed_tokens is not None
+                  else self.model._resolve_prompt(None)[0])  # seed runway; chroma drives contour
         meta = self._gen_metadata(
             "cover", text=text, negative_text=negative_text,
             temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,

@@ -44,16 +44,20 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     retries=modal.Retries(max_retries=5, backoff_coefficient=1.0, initial_delay=5.0),
     volumes={"/tokens": tokens_vol},
 )
-def detect_remote():
+def detect_remote(data_subdir: str = ""):
     from diskrot.key_detect import detect_keys
 
-    out = detect_keys("/tokens", verbose=True, commit_cb=tokens_vol.commit)
+    # Keys are derived from the PACKED CHROMA sidecar, so they are frame-rate
+    # specific and must be regenerated per codec. detect_keys derives both
+    # <root>/packed and <root>/keys.json from this one arg.
+    root = f"/tokens/{data_subdir}" if data_subdir else "/tokens"
+    out = detect_keys(root, verbose=True, commit_cb=tokens_vol.commit)
     tokens_vol.commit()  # idempotent safety net
     print(f"[done] keys written to {out}", flush=True)
 
 
 @app.local_entrypoint()
-def main():
-    fc = detect_remote.spawn()
+def main(data_subdir: str = ""):
+    fc = detect_remote.spawn(data_subdir=data_subdir)
     print(f"key detection launched (detached) -- function call id: {fc.object_id}")
     print("monitor with: modal app logs nano-key-detect")

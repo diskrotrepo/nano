@@ -91,6 +91,18 @@ def ingest_wave(
     with_dedup: bool = True,
     with_filter: bool = True,
     with_align: bool = True,
+    # prepare MUTATES the shared R2 corpus (apply=True; the quality gate DELETES
+    # clipped/silent/low-bitrate mp3s). On a re-codec pass the corpus is already
+    # prepared, so re-running is at best wasted hours and at worst deletes audio
+    # the OTHER codec's pack still references. Off for any such pass.
+    with_prepare: bool = True,
+    # key_detect sweeps every .mel.bin (O(corpus) per call), so a 14-wave ingest
+    # should run it ONCE at the end rather than per wave.
+    with_key_detect: bool = True,
+    # Codec isolation: re-roots tokens/melody/stems/pack/status under
+    # /tokens/<data_subdir>. The shared conditioning stores (tags/lyrics/
+    # phonemes/structure/tempo) and the corpus itself are NOT re-rooted.
+    data_subdir: str = "",
     align_use_demucs: bool = False,
     structure_sample_pct: int = 50,
     stems_sample_pct: int = 50,
@@ -99,7 +111,8 @@ def ingest_wave(
     import os
     from pathlib import Path
 
-    status_dir = Path("/tokens/waves") / f"wave_{wave_id}"
+    status_dir = (Path("/tokens") / data_subdir / "waves" / f"wave_{wave_id}"
+                  if data_subdir else Path("/tokens/waves") / f"wave_{wave_id}")
     status_dir.mkdir(parents=True, exist_ok=True)
     status_path = status_dir / "status.json"
 
@@ -153,7 +166,7 @@ def ingest_wave(
     # command) instead of mid-pipeline, after prepare/dedup have already burned
     # hours. Skips stages already marked done (a resume won't call them).
     _required = [
-        ("prepare", "nano-prepare", "run_prepare"),
+        *([("prepare", "nano-prepare", "run_prepare")] if with_prepare else []),
         *([("audio_dedup", "nano-audio-dedup", "run_dedup")] if with_dedup else []),
         ("tokenize", "nano-tokenize", "run_tokenize"),
         *([("melody", "nano-melody", "orchestrate")] if with_melody else []),
@@ -169,7 +182,7 @@ def ingest_wave(
         ("pack", "nano-pack", "pack_append_remote"),
         ("cleanup", "nano-wave-cleanup", "cleanup_remote"),
         *([("phonemize", "nano-phonemize", "phonemize_remote")] if with_lyrics else []),
-        ("key_detect", "nano-key-detect", "detect_remote"),
+        *([("key_detect", "nano-key-detect", "detect_remote")] if with_key_detect else []),
     ]
     _missing: list[str] = []
     for _stage, _app, _fn in _required:
@@ -196,17 +209,24 @@ def ingest_wave(
     # CPU/GPU stages serialized by the blocking .remote() calls above.
     # prepare: validate/dedupe/length-drop (+ optional content quality gate). The
     # quality gate decodes each file (clip/silence/bitrate) and drops garbage.
-    run("prepare", "nano-prepare", "run_prepare",
-        apply=True, wave_id=wave_id, quality_gate=with_quality_gate)
+    if with_prepare:
+        run("prepare", "nano-prepare", "run_prepare",
+            apply=True, wave_id=wave_id, quality_gate=with_quality_gate)
+    else:
+        print(f"[wave {wave_id}] SKIP prepare (--no-with-prepare): corpus already "
+              f"prepared; re-running would re-scan and could DELETE mp3s another "
+              f"codec's pack references", flush=True)
     if with_dedup:
         # Acoustic near-dup removal BEFORE tokenize so we never tokenize a re-upload
         # SHA-256 missed. Deletes the non-keeper copies (apply=True), like prepare.
         # The fingerprint manifest is global, so cross-wave dups are caught too.
         run("audio_dedup", "nano-audio-dedup", "run_dedup", apply=True, wave_id=wave_id)
     run("tokenize", "nano-tokenize", "run_tokenize",
-        min_seconds=min_seconds, batch_size=tokenize_batch, wave_id=wave_id)
+        min_seconds=min_seconds, batch_size=tokenize_batch, wave_id=wave_id,
+        data_subdir=data_subdir)
     if with_melody:
-        run("melody", "nano-melody", "orchestrate", wave_id=wave_id)
+        run("melody", "nano-melody", "orchestrate", wave_id=wave_id,
+            data_subdir=data_subdir)
     if with_stems:
         # Demucs all 4 stems + codec-tokenize each -> nano-stems (the /addstem
         # conditioning). GPU stage; needs the .pt frame count, so after tokenize,
@@ -251,14 +271,19 @@ def ingest_wave(
         # markers at 100% — the dataset prefers this tempo.json over the structure
         # bpm. Only needs /corpus, so its order vs structure doesn't matter.
         run("tempo", "nano-tempo", "orchestrate", wave_id=wave_id)
-    run("pack", "nano-pack", "pack_append_remote", wave_id=wave_id)
+    run("pack", "nano-pack", "pack_append_remote", wave_id=wave_id,
+        data_subdir=data_subdir)
     # Cleanup AFTER pack (needs the wave's .pt/.mel.npy). phonemize/key_detect
     # read the lyrics shards / packed chroma, so they're safe to run after.
     run("cleanup", "nano-wave-cleanup", "cleanup_remote",
-        wave_id=wave_id, apply=True, drop_mp3=drop_mp3)
+        wave_id=wave_id, apply=True, drop_mp3=drop_mp3, data_subdir=data_subdir)
     if with_lyrics:
         run("phonemize", "nano-phonemize", "phonemize_remote")
-    run("key_detect", "nano-key-detect", "detect_remote")
+    if with_key_detect:
+        run("key_detect", "nano-key-detect", "detect_remote", data_subdir=data_subdir)
+    else:
+        print(f"[wave {wave_id}] SKIP key_detect (--no-with-key-detect): run it once "
+              f"after the final wave — it sweeps the whole corpus each call", flush=True)
     print(f"[wave {wave_id}] ALL STAGES COMPLETE", flush=True)
 
 
@@ -277,6 +302,9 @@ def main(
     with_dedup: bool = True,
     with_filter: bool = True,
     with_align: bool = True,
+    with_prepare: bool = True,
+    with_key_detect: bool = True,
+    data_subdir: str = "",
     align_use_demucs: bool = False,
     structure_sample_pct: int = 50,
     stems_sample_pct: int = 50,
@@ -291,6 +319,8 @@ def main(
         with_structure=with_structure, with_tempo=with_tempo,
         with_quality_gate=with_quality_gate, with_dedup=with_dedup,
         with_filter=with_filter, with_align=with_align,
+        with_prepare=with_prepare, with_key_detect=with_key_detect,
+        data_subdir=data_subdir,
         align_use_demucs=align_use_demucs,
         structure_sample_pct=structure_sample_pct,
         stems_sample_pct=stems_sample_pct, drop_mp3=drop_mp3,
