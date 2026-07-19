@@ -287,6 +287,116 @@ def ingest_wave(
     print(f"[wave {wave_id}] ALL STAGES COMPLETE", flush=True)
 
 
+# Run a WHOLE corpus of waves back-to-back, unattended.
+#
+# Waves must be strictly sequential: each one's loose .pt/.mel.npy are reclaimed by
+# its cleanup stage before the next begins, which is what keeps the live loose-file
+# count under the ~500k-inode volume cap. Running two waves at once would blow it.
+#
+# 24h is Modal's ceiling and 13 waves is ~35h at measured pace, so this WILL be
+# killed mid-run. That's fine and by design: `retries` restarts it, and the
+# resume-by-status scan below skips every wave already carried through cleanup, so
+# a restart costs one re-scan rather than repeated work. That combination is what
+# makes this genuinely "kick it off and it runs until it's done".
+@app.function(
+    image=image, volumes={"/tokens": tokens_vol}, timeout=24 * 60 * 60,
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=30.0),
+)
+def ingest_waves(waves: list[str], **kwargs) -> dict:
+    import json
+    from pathlib import Path
+
+    data_subdir = kwargs.get("data_subdir", "")
+    root = Path("/tokens") / data_subdir if data_subdir else Path("/tokens")
+
+    def _complete(wid: str) -> bool:
+        """A wave is done when its LAST stage (cleanup) is marked done."""
+        p = root / "waves" / f"wave_{wid}" / "status.json"
+        if not p.exists():
+            return False
+        try:
+            return json.loads(p.read_text()).get("cleanup") == "done"
+        except Exception:  # noqa: BLE001 — an unreadable status means "not done"
+            return False
+
+    tokens_vol.reload()
+    todo = [w for w in waves if not _complete(w)]
+    done_already = [w for w in waves if w not in todo]
+    print(f"[all-waves] {len(waves)} requested; {len(done_already)} already complete "
+          f"{done_already}; {len(todo)} to run: {todo}", flush=True)
+
+    results: dict[str, str] = {w: "already-complete" for w in done_already}
+    consecutive_failures = 0
+    for i, wid in enumerate(todo, 1):
+        print(f"\n[all-waves] ===== wave {wid}  ({i}/{len(todo)}) =====", flush=True)
+        try:
+            ingest_wave.remote(wave_id=wid, **kwargs)
+            results[wid] = "ok"
+            consecutive_failures = 0
+            print(f"[all-waves] wave {wid} OK", flush=True)
+        except Exception as e:  # noqa: BLE001 — one bad wave shouldn't end the corpus
+            results[wid] = f"FAILED: {type(e).__name__}: {str(e)[:200]}"
+            consecutive_failures += 1
+            print(f"[all-waves] wave {wid} FAILED: {e}", flush=True)
+            # Two in a row is a systematic fault (bad deploy, wrong codec, missing
+            # corpus), not one unlucky wave. Stop rather than burn the remaining
+            # waves — and rather than let Modal's retries replay the same failure.
+            if consecutive_failures >= 2:
+                print("[all-waves] ABORT: 2 consecutive wave failures — this looks "
+                      "systematic, not incidental. Fix, then re-run: completed waves "
+                      "are skipped automatically.", flush=True)
+                break
+
+    print("\n[all-waves] ===== SUMMARY =====", flush=True)
+    for w in waves:
+        print(f"  wave {w:10s} {results.get(w, 'not attempted')}", flush=True)
+    failed = [w for w, r in results.items() if r.startswith("FAILED")]
+    if failed:
+        raise RuntimeError(f"waves failed: {failed}")
+    print("[all-waves] every requested wave is complete", flush=True)
+    return results
+
+
+@app.local_entrypoint()
+def run_all(
+    waves: str = "base_1,base_2,base_3,base_4,base_5,base_6,base_7,base_8,base_9,"
+                 "base_10,base_11,base_12,base_13",
+    data_subdir: str = "dac",
+    min_seconds: int = 20,
+    tokenize_batch: int = 64,
+):
+    """Ingest many waves back-to-back, unattended (use with --detach).
+
+    Defaults are the DAC re-tokenize shape: only the codec-specific stages run
+    (tokenize -> melody -> pack -> cleanup); every shared conditioning stage is
+    off, and prepare is off because the corpus is already prepared and re-running
+    it could DELETE mp3s the SpectroStream pack still references.
+    """
+    wave_list = [w.strip() for w in waves.split(",") if w.strip()]
+    if not wave_list:
+        raise SystemExit("--waves must be a non-empty comma-separated list")
+    fc = ingest_waves.spawn(
+        waves=wave_list,
+        data_subdir=data_subdir,
+        min_seconds=min_seconds,
+        tokenize_batch=tokenize_batch,
+        with_prepare=False,      # corpus already prepared; re-running can DELETE mp3s
+        with_dedup=False,
+        with_tags=False,         # tags/lyrics/phonemes/structure/tempo are shared and
+        with_lyrics=False,       # already copied under the data_subdir — recomputing
+        with_structure=False,    # them would cost the whole original ingest again
+        with_tempo=False,
+        with_stems=False,
+        with_key_detect=False,   # O(corpus) per call — run once after the last wave
+        drop_mp3=False,          # mp3s are shared across codecs; never drop them here
+    )
+    print(f"multi-wave ingest launched (detached) — {len(wave_list)} waves: {wave_list}")
+    print(f"function call id: {fc.object_id}")
+    print("monitor: modal app logs nano-ingest-wave")
+    print(f"after it finishes, run key_detect ONCE:\n"
+          f"  modal run diskrot/modal_key_detect.py --data-subdir {data_subdir}")
+
+
 @app.local_entrypoint()
 def main(
     wave_id: str = "",

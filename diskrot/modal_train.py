@@ -267,6 +267,53 @@ DEFAULTS = {
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 4 (global 32 on 8 ranks)
 
 
+def _assert_codec_matches_pack(root: str) -> None:
+    """Refuse to train if NANO_CODEC disagrees with the pack's actual codec.
+
+    This closes the worst silent failure in the project. The frame rate is resolved
+    from the ENV at module scope (``dataset.py`` ``_FRAME_RATE_HZ``), never from the
+    data, and the pack index records no codec. So pointing a SpectroStream-configured
+    run (25 Hz) at a DAC pack (86 Hz) trains happily on temporally scrambled
+    conditioning: every structure/tempo/key marker and every vocal-biased crop lands
+    at the wrong time, val loss looks fine, and the output is quietly garbage.
+
+    The existing depth guard does NOT catch it — with ``--n-codebooks 9`` against a
+    9-codebook DAC pack, ``stored_k < model_k`` is false and the run proceeds.
+
+    Codebook depth identifies the codec unambiguously: DAC is always exactly 9;
+    SpectroStream stores 24 or 32. That is enough to verify the env without any
+    change to the pack format (so it works on packs already written).
+    """
+    import os
+    from pathlib import Path
+
+    from diskrot.pack_cache import SHARD_INDEX_NAME, load_shard_index
+
+    packed_dir = Path(root) / "packed"
+    if not (packed_dir / SHARD_INDEX_NAME).exists():
+        return  # no pack yet (e.g. a loose-.pt run) — nothing to cross-check
+
+    stored_k = int(load_shard_index(packed_dir)["n_codebooks"])
+    pack_codec = "dac" if stored_k == 9 else "spectrostream"
+    env_codec = "spectrostream" if os.environ.get(
+        "NANO_CODEC", "dac").lower() in ("spectrostream", "ss") else "dac"
+    if pack_codec != env_codec:
+        want_rate, got_rate = (86, 25) if pack_codec == "dac" else (25, 86)
+        raise SystemExit(
+            f"CODEC MISMATCH: the pack at {packed_dir} stores {stored_k} codebooks "
+            f"(= {pack_codec}, {want_rate} Hz), but NANO_CODEC={env_codec} "
+            f"({got_rate} Hz).\n"
+            f"Training would apply {got_rate} Hz timing to {want_rate} Hz tokens — "
+            f"every structure/tempo/key marker and crop would land at the wrong "
+            f"time, and NOTHING else would raise.\n"
+            f"Fix: export NANO_CODEC={pack_codec} before `modal run` "
+            f"(it is baked into the image from your shell), or point --data-subdir "
+            f"at the {env_codec} pack."
+        )
+    print(f"[guard] codec OK: pack={pack_codec} ({stored_k} cb) matches "
+          f"NANO_CODEC={env_codec}", flush=True)
+
+
 def _build_cfg_kwargs(
     steps: int, batch_size: int, lr: float, warmup_steps: int,
     patience: int, eval_batches: int, ckpt_subdir: str, text_conditioned: bool,
@@ -299,6 +346,7 @@ def _build_cfg_kwargs(
     conditioning path under /tokens/{data_subdir}, so a fine-tune corpus can
     be packed beside the main one (same layout, one directory down)."""
     root = f"/tokens/{data_subdir}" if data_subdir else "/tokens"
+    _assert_codec_matches_pack(root)
     tags_path = f"{root}/tags.json" if text_conditioned else None
     lyrics_path = f"{root}/lyrics" if text_conditioned else None
     structure_path = f"{root}/structure" if text_conditioned else None
