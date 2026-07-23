@@ -216,7 +216,10 @@ _ss_image = (
 
 _dac_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
+    # espeak-ng: v10's lyric path phonemizes request lyrics via the `phonemizer`
+    # lib (espeak backend) to IPA — without it every lyrics= request 500s
+    # (g2p_en is the retired v8 English-only path, kept only as a fallback).
+    .apt_install("ffmpeg", "libsndfile1", "espeak-ng", "libespeak-ng1")
     .pip_install(
         "torch>=2.4",
         "torchaudio>=2.4",
@@ -233,7 +236,9 @@ _dac_image = (
         # weight-only int8/int4 quantization for the CUDA path (NANO_BITS=8|4);
         # only imported when NANO_BITS selects a quantized mode.
         "torchao>=0.7",
-        # phonemizes request lyrics for the v8 lyric conditioning path.
+        # v10 lyric conditioning: espeak-backed IPA phonemizer (primary path)
+        # plus g2p_en as the retired-v8 fallback.
+        "phonemizer>=3.2",
         "g2p_en==2.1.0",
     )
     # Match modal_train.py's protobuf intersection (descript-audiotools pins

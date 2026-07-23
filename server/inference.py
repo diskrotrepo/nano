@@ -276,8 +276,15 @@ class InferenceEngine:
             # high-energy prompts to silence — the v9 A/B showed no collapse
             # (techno cfg5: RMS 0.087, 0% silent frames), so it returns for v9.
             # Torch backend only; failure degrades to the legacy random seed.
+            # SPECTROSTREAM-ONLY: on DAC the silence runway re-created the exact
+            # v8-era collapse (2026-07-22, v10_dac_2b: 100% silence at every
+            # cfg 1-10, both modes, steps 58k/84k/87k; the same checkpoint
+            # /extend-s real audio fine and makes bursty audio from the legacy
+            # random seed). DAC's silence attractor is too strong — never seed
+            # a DAC rollout with encoded silence.
             self._silence_seed: torch.Tensor | None = None
-            if self.backend == "torch":
+            _is_ss = type(self.codec).__name__.startswith("SpectroStream")
+            if self.backend == "torch" and _is_ss:
                 try:
                     n_ch = getattr(self.codec, "N_CHANNELS", 1)
                     n_seed = self.model.cfg.n_codebooks + 1  # cover the delay ramp
@@ -293,6 +300,9 @@ class InferenceEngine:
                 except Exception as e:  # noqa: BLE001 — seed is an enhancement, not load-bearing
                     print(f"[inference] bootstrap seed unavailable ({type(e).__name__}: {e}); "
                           "falling back to random seed frame")
+            elif self.backend == "torch":
+                print("[inference] bootstrap seed: random (DAC — silence seed "
+                      "collapses DAC rollouts, SpectroStream-only)")
 
             # load text encoder if model was trained with text conditioning
             if cfg.use_text_conditioning:
