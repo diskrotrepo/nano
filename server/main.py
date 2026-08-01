@@ -317,6 +317,78 @@ def list_models() -> dict:
     return {"models": out, "default_model": DEFAULT_MODEL, "active_model": ACTIVE_MODEL}
 
 
+# ── Sampling presets ────────────────────────────────────────────────────────
+# Plain-language names for the per-codebook sampling shapes the sweeps rank
+# (eval/sweep/config.py + scripts/eval_sampling_sweep.py profiles). A preset
+# bundles the whole sampling shape (per-cb temperature/top_k ladders + top_p);
+# cfg_scale stays an independent "prompt strength" control. The `preset`
+# request field, when set, replaces the temperature/top_k/top_p params — the
+# advanced per-cb fields only apply when preset is empty (or "custom").
+SAMPLING_PRESETS: dict[str, dict] = {
+    "balanced": {  # = the sweep's default_ladder — the server's long-time default
+        "label": "Balanced",
+        "description": "Good middle ground between clean and varied. The default.",
+        "per_cb_temperature": "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42",
+        "per_cb_top_k": "120,90,70,50,36,26,18,12,8",
+        "top_p": 0.95,
+    },
+    "steady": {  # = user_ladder — the 2026-07 v10 sweep's cross-genre winner
+        "label": "Steady",
+        "description": "Cleaner and more consistent — a tighter groove with fewer surprises.",
+        "per_cb_temperature": "0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3",
+        "per_cb_top_k": "120,90,70,50,36,26,18,12,8",
+        "top_p": 0.95,
+    },
+    "safe": {  # = tight_ladder
+        "label": "Extra safe",
+        "description": "The most predictable, polished sound. Can get repetitive.",
+        "per_cb_temperature": "0.8,0.7,0.6,0.5,0.45,0.4,0.35,0.3,0.25",
+        "per_cb_top_k": "100,70,50,36,26,18,12,8,6",
+        "top_p": 0.95,
+    },
+    "adventurous": {  # = open_flat
+        "label": "Adventurous",
+        "description": "The loosest and most surprising. More variety, more rough edges.",
+        "per_cb_temperature": "0.95",
+        "per_cb_top_k": "80",
+        "top_p": 0.95,
+    },
+}
+DEFAULT_PRESET = "balanced"
+
+
+def _resolve_preset(
+    preset: str, per_cb_temperature: str, per_cb_top_k: str,
+    per_cb_top_p: str, top_p: float,
+) -> tuple[str, str, str, float]:
+    """Map a named preset onto the sampling params. Empty/"custom" keeps the
+    caller's own values (back-compat + the advanced panel); unknown -> 400."""
+    p = (preset or "").strip().lower()
+    if not p or p == "custom":
+        return per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p
+    if p not in SAMPLING_PRESETS:
+        raise HTTPException(
+            400, f"unknown preset {preset!r} — one of {sorted(SAMPLING_PRESETS)} or 'custom'")
+    d = SAMPLING_PRESETS[p]
+    return d["per_cb_temperature"], d["per_cb_top_k"], "", d["top_p"]
+
+
+@app.get("/presets")
+def list_presets() -> dict:
+    """The sampling presets the `preset` request field accepts. UIs populate
+    their picker from this (label + description are user-facing copy)."""
+    return {
+        "presets": [
+            {"id": k, "label": v["label"], "description": v["description"],
+             "default": k == DEFAULT_PRESET,
+             "per_cb_temperature": v["per_cb_temperature"],
+             "per_cb_top_k": v["per_cb_top_k"], "top_p": v["top_p"]}
+            for k, v in SAMPLING_PRESETS.items()
+        ],
+        "default_preset": DEFAULT_PRESET,
+    }
+
+
 @app.post("/generate")
 async def generate_endpoint(
     seconds: float = Form(30.0),
@@ -328,6 +400,7 @@ async def generate_endpoint(
     per_cb_temperature: str = Form("1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"),
     per_cb_top_k: str = Form("120,90,70,50,36,26,18,12,8"),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(7.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -360,6 +433,8 @@ async def generate_endpoint(
         better than a single temperature applied across all 9.
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     style_bytes = (await style_audio.read()) if style_audio else None
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
@@ -430,6 +505,7 @@ class BatchRequest(BaseModel):
     per_cb_temperature: str = "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"
     per_cb_top_k: str = "120,90,70,50,36,26,18,12,8"
     per_cb_top_p: str = ""
+    preset: str = ""
     cfg_scale: float = 7.0
     lyric_cfg_scale: float = 8.0
     sweeten: bool = True
@@ -498,13 +574,15 @@ def generate_batch_endpoint(req: BatchRequest) -> dict:
         manifest[i]["audio_b64"] = base64.b64encode(body).decode("ascii")
         manifest[i]["file"] = name
 
+    b_temp, b_topk, b_topp_list, b_topp = _resolve_preset(
+        req.preset, req.per_cb_temperature, req.per_cb_top_k, req.per_cb_top_p, req.top_p)
     try:
         engine.generate_audio_batch(
             gen_requests,
             seconds=req.seconds,
-            temperature=_parse_per_cb_temp(req.per_cb_temperature, req.temperature),
-            top_k=_parse_per_cb_topk(req.per_cb_top_k, req.top_k),
-            top_p=_parse_per_cb_topp(req.per_cb_top_p, req.top_p),
+            temperature=_parse_per_cb_temp(b_temp, req.temperature),
+            top_k=_parse_per_cb_topk(b_topk, req.top_k),
+            top_p=_parse_per_cb_topp(b_topp_list, b_topp),
             cfg_scale=req.cfg_scale,
             lyric_cfg_scale=req.lyric_cfg_scale or None,
             on_item=_on_item,
@@ -520,9 +598,11 @@ def generate_batch_endpoint(req: BatchRequest) -> dict:
 def _generate_stream_response(
     *, seconds, temperature, top_k, top_p, per_cb_temperature, per_cb_top_k,
     per_cb_top_p, cfg_scale, prompt, lyrics, gender, bpm, negative_prompt,
-    sweeten, lyric_cfg_scale, req_id, model,
+    sweeten, lyric_cfg_scale, req_id, model, preset="",
 ) -> StreamingResponse:
     """Shared body for the GET and POST /generate_stream endpoints."""
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     _get_engine(model)
     assert engine is not None
     if seconds <= 0:
@@ -561,6 +641,7 @@ def generate_stream_endpoint(
     per_cb_temperature: str = "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42",
     per_cb_top_k: str = "120,90,70,50,36,26,18,12,8",
     per_cb_top_p: str = "",
+    preset: str = "",
     cfg_scale: float = 7.0,
     prompt: str = "",
     lyrics: str = "",
@@ -592,6 +673,7 @@ def generate_stream_endpoint(
         per_cb_top_p=per_cb_top_p, cfg_scale=cfg_scale, prompt=prompt,
         lyrics=lyrics, gender=gender, bpm=bpm, negative_prompt=negative_prompt,
         sweeten=sweeten, lyric_cfg_scale=lyric_cfg_scale, req_id=req_id, model=model,
+        preset=preset,
     )
 
 
@@ -604,6 +686,7 @@ def generate_stream_post_endpoint(
     per_cb_temperature: str = Form("1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"),
     per_cb_top_k: str = Form("120,90,70,50,36,26,18,12,8"),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(7.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -624,6 +707,7 @@ def generate_stream_post_endpoint(
         per_cb_top_p=per_cb_top_p, cfg_scale=cfg_scale, prompt=prompt,
         lyrics=lyrics, gender=gender, bpm=bpm, negative_prompt=negative_prompt,
         sweeten=sweeten, lyric_cfg_scale=lyric_cfg_scale, req_id=req_id, model=model,
+        preset=preset,
     )
 
 
@@ -660,6 +744,7 @@ async def extend_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -684,6 +769,8 @@ async def extend_endpoint(
     repeatedly to chain a clip past the model's single-shot length cap.
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await audio.read()
     if not data:
@@ -724,6 +811,7 @@ async def cover_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -747,6 +835,8 @@ async def cover_endpoint(
     Requires a checkpoint trained with melody conditioning (use_melody_conditioning).
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await melody_audio.read()
     if not data:
@@ -785,6 +875,7 @@ async def extend_stream_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -800,6 +891,8 @@ async def extend_stream_endpoint(
     continuation as it's produced (progressive MSE playback; bypasses the 150s
     wall). The finished clip is saved to OUTPUT_DIR (fetch via /outputs/{req_id})."""
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await audio.read()
     if not data:
@@ -840,6 +933,7 @@ async def cover_stream_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -855,6 +949,8 @@ async def cover_stream_endpoint(
     """Streaming /cover: re-render the hum's melody in the prompt's timbre,
     streaming the result as it generates. Needs a melody-trained checkpoint."""
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await melody_audio.read()
     if not data:
@@ -895,6 +991,7 @@ async def infill_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     negative_prompt: str = Form(""),
@@ -913,6 +1010,8 @@ async def infill_endpoint(
     Requires a checkpoint trained with FIM (use_fim — a v8+ model).
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     before = await before_audio.read()
     after = await after_audio.read()
@@ -995,6 +1094,7 @@ async def addstem_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -1023,6 +1123,8 @@ async def addstem_endpoint(
     the `demucs` package.
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await audio.read()
     if not data:

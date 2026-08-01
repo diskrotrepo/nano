@@ -76,6 +76,7 @@ class _HomePageState extends State<HomePage> {
   // Available switchable checkpoints (from GET /models). The picker shows only
   // when there's more than one; `_params.model` holds the selection.
   List<String> _models = const [];
+  List<PresetInfo> _presets = PresetInfo.fallback;
 
   final List<GenClip> _clips = [];
   final ClipPlayer _player = ClipPlayer();
@@ -119,9 +120,19 @@ class _HomePageState extends State<HomePage> {
       } catch (_) {
         mi = null;
       }
+      // Sampling presets for the "sound style" dropdown (built-in fallback on
+      // older servers, so this never fails the health check).
+      final presets = await _api.presets();
       if (mounted) {
         setState(() {
           _health = h;
+          _presets = presets;
+          if (_params.preset != 'custom' &&
+              !presets.any((p) => p.id == _params.preset)) {
+            _params.preset = presets
+                .firstWhere((p) => p.isDefault, orElse: () => presets.first)
+                .id;
+          }
           _models = mi?.ids ?? const [];
           // Default the selection to the server's default when unset or stale.
           if (mi != null && (_params.model.isEmpty || !mi.ids.contains(_params.model))) {
@@ -488,6 +499,7 @@ class _HomePageState extends State<HomePage> {
       _header(),
       const SizedBox(height: 18),
       if (!isStem) _conditioningCard(),
+      if (!isStem) _presetCard(),
       if (!isStem) _samplingCard(),
       _modeCard(),
       _runButton(),
@@ -777,6 +789,47 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// Plain-language sampling preset picker ("sound style"). Maps to the
+  /// server's named presets (GET /presets); picking one makes the server apply
+  /// that preset's whole sampling shape and ignore the advanced knobs. Editing
+  /// any advanced sampling knob switches the dropdown to Custom.
+  Widget _presetCard() {
+    final ids = {for (final p in _presets) p.id};
+    final value = ids.contains(_params.preset) ? _params.preset : 'custom';
+    PresetInfo? selected;
+    for (final p in _presets) {
+      if (p.id == value) selected = p;
+    }
+    return SectionCard(
+      title: 'sound style',
+      children: [
+        DropdownButton<String>(
+          value: value,
+          isExpanded: true,
+          dropdownColor: NanoColors.surfaceAlt,
+          underline: const SizedBox.shrink(),
+          style: const TextStyle(fontSize: 13, color: NanoColors.text),
+          items: [
+            for (final p in _presets)
+              DropdownMenuItem(value: p.id, child: Text(p.label)),
+            const DropdownMenuItem(
+                value: 'custom', child: Text('Custom (advanced)')),
+          ],
+          onChanged: (v) => setState(() {
+            _params.preset = v ?? 'custom';
+            if (v == 'custom') _showAdvanced = true;
+          }),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          selected?.description ??
+              'Hand-tuned settings from the advanced panel below.',
+          style: const TextStyle(color: NanoColors.textDim, fontSize: 11),
+        ),
+      ],
+    );
+  }
+
   Widget _samplingCard() {
     return SectionCard(
       title: 'advanced',
@@ -816,7 +869,10 @@ class _HomePageState extends State<HomePage> {
                       : v < 1.5
                           ? 'adventurous'
                           : 'wild / risky',
-          onChanged: (v) => setState(() => _params.temperature = v),
+          onChanged: (v) => setState(() {
+            _params.temperature = v;
+            _params.preset = 'custom';
+          }),
         ),
         LabeledSlider(
           label: 'note probability',
@@ -838,7 +894,10 @@ class _HomePageState extends State<HomePage> {
                       : v < 150
                           ? 'open'
                           : 'wide open',
-          onChanged: (v) => setState(() => _params.topK = v.round()),
+          onChanged: (v) => setState(() {
+            _params.topK = v.round();
+            _params.preset = 'custom';
+          }),
         ),
         LabeledSlider(
           label: 'note confidence',
@@ -856,7 +915,10 @@ class _HomePageState extends State<HomePage> {
                   : v < 0.97
                       ? 'balanced'
                       : 'loose',
-          onChanged: (v) => setState(() => _params.topP = v),
+          onChanged: (v) => setState(() {
+            _params.topP = v;
+            _params.preset = 'custom';
+          }),
         ),
         LabeledSlider(
           label: 'prompt adherence',
@@ -927,16 +989,19 @@ class _HomePageState extends State<HomePage> {
             label: 'per_cb_temperature',
             controller: _perTempCtl,
             hint: '0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3',
+            onChanged: (_) => setState(() => _params.preset = 'custom'),
           ),
           NanoTextField(
             label: 'per_cb_top_k',
             controller: _perTopKCtl,
             hint: '50,50,40,40,...',
+            onChanged: (_) => setState(() => _params.preset = 'custom'),
           ),
           NanoTextField(
             label: 'per_cb_top_p',
             controller: _perTopPCtl,
             hint: '0.95,0.95,...',
+            onChanged: (_) => setState(() => _params.preset = 'custom'),
           ),
         ],
       ],

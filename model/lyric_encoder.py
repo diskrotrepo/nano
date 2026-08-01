@@ -586,7 +586,16 @@ def text_to_phoneme_ids(
     try:
         phone_sep, _ = _get_seps()
         ipa = _get_espeak(language).phonemize([text], separator=phone_sep, strip=True)[0]
-    except Exception:
+    except Exception as e:
+        # LOUD degrade: dropping the words silently made every lyric eval on an
+        # espeak-less image look like "the model can't sing" (2026-07-23). The
+        # stream still degrades to a bare BOS (callers add the marker header),
+        # but the operator must be able to see it happening.
+        if not _ESPEAK.get("__warned__"):
+            _ESPEAK["__warned__"] = True
+            print(f"[lyric_encoder] WARNING: phonemization unavailable "
+                  f"({type(e).__name__}: {e}) — lyric WORDS are being dropped; "
+                  f"install espeak-ng + phonemizer for lyric conditioning")
         return [BOS_PHONEME_ID] if add_bos else []
     ids: list[int] = [BOS_PHONEME_ID] if add_bos else []
     prev_boundary = True  # suppress a leading boundary token

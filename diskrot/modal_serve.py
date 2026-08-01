@@ -10,7 +10,7 @@ Setup (one-time):
     # a trained checkpoint must already be on the nano-ckpts volume. Prefer the
     # slim, inference-only export (optimizer state stripped, fp16) — far faster
     # to load on cold start:
-    modal run diskrot/modal_export_ckpt.py --src v8_sing/best.pt
+    modal run diskrot/modal_export_ckpt.py --src v10_dac_2b/best.pt
 
 Develop (hot-reloading public URL, torn down on Ctrl-C):
     modal serve diskrot/modal_serve.py
@@ -27,7 +27,7 @@ The UI is mounted from the local `webapp/build/web` bundle, so build it first:
 (The UI pre-fills its server-url field with the sibling API URL.)
 
 Point at a different checkpoint on the volume:
-    NANO_CKPT=/ckpts/v8_sing/latest.pt modal serve diskrot/modal_serve.py
+    NANO_CKPT=/ckpts/v10_dac_2b/latest.pt modal serve diskrot/modal_serve.py
 
 Register MULTIPLE switchable checkpoints (the request's `model` field picks one;
 the others lazy-load on first use; GET /models lists them). Keeps the big model
@@ -59,17 +59,18 @@ app = modal.App("nano-serve")
 # Prefer the slim inference export; fall back to the raw training checkpoints.
 # Override with the NANO_CKPT env var at `modal serve`/`modal deploy` time.
 # (v7_1500m checkpoints predate the fused output head and cannot load on this
-# code — don't list them as fallbacks.) v8 is retired (2026-07-13): the SS
-# image defaults to the v9 run's checkpoints; the DAC candidates remain only
-# so the legacy image stays launchable.
+# code — don't list them as fallbacks.) DAC is the live path again as of the
+# v10 migration (2026-07-21), so the default branch points at the v10 run; the
+# SpectroStream branch keeps the (abandoned) v9 run so that image stays
+# launchable.
 DEFAULT_CKPT_CANDIDATES = [
     "/ckpts/v9_stereo/best_inference.pt",
     "/ckpts/v9_stereo/best.pt",
     "/ckpts/v9_stereo/latest.pt",
 ] if os.environ.get("NANO_CODEC", "").strip().lower() == "spectrostream" else [
-    "/ckpts/v8_sing/best_inference.pt",
-    "/ckpts/v8_sing/best.pt",
-    "/ckpts/v8_sing/latest.pt",
+    "/ckpts/v10_dac_2b/best_inference.pt",
+    "/ckpts/v10_dac_2b/best.pt",
+    "/ckpts/v10_dac_2b/latest.pt",
 ]
 
 # Local shell env does NOT cross into the container — bake the documented
@@ -314,7 +315,7 @@ def serve():
             raise FileNotFoundError(
                 "No checkpoint found on the nano-ckpts volume at any of "
                 f"{DEFAULT_CKPT_CANDIDATES}. Export one with "
-                "`modal run diskrot/modal_export_ckpt.py --src v8_sing/best.pt`, "
+                "`modal run diskrot/modal_export_ckpt.py --src v10_dac_2b/best.pt`, "
                 "or set NANO_CKPT / NANO_MODELS to its path(s)."
             )
     _sel = os.environ.get("NANO_MODELS") or os.environ.get("NANO_CKPT")

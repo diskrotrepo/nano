@@ -76,6 +76,10 @@ class GenParams {
   static const double defaultMelodyCfgScale = 0.0;
 
   // sampling (all modes)
+  // Named sampling preset (see GET /presets). When set to a preset id the
+  // server applies that preset's whole sampling shape and the per-cb fields
+  // below are ignored; 'custom' (or '') means "use the advanced fields".
+  String preset = 'balanced';
   double temperature = defaultTemperature;
   int topK = defaultTopK;
   double topP = defaultTopP;
@@ -130,6 +134,29 @@ class ModelsInfo {
   final String defaultId;
 }
 
+/// One named sampling preset (GET /presets): a plain-language sound profile
+/// ("Balanced", "Adventurous", ...) the server maps onto its sampling knobs.
+class PresetInfo {
+  const PresetInfo(this.id, this.label, this.description, this.isDefault);
+  final String id;
+  final String label;
+  final String description;
+  final bool isDefault;
+
+  /// Mirrors the server's built-in presets — used when GET /presets is
+  /// unavailable so the dropdown still renders. 'custom' is appended by the UI.
+  static const fallback = [
+    PresetInfo('balanced', 'Balanced',
+        'Good middle ground between clean and varied. The default.', true),
+    PresetInfo('steady', 'Steady',
+        'Cleaner and more consistent — a tighter groove with fewer surprises.', false),
+    PresetInfo('safe', 'Extra safe',
+        'The most predictable, polished sound. Can get repetitive.', false),
+    PresetInfo('adventurous', 'Adventurous',
+        'The loosest and most surprising. More variety, more rough edges.', false),
+  ];
+}
+
 class HealthInfo {
   HealthInfo(this.raw);
   final Map<String, dynamic> raw;
@@ -177,6 +204,29 @@ class NanoApi {
     return ModelsInfo(ids.isEmpty ? const ['default'] : ids, def);
   }
 
+  /// Named sampling presets (GET /presets) — plain-language sound profiles the
+  /// preset dropdown offers. Falls back to a built-in list mirroring the
+  /// server's defaults when the endpoint is unavailable (older server), so the
+  /// dropdown always renders.
+  Future<List<PresetInfo>> presets() async {
+    try {
+      final resp = await http.get(_uri('/presets'));
+      if (resp.statusCode == 200) {
+        final j = jsonDecode(resp.body) as Map<String, dynamic>;
+        final list = ((j['presets'] as List?) ?? const [])
+            .map((m) => PresetInfo(
+                  '${(m as Map)['id']}',
+                  '${m['label']}',
+                  '${m['description']}',
+                  m['default'] == true,
+                ))
+            .toList();
+        if (list.isNotEmpty) return list;
+      }
+    } catch (_) {/* fall through to the built-in list */}
+    return PresetInfo.fallback;
+  }
+
   /// GET URL for the progressive /generate_stream endpoint. A native <audio src>
   /// pointed here plays the clip as it generates (and slips under Modal's 150s
   /// wall, which kills the buffered POST on long clips). Only /generate fields are
@@ -192,6 +242,7 @@ class NanoApi {
       'per_cb_temperature': p.perCbTemperature,
       'per_cb_top_k': p.perCbTopK,
       'per_cb_top_p': p.perCbTopP,
+      'preset': p.preset,
       'cfg_scale': p.cfgScale.toString(),
       'prompt': p.prompt,
       'lyrics': p.lyrics,
@@ -232,6 +283,7 @@ class NanoApi {
       'per_cb_temperature': p.perCbTemperature,
       'per_cb_top_k': p.perCbTopK,
       'per_cb_top_p': p.perCbTopP,
+      'preset': p.preset,
       'cfg_scale': p.cfgScale.toString(),
       'lyric_cfg_scale': p.lyricCfgScale.toString(),
       'req_id': reqId,
@@ -281,6 +333,7 @@ class NanoApi {
     f['per_cb_temperature'] = p.perCbTemperature;
     f['per_cb_top_k'] = p.perCbTopK;
     f['per_cb_top_p'] = p.perCbTopP;
+    f['preset'] = p.preset;
     f['cfg_scale'] = p.cfgScale.toString();
     f['lyric_cfg_scale'] = p.lyricCfgScale.toString();
 

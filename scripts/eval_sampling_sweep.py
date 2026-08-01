@@ -68,8 +68,13 @@ def _prefetch_g2p() -> None:
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
+    # espeak-ng + phonemizer: the v10/IPA-256 lyric path phonemizes request lyrics
+    # via phonemizer's EspeakBackend — WITHOUT them text_to_phoneme_ids silently
+    # drops every word and "lyric" cells run on a wordless header (the 2026-07-23
+    # no-vocals eval artifact). g2p_en stays only for legacy v8/ARPABET ckpts.
+    .apt_install("ffmpeg", "libsndfile1", "espeak-ng")
     .pip_install(
+        "phonemizer>=3.2",
         "torch>=2.4",
         "torchaudio>=2.4",
         "librosa>=0.10",
