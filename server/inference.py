@@ -449,13 +449,30 @@ class InferenceEngine:
         # inline markers). Brackets never reach g2p; unknown labels fold to
         # <no_section>. Plain lyrics (no brackets) get a <no_section> prefix.
         lyric_ids = lyric_mask = None
-        if lyrics_str and getattr(self.model.cfg, "use_lyric_conditioning", False):
+        # `lyrics is None` marks the CFG negative/baseline call — keep it a null
+        # lyric (matches training's lyric-drop). A POSITIVE call (lyrics is a
+        # string, even "") with no sung words means the user wants an
+        # INSTRUMENTAL: inject an <instrumental> marker so the model suppresses
+        # vocals. Without this, empty lyrics sent NO lyric stream at all and the
+        # model sang gibberish; and a bare header defaults to <unknown_vocals>,
+        # which doesn't suppress vocals either — it needs an explicit
+        # <instrumental> (unless the user already put [vocals]/[instrumental]).
+        if lyrics is not None and getattr(self.model.cfg, "use_lyric_conditioning", False):
+            import re
+
             from model.lyric_encoder import (
                 PAD_PHONEME_ID, text_with_markers_to_phoneme_ids,
             )
 
+            has_words = bool(re.sub(r"\[[^\]]*\]", "", lyrics_str).strip())
+            has_vocal_marker = bool(
+                re.search(r"\[(instrumental|vocals?|no[ _]vocals)\]", lyrics_str, re.I)
+            )
+            src = lyrics_str
+            if not has_words and not has_vocal_marker:
+                src = f"[instrumental] {lyrics_str}".strip()
             ids = text_with_markers_to_phoneme_ids(
-                lyrics_str, max_len=self.model.cfg.max_lyric_len
+                src, max_len=self.model.cfg.max_lyric_len
             )
             if ids:
                 lyric_ids = torch.tensor(ids, dtype=torch.long, device=self.device)[None]
@@ -986,7 +1003,9 @@ class InferenceEngine:
             raise ValueError("Requested duration exceeds model context limit.")
 
         pos = [
-            self._build_conditioning(r.get("text"), lyrics=r.get("lyrics"),
+            # `or ""` so a positive item with no lyrics still builds an
+            # <instrumental> header (None is reserved for the CFG baseline below).
+            self._build_conditioning(r.get("text"), lyrics=r.get("lyrics") or "",
                                      gender=r.get("gender"), bpm=r.get("bpm"))
             for r in requests
         ]
