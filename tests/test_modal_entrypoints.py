@@ -47,6 +47,7 @@ BLOCKING_OK = {
     "modal_r2_wavify.py",            # dry-run blocks inline; apply path spawns
     "modal_clean_dac_pt.py",         # dry-run blocks inline; apply path spawns
     "modal_copy_conditioning.py",    # ~1k-file codec-subdir copy, seconds; dry-run inline
+    "modal_make_test_wave.py",       # server-side R2 copy of ~1k objects, seconds; teardown tool
 }
 
 MODAL_RUN_RE = re.compile(

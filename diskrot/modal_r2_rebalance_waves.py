@@ -19,7 +19,7 @@ clean; pass ``--reset`` to discard a stale one and recompute from scratch.
 
     export NANO_AUDIO_BUCKET=nano-audio
     export NANO_AUDIO_ENDPOINT=https://<acct>.r2.cloudflarestorage.com
-    modal run diskrot/modal_r2_rebalance_waves.py                       # dry-run plan
+    modal run --detach diskrot/modal_r2_rebalance_waves.py             # dry-run plan
     modal run --detach diskrot/modal_r2_rebalance_waves.py --apply      # copy + delete
 """
 import json
@@ -243,8 +243,9 @@ def rebalance(apply: bool = False, reset: bool = False,
 
 @app.local_entrypoint()
 def main(apply: bool = False, reset: bool = False, overflow_wave: str = "wave_22"):
-    if apply:
-        rebalance.spawn(apply=True, reset=reset, overflow_wave=overflow_wave)
-        print("rebalance launched (detached). watch: modal app logs <ap-...> -f")
-    else:
-        rebalance.remote(apply=False, reset=reset, overflow_wave=overflow_wave)
+    # spawn (not .remote()) for BOTH modes so the plan/report survives a flaky
+    # local client; pair with `modal run --detach` and read it from app logs.
+    call = rebalance.spawn(apply=apply, reset=reset, overflow_wave=overflow_wave)
+    print(f"rebalance {'APPLY' if apply else 'dry-run'} launched (detached); "
+          f"call {call.object_id}.")
+    print("watch / read plan: modal app logs <ap-...> -f")

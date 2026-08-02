@@ -19,7 +19,7 @@ staging dirs are left alone.
 
     export NANO_AUDIO_BUCKET=nano-audio
     export NANO_AUDIO_ENDPOINT=https://<acct>.r2.cloudflarestorage.com
-    modal run diskrot/modal_r2_dedup_waves.py                    # dry-run report
+    modal run --detach diskrot/modal_r2_dedup_waves.py          # dry-run report
     modal run --detach diskrot/modal_r2_dedup_waves.py --apply   # delete redundant copies
 """
 import os

@@ -223,6 +223,9 @@ def _make_stub_engine():
         codec=codec,
         _build_conditioning=lambda *a, **k: (None, None, None),
         _gen_metadata=lambda *a, **k: {},
+        # No silence seed in the stub → the (None, 1) path, so the stream falls
+        # back to _resolve_prompt (like the real engine without a seed).
+        _bootstrap=lambda: (None, 1),
     )
     # Bind the real methods under test onto the stub.
     stub._decode_chunk = InferenceEngine._decode_chunk.__get__(stub)
