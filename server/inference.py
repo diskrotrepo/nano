@@ -149,17 +149,14 @@ class InferenceEngine:
             if any(k.startswith("_orig_mod.") for k in state):
                 state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
-            # Backend on Apple Silicon: PyTorch-MPS by default (bf16, shares the
-            # CUDA code path and is parity-tested), MLX only on explicit opt-in
-            # (NANO_MLX=1). MLX is faster for single-token decode, BUT on the v10
-            # DAC shape its int8 path degrades the rollout to hiss/noise (verified
-            # 2026-08-02: identical /generate_stream gave zcr 0.32 + autocorr 0.54
-            # on MLX-int8 vs zcr 0.06 + autocorr 0.96 on torch-MPS). MLX was only
-            # ever audio-validated on the v9 SpectroStream shape — keep it opt-in
-            # until the DAC path is fixed/validated. Elsewhere: PyTorch.
+            # Backend on Apple Silicon: MLX by default (int8, ~1.9x faster than
+            # torch-MPS on the v10 DAC shape and now numerically correct — the CFG
+            # stage-batching that used to collapse DAC to noise is run unbatched,
+            # and activations/head default to fp32). Opt back out to the
+            # parity-tested torch-MPS path with NANO_MLX=0. Elsewhere: PyTorch.
             self.backend = (
                 "mlx"
-                if os.environ.get("NANO_MLX", "0") == "1"
+                if os.environ.get("NANO_MLX", "1") != "0"
                 and self.device == "mps"
                 and _mlx_available()
                 else "torch"
