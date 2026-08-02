@@ -57,10 +57,16 @@ def test_train_val_split_disjoint(synth_tokens_dir):
 
 
 def test_val_ratio_respected(synth_tokens_dir):
-    """val_ratio=0.2 over 10 files → 2 val files."""
-    tokens_dir = _packed_dir(synth_tokens_dir(n_files=10, T=1000))
+    """The per-song hash split honors val_ratio in aggregate: over a larger
+    corpus the realized val fraction converges to val_ratio. (It's no longer the
+    old exact int(N*ratio) — each song is assigned independently by name hash so
+    the split stays stable as the corpus grows; see _build_mmap_split_index.)"""
+    tokens_dir = _packed_dir(synth_tokens_dir(n_files=300, T=600))
     val = TokenDataset(tokens_dir, segment_frames=500, split="val", seed=42, val_ratio=0.2)
-    assert len(val) == 2
+    train = TokenDataset(tokens_dir, segment_frames=500, split="train", seed=42, val_ratio=0.2)
+    assert len(train) + len(val) == 300
+    frac = len(val) / 300
+    assert 0.13 <= frac <= 0.27, f"realized val fraction {frac:.3f} not near 0.2"
 
 
 def test_skips_too_short_files(synth_tokens_dir):
@@ -77,7 +83,7 @@ def test_skips_too_short_files(synth_tokens_dir):
 def test_getitem_shape_and_dtype(synth_tokens_dir):
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=1000))
     ds = TokenDataset(tokens_dir, segment_frames=300)
-    tokens, tags, lyric_ids, _melody = ds[0]
+    tokens, tags, lyric_ids, _melody, *_ = ds[0]
     assert tokens.shape == (9, 300)
     # int16 stays int16 on host (saves ~24 GB shared RAM at production scale).
     # Training loop casts to int64 via .long() after .to(device) — see
@@ -89,11 +95,12 @@ def test_getitem_shape_and_dtype(synth_tokens_dir):
     # empty/fully-padded sequence, which would NaN the lyric cross-attention).
     from model.lyric_encoder import (
         BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
-        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
+        UNKNOWN_LANG_ID, UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID,
     )
+    # v9 6-marker header: BOS <gender> <tempo> <key> <vocals> <lang> <section>.
     assert lyric_ids.tolist() == [
         BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID,
+        UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, UNKNOWN_LANG_ID, NO_SECTION_ID,
     ]
 
 
@@ -171,11 +178,19 @@ def test_vocal_crop_bias_increases_word_hits(synth_tokens_dir, tmp_path):
     the large majority of the time. Drives _choose_crop_start directly so the
     crop position is observable."""
     import random
+    from diskrot.dataset import _FRAME_RATE_HZ
 
-    rate = DACodec.FRAME_RATE_HZ
+    # Use the dataset's OWN frame rate (codec-dependent: DAC 86 Hz / SpectroStream
+    # 25 Hz) so the crop geometry is identical regardless of NANO_CODEC — hardcoding
+    # DACodec.FRAME_RATE_HZ here made the test fail under NANO_CODEC=spectrostream
+    # (the biasing code is fine). See the nano-codec-env-breaks-dac-tests note.
+    rate = _FRAME_RATE_HZ
     seg = 500
     T = 1000
-    word = {"word": "late", "start": 10.0, "end": 10.5}  # ~860-903 frames, late
+    # Anchor the word LATE in FRAME space (~860-903 of 1000) and convert to seconds
+    # with `rate`, so it stays late (uniform usually misses) under any codec.
+    w_start_f, w_end_f = 860, 903
+    word = {"word": "late", "start": w_start_f / rate, "end": w_end_f / rate}
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=4, T=T))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({"song_000": {"words": [word]}}))
@@ -281,13 +296,14 @@ def test_segment_lyric_ids_window_and_bos(synth_tokens_dir, tmp_path):
     transcribed)."""
     from model.lyric_encoder import (
         BOS_PHONEME_ID, NO_SECTION_ID, UNKNOWN_GENDER_ID, UNKNOWN_KEY_ID,
-        UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID, VOCAL_TOKEN_TO_ID,
+        UNKNOWN_LANG_ID, UNKNOWN_TEMPO_ID, UNKNOWN_VOCALS_ID, VOCAL_TOKEN_TO_ID,
     )
 
+    # v9 6-marker header (lyrics here carry no language -> <unknown_lang>).
     prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-              UNKNOWN_KEY_ID, VOCAL_TOKEN_TO_ID["vocals"], NO_SECTION_ID]
+              UNKNOWN_KEY_ID, VOCAL_TOKEN_TO_ID["vocals"], UNKNOWN_LANG_ID, NO_SECTION_ID]
     unknown_prefix = [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, UNKNOWN_TEMPO_ID,
-                      UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, NO_SECTION_ID]
+                      UNKNOWN_KEY_ID, UNKNOWN_VOCALS_ID, UNKNOWN_LANG_ID, NO_SECTION_ID]
     tokens_dir = _packed_dir(synth_tokens_dir(n_files=2, T=1000))
     lyrics_path = tmp_path / "lyrics.json"
     lyrics_path.write_text(json.dumps({
@@ -350,7 +366,7 @@ def test_collate_lyrics_pads_and_masks(synth_tokens_dir):
         (torch.zeros(9, 300, dtype=torch.int16), "tagB",
          torch.tensor([BOS_PHONEME_ID], dtype=torch.long), None),
     ]
-    tokens, tags, ids, mask, _melody = collate_lyrics(batch)
+    tokens, tags, ids, mask, _melody, *_ = collate_lyrics(batch)
     assert tokens.shape == (2, 9, 300)
     assert tags == ["tagA", "tagB"]
     assert ids.shape == (2, 3)

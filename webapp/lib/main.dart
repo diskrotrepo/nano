@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
@@ -63,12 +65,18 @@ class _HomePageState extends State<HomePage> {
 
   bool _showAdvanced = false;
   bool _busy = false;
+  // How many clips a single GENERATE fires at once ("takes"). Each is its own
+  // request, so they run in parallel across Modal containers.
+  int _takes = 1;
+  // Refreshes the "generating… Ns" elapsed counter during a blocking buffered gen.
+  Timer? _bufferedTicker;
   String? _error;
   HealthInfo? _health;
   bool _healthLoading = false;
   // Available switchable checkpoints (from GET /models). The picker shows only
   // when there's more than one; `_params.model` holds the selection.
   List<String> _models = const [];
+  List<PresetInfo> _presets = PresetInfo.fallback;
 
   final List<GenClip> _clips = [];
   final ClipPlayer _player = ClipPlayer();
@@ -82,6 +90,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _bufferedTicker?.cancel();
     _player.dispose();
     for (final clip in _clips) {
       clip.blob?.revoke();
@@ -111,9 +120,19 @@ class _HomePageState extends State<HomePage> {
       } catch (_) {
         mi = null;
       }
+      // Sampling presets for the "sound style" dropdown (built-in fallback on
+      // older servers, so this never fails the health check).
+      final presets = await _api.presets();
       if (mounted) {
         setState(() {
           _health = h;
+          _presets = presets;
+          if (_params.preset != 'custom' &&
+              !presets.any((p) => p.id == _params.preset)) {
+            _params.preset = presets
+                .firstWhere((p) => p.isDefault, orElse: () => presets.first)
+                .id;
+          }
           _models = mi?.ids ?? const [];
           // Default the selection to the server's default when unset or stale.
           if (mi != null && (_params.model.isEmpty || !mi.ids.contains(_params.model))) {
@@ -138,8 +157,7 @@ class _HomePageState extends State<HomePage> {
     return AudioFile(f!.name, f.bytes!);
   }
 
-  Future<void> _run() async {
-    // sync controllers into params
+  void _syncParams() {
     _params
       ..prompt = _promptCtl.text
       ..lyrics = _lyricsCtl.text
@@ -147,54 +165,97 @@ class _HomePageState extends State<HomePage> {
       ..perCbTemperature = _perTempCtl.text
       ..perCbTopK = _perTopKCtl.text
       ..perCbTopP = _perTopPCtl.text;
+  }
 
-    final isStem = _mode == NanoMode.stem;
+  /// Best-effort requested clip length (the progress-bar/ETA denominator).
+  /// generate is exact; extend/cover estimate from the source clip's length;
+  /// stem has no requested length (0 → no bar, just "generating…").
+  double _requestedLength(NanoMode mode) {
+    switch (mode) {
+      case NanoMode.generate:
+        return _params.seconds;
+      case NanoMode.extend:
+        final src = _sourceClip?.durationSeconds;
+        final kept = _params.fromSeconds >= 0 ? _params.fromSeconds : (src ?? 0);
+        if (src == null && _params.fromSeconds < 0) return 0;
+        return kept + _params.addSeconds;
+      case NanoMode.cover:
+        return _sourceClip?.durationSeconds ?? 0;
+      case NanoMode.stem:
+        return 0;
+    }
+  }
+
+  Future<void> _run() async {
+    _syncParams();
+    final mode = _mode;
+    // generate/extend/cover all stream progressively; stem has no stream endpoint.
+    // (Long lyrics and browsers without MSE are handled inside _launchStreamClip —
+    // they no longer drop to a no-progress buffered request.)
+    const streamModes = {NanoMode.generate, NanoMode.extend, NanoMode.cover};
+    final canStream =
+        streamModes.contains(mode) && (mode == NanoMode.generate || _params.inputAudio != null);
+    if (canStream) {
+      // "Takes": generate N clips at once (each its own request — they run in
+      // parallel across Modal containers). Only meaningful for generate; a
+      // transform (extend/cover) acts on one source clip.
+      final n = mode == NanoMode.generate ? _takes : 1;
+      final requested = _requestedLength(mode);
+      setState(() => _error = null);
+      for (var i = 0; i < n; i++) {
+        _launchStreamClip(mode, requested);
+      }
+      return;
+    }
+    await _launchBufferedClip(mode);
+  }
+
+  /// Launch one streaming clip. Uses MSE for progressive playback when the
+  /// browser supports MP3-over-MSE; otherwise downloads progressively (with
+  /// byte-based progress) and plays the finished blob. generate streams over GET
+  /// (or POST when lyrics would overflow the URL); extend/cover POST their upload.
+  void _launchStreamClip(NanoMode mode, double requested) {
     final clip = GenClip(
       id: _clipSeq++,
-      mode: _mode,
-      prompt: isStem
-          ? 'keep ${kStemNames.where(_params.stemKeep.contains).join(', ')}'
-          : _promptCtl.text.trim(),
-      lyrics: isStem ? '' : _lyricsCtl.text.trim(),
+      mode: mode,
+      prompt: _promptCtl.text.trim(),
+      lyrics: _lyricsCtl.text.trim(),
+      requestedSeconds: requested,
+      startedAt: DateTime.now(),
     );
+    final reqId = 'g${clip.id}t${DateTime.now().microsecondsSinceEpoch}';
+    final longLyrics = clip.lyrics.length > 1500;
 
-    // Progressive playback via MSE for generate/extend/cover: play unlocks once
-    // >= kStreamGateSeconds is buffered, then continues as the rest streams in
-    // (bypassing Modal's 150s wall; the server saves the finished clip on
-    // completion). generate streams over GET; extend/cover POST their upload.
-    // Needs MSE-mp3 support and (for extend/cover) an input clip; otherwise it
-    // falls through to the reliable buffered POST path below. Very long lyrics
-    // would overflow the generate GET query, so fall back there too.
-    const streamModes = {NanoMode.generate, NanoMode.extend, NanoMode.cover};
-    final canStream = mseMp3Supported() &&
-        streamModes.contains(_mode) &&
-        _lyricsCtl.text.trim().length <= 1500 &&
-        (_mode == NanoMode.generate || _params.inputAudio != null);
-    if (canStream) {
-      final reqId = 'g${clip.id}t${DateTime.now().microsecondsSinceEpoch}';
-      late final MseStream mse;
-      void onPlay() => _onStreamPlay(mse);
-      if (_mode == NanoMode.generate) {
-        mse = MseStream(_api.streamUrl(_params, reqId), onPlay: onPlay);
+    // Resolve the request target: (url, optional POST init).
+    final String url;
+    final web.RequestInit? init;
+    if (mode == NanoMode.generate && !longLyrics) {
+      url = _api.streamUrl(_params, reqId); // GET with query params
+      init = null;
+    } else {
+      url = _api.streamEndpoint(mode); // POST
+      if (mode == NanoMode.generate) {
+        init = streamPostInit(fields: _api.streamFields(mode, _params, reqId));
       } else {
         final file = _params.inputAudio!;
-        mse = MseStream(
-          _api.streamEndpoint(_mode),
-          requestInit: streamPostInit(
-            fields: _api.streamFields(_mode, _params, reqId),
-            fileField: _mode == NanoMode.cover ? 'melody_audio' : 'audio',
-            fileBytes: file.bytes,
-            fileName: file.name,
-          ),
-          onPlay: onPlay,
+        init = streamPostInit(
+          fields: _api.streamFields(mode, _params, reqId),
+          fileField: mode == NanoMode.cover ? 'melody_audio' : 'audio',
+          fileBytes: file.bytes,
+          fileName: file.name,
         );
       }
+    }
+
+    if (mseMp3Supported()) {
+      late final MseStream mse;
+      mse = MseStream(url, requestInit: init, onPlay: () => _onStreamPlay(mse));
       mse.addListener(() {
         if (!mounted || !_clips.contains(clip)) return;
         setState(() {
           clip.bufferedSeconds = mse.bufferedSeconds;
           if (clip.status == ClipStatus.generating &&
-              (mse.bufferedSeconds >= kStreamGateSeconds || mse.complete)) {
+              (mse.bufferedSeconds >= streamGate(clip.requestedSeconds) || mse.complete)) {
             clip.status = ClipStatus.ready; // enough buffered → playable
           }
           if (mse.complete && clip.bytes == null) {
@@ -213,20 +274,70 @@ class _HomePageState extends State<HomePage> {
         });
       });
       clip.mse = mse;
-      setState(() {
-        _error = null;
-        _clips.insert(0, clip);
+    } else {
+      // No MSE: progressive download with byte-based progress (true progressive
+      // *playback* needs MSE, but the user still sees a live progress bar instead
+      // of a dead spinner), then play the finished blob.
+      fetchAudioStream(url, requestInit: init, onProgress: (recv) {
+        if (!mounted || !_clips.contains(clip)) return;
+        setState(() => clip.bufferedSeconds = recv / kMp3BytesPerSecond);
+      }).then((bytes) {
+        if (!mounted || !_clips.contains(clip)) return;
+        final blob = AudioBlob.fromBytes(bytes, 'audio/mpeg');
+        setState(() {
+          clip
+            ..status = ClipStatus.ready
+            ..bytes = bytes
+            ..mime = 'audio/mpeg'
+            ..blob = blob;
+        });
+        blob.duration().then((d) {
+          if (mounted && _clips.contains(clip)) {
+            setState(() => clip.durationSeconds = d);
+          }
+        });
+      }).catchError((e) {
+        if (mounted && _clips.contains(clip)) {
+          setState(() => clip
+            ..status = ClipStatus.error
+            ..error = '$e');
+        }
       });
-      return;
     }
+    setState(() {
+      _error = null;
+      _clips.insert(0, clip);
+    });
+  }
 
+  Future<void> _launchBufferedClip(NanoMode mode) async {
+    final isStem = mode == NanoMode.stem;
+    final clip = GenClip(
+      id: _clipSeq++,
+      mode: mode,
+      prompt: isStem
+          ? 'keep ${kStemNames.where(_params.stemKeep.contains).join(', ')}'
+          : _promptCtl.text.trim(),
+      lyrics: isStem ? '' : _lyricsCtl.text.trim(),
+      requestedSeconds: _requestedLength(mode),
+      startedAt: DateTime.now(),
+    );
     setState(() {
       _busy = true;
       _error = null;
       _clips.insert(0, clip);
     });
+    // Tick so the "generating… Ns" elapsed counter advances while we block.
+    _bufferedTicker?.cancel();
+    _bufferedTicker = Timer.periodic(const Duration(milliseconds: 500), (t) {
+      if (mounted && clip.status == ClipStatus.generating) {
+        setState(() {});
+      } else {
+        t.cancel();
+      }
+    });
     try {
-      final result = await _api.run(_mode, _params);
+      final result = await _api.run(mode, _params);
       final blob = AudioBlob.fromBytes(result.bytes, result.mime);
       final dur = await blob.duration();
       if (!mounted) {
@@ -253,6 +364,7 @@ class _HomePageState extends State<HomePage> {
         });
       }
     } finally {
+      _bufferedTicker?.cancel();
       if (mounted) setState(() => _busy = false);
     }
   }
@@ -387,6 +499,7 @@ class _HomePageState extends State<HomePage> {
       _header(),
       const SizedBox(height: 18),
       if (!isStem) _conditioningCard(),
+      if (!isStem) _presetCard(),
       if (!isStem) _samplingCard(),
       _modeCard(),
       _runButton(),
@@ -676,6 +789,47 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// Plain-language sampling preset picker ("sound style"). Maps to the
+  /// server's named presets (GET /presets); picking one makes the server apply
+  /// that preset's whole sampling shape and ignore the advanced knobs. Editing
+  /// any advanced sampling knob switches the dropdown to Custom.
+  Widget _presetCard() {
+    final ids = {for (final p in _presets) p.id};
+    final value = ids.contains(_params.preset) ? _params.preset : 'custom';
+    PresetInfo? selected;
+    for (final p in _presets) {
+      if (p.id == value) selected = p;
+    }
+    return SectionCard(
+      title: 'sound style',
+      children: [
+        DropdownButton<String>(
+          value: value,
+          isExpanded: true,
+          dropdownColor: NanoColors.surfaceAlt,
+          underline: const SizedBox.shrink(),
+          style: const TextStyle(fontSize: 13, color: NanoColors.text),
+          items: [
+            for (final p in _presets)
+              DropdownMenuItem(value: p.id, child: Text(p.label)),
+            const DropdownMenuItem(
+                value: 'custom', child: Text('Custom (advanced)')),
+          ],
+          onChanged: (v) => setState(() {
+            _params.preset = v ?? 'custom';
+            if (v == 'custom') _showAdvanced = true;
+          }),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          selected?.description ??
+              'Hand-tuned settings from the advanced panel below.',
+          style: const TextStyle(color: NanoColors.textDim, fontSize: 11),
+        ),
+      ],
+    );
+  }
+
   Widget _samplingCard() {
     return SectionCard(
       title: 'advanced',
@@ -715,7 +869,10 @@ class _HomePageState extends State<HomePage> {
                       : v < 1.5
                           ? 'adventurous'
                           : 'wild / risky',
-          onChanged: (v) => setState(() => _params.temperature = v),
+          onChanged: (v) => setState(() {
+            _params.temperature = v;
+            _params.preset = 'custom';
+          }),
         ),
         LabeledSlider(
           label: 'note probability',
@@ -737,7 +894,10 @@ class _HomePageState extends State<HomePage> {
                       : v < 150
                           ? 'open'
                           : 'wide open',
-          onChanged: (v) => setState(() => _params.topK = v.round()),
+          onChanged: (v) => setState(() {
+            _params.topK = v.round();
+            _params.preset = 'custom';
+          }),
         ),
         LabeledSlider(
           label: 'note confidence',
@@ -755,7 +915,10 @@ class _HomePageState extends State<HomePage> {
                   : v < 0.97
                       ? 'balanced'
                       : 'loose',
-          onChanged: (v) => setState(() => _params.topP = v),
+          onChanged: (v) => setState(() {
+            _params.topP = v;
+            _params.preset = 'custom';
+          }),
         ),
         LabeledSlider(
           label: 'prompt adherence',
@@ -826,16 +989,19 @@ class _HomePageState extends State<HomePage> {
             label: 'per_cb_temperature',
             controller: _perTempCtl,
             hint: '0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3',
+            onChanged: (_) => setState(() => _params.preset = 'custom'),
           ),
           NanoTextField(
             label: 'per_cb_top_k',
             controller: _perTopKCtl,
             hint: '50,50,40,40,...',
+            onChanged: (_) => setState(() => _params.preset = 'custom'),
           ),
           NanoTextField(
             label: 'per_cb_top_p',
             controller: _perTopPCtl,
             hint: '0.95,0.95,...',
+            onChanged: (_) => setState(() => _params.preset = 'custom'),
           ),
         ],
       ],
@@ -857,6 +1023,8 @@ class _HomePageState extends State<HomePage> {
             help: 'Single-shot generation length (max ~95s).',
             onChanged: (v) => setState(() => _params.seconds = v),
           ),
+          const SizedBox(height: 12),
+          _takesSelector(),
           const SizedBox(height: 10),
           const Divider(height: 1, color: NanoColors.border),
           const SizedBox(height: 8),
@@ -886,6 +1054,49 @@ class _HomePageState extends State<HomePage> {
           NanoMode.stem => _stemControls(),
           _ => _extendControls(),
         },
+      ],
+    );
+  }
+
+  /// "takes" selector: how many clips a single GENERATE fires at once. Each is
+  /// its own streaming request, so they generate in parallel (the server fans
+  /// them across containers / batches them). 1 | 2 | 4 | 8.
+  Widget _takesSelector() {
+    Widget seg(int value) {
+      final selected = _takes == value;
+      return Expanded(
+        child: InkWell(
+          onTap: () => setState(() => _takes = value),
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 2),
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: selected ? NanoColors.pink : NanoColors.surfaceAlt,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              '$value',
+              style: TextStyle(
+                color: selected ? Colors.black : NanoColors.text,
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        const SizedBox(
+          width: 64,
+          child: Text('takes',
+              style: TextStyle(color: NanoColors.textDim, fontSize: 12)),
+        ),
+        for (final v in const [1, 2, 4, 8]) seg(v),
       ],
     );
   }
@@ -1314,9 +1525,24 @@ class _HomePageState extends State<HomePage> {
 /// CLAP score / sweetened prompt the server returned.
 enum ClipStatus { generating, ready, error }
 
-/// Seconds of audio that must be buffered before a streaming clip becomes
-/// playable (progressive MSE playback). Below this, play stays disabled.
-const double kStreamGateSeconds = 10.0;
+/// Ceiling on the audio that must be buffered before a streaming clip becomes
+/// playable (progressive MSE playback). Kept small (≈ the server's emit cadence)
+/// so play unlocks almost as soon as the first chunk lands; [streamGate] adapts
+/// it down further for short clips.
+const double kStreamGateSeconds = 3.0;
+
+/// How much buffered audio unlocks playback for a clip of [requestedSeconds].
+/// Never wait for more than a quarter of the requested length (so a short clip
+/// doesn't sit behind a fixed multi-second gate that's a big fraction of it),
+/// capped at [kStreamGateSeconds].
+double streamGate(double requestedSeconds) => requestedSeconds > 0
+    ? math.min(kStreamGateSeconds, 0.25 * requestedSeconds)
+    : kStreamGateSeconds;
+
+/// Server MP3 bitrate is 192 kbps (server/inference.py), so received bytes map
+/// to ≈ this many bytes per second of audio — used to estimate progress on the
+/// no-MSE download path, where decodable duration isn't observable mid-stream.
+const double kMp3BytesPerSecond = 192000 / 8;
 
 class GenClip {
   GenClip({
@@ -1324,12 +1550,20 @@ class GenClip {
     required this.mode,
     required this.prompt,
     required this.lyrics,
+    this.requestedSeconds = 0,
+    this.startedAt,
   });
 
   final int id;
   final NanoMode mode;
   final String prompt;
   final String lyrics;
+
+  // Requested clip length (seconds) — the denominator for the progress bar/ETA.
+  // 0 when unknown (e.g. stem separation, where output length isn't requested).
+  final double requestedSeconds;
+  // Wall-clock start, for elapsed/ETA. Set when the request is launched.
+  final DateTime? startedAt;
 
   ClipStatus status = ClipStatus.generating;
   Uint8List? bytes;
@@ -1345,6 +1579,28 @@ class GenClip {
   double? clapScore;
   String? sweetened;
   String? error;
+
+  /// Wall-clock seconds since this clip's request was launched.
+  double get elapsedSeconds => startedAt == null
+      ? 0
+      : DateTime.now().difference(startedAt!).inMilliseconds / 1000.0;
+
+  /// Generation progress 0..1 (buffered / requested). 0 when length is unknown.
+  double get progress => requestedSeconds > 0
+      ? (bufferedSeconds / requestedSeconds).clamp(0.0, 1.0)
+      : 0.0;
+
+  /// Rough ETA (seconds remaining), from the buffered-so-far rate. null until
+  /// there's enough signal (some buffered audio + a little elapsed wall-clock).
+  double? get etaSeconds {
+    if (requestedSeconds <= 0 || bufferedSeconds <= 0) return null;
+    final elapsed = elapsedSeconds;
+    if (elapsed < 0.5) return null;
+    final rate = bufferedSeconds / elapsed; // audio-seconds produced per wall-second
+    if (rate <= 0) return null;
+    final remaining = (requestedSeconds - bufferedSeconds) / rate;
+    return remaining.clamp(0.0, 86400.0);
+  }
 
   /// Blob playback source for non-streaming clips (extend/cover/stem + the
   /// finished download). Streaming clips play through their own [mse] element.
@@ -1425,7 +1681,10 @@ class ClipCard extends StatelessWidget {
                   _lengthChip(),
                 ],
               ),
-              if (mse != null && ready) ...[
+              if (clip.status == ClipStatus.generating) ...[
+                const SizedBox(height: 10),
+                _progressBar(),
+              ] else if (mse != null) ...[
                 const SizedBox(height: 10),
                 _streamBar(mse),
               ] else if (hasBytes) ...[
@@ -1456,6 +1715,38 @@ class ClipCard extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+
+  /// Determinate generation progress (buffered / requested) + %, elapsed and a
+  /// rough ETA. Shown while a clip is still generating (before it's playable),
+  /// for both the MSE and the no-MSE download paths. Indeterminate when the
+  /// requested length is unknown (e.g. stem separation).
+  Widget _progressBar() {
+    final det = clip.requestedSeconds > 0;
+    final pct = (clip.progress * 100).round();
+    final eta = clip.etaSeconds;
+    final label = det
+        ? '$pct% · ${clip.bufferedSeconds.toStringAsFixed(0)}s / '
+            '${clip.requestedSeconds.toStringAsFixed(0)}s'
+            '${eta != null ? ' · ~${eta.toStringAsFixed(0)}s left' : ''}'
+        : 'generating… ${clip.elapsedSeconds.toStringAsFixed(0)}s';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(2),
+          child: LinearProgressIndicator(
+            value: det ? clip.progress : null, // indeterminate when length unknown
+            minHeight: 4,
+            backgroundColor: NanoColors.surfaceAlt,
+            color: NanoColors.pink,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(label,
+            style: const TextStyle(color: NanoColors.textDim, fontSize: 10)),
+      ],
     );
   }
 
@@ -1506,7 +1797,10 @@ class ClipCard extends StatelessWidget {
         Text(
           mse.complete
               ? 'streamed in full'
-              : 'streaming · ${mse.bufferedSeconds.toStringAsFixed(0)}s buffered',
+              : (clip.requestedSeconds > 0
+                  ? 'streaming · ${(clip.progress * 100).round()}%'
+                      '${clip.etaSeconds != null ? ' · ~${clip.etaSeconds!.toStringAsFixed(0)}s left' : ''}'
+                  : 'streaming · ${mse.bufferedSeconds.toStringAsFixed(0)}s buffered'),
           style: const TextStyle(color: NanoColors.textDim, fontSize: 10),
         ),
       ],
@@ -1555,10 +1849,10 @@ class ClipCard extends StatelessWidget {
 
   Widget _body(bool ready) {
     final primary = switch (clip.status) {
-      ClipStatus.generating => clip.mse != null
-          ? 'buffering ${clip.bufferedSeconds.toStringAsFixed(1)}s / '
-              '${kStreamGateSeconds.toStringAsFixed(0)}s'
-          : 'generating…',
+      // Show the prompt while generating (so each take is identifiable); the
+      // numeric progress lives in _progressBar below the row.
+      ClipStatus.generating =>
+        clip.prompt.isEmpty ? 'generating…' : clip.prompt,
       ClipStatus.error => clip.error ?? 'failed',
       ClipStatus.ready => clip.prompt.isEmpty ? '(no prompt)' : clip.prompt,
     };

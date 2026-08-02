@@ -1,6 +1,8 @@
 """Inference: mp3 in → mp3 (or wav) out via the trained nano audio GPT."""
 from __future__ import annotations
 
+import contextlib
+import functools
 import io
 import os
 import platform
@@ -11,12 +13,12 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
 
-from model.codec import DACodec
+from diskrot.audio_io import decode_pcm
+from model.codec import DACodec, get_codec
 from model.nano_audio_gpt import GPTConfig, NanoAudioGPT
 from model.text_encoder import CLAPTextEncoder
 from server.prompt_sweetener import PromptSweetener
@@ -78,6 +80,47 @@ def _quantize_torch_linears(model: torch.nn.Module, bits: int, group_size: int =
     quantize_(model, config, filter_fn=filter_fn)
 
 
+# ---- single-GPU generation gate -------------------------------------------
+# The Apple GPU watchdog aborts the whole process ("[METAL] Command buffer
+# execution failed: ... GPU Hang Error", with the other in-flight buffers
+# "Discarded (victim of GPU error/recovery)") when several long MLX generations
+# run on the one local GPU at once — e.g. the webapp's multi-"take" UI firing N
+# concurrent /generate_stream. It's an uncaught C++ abort, not a catchable Python
+# exception, so the only defense is to PREVENT the overcommit: serialize GPU
+# generation. Only the MLX (local Apple-Silicon) path needs this — CUDA/Modal
+# handle concurrency via batching + container scale-out, so the gate stays a
+# no-op there (enabled only once an MLX engine loads). Tune with
+# NANO_MAX_CONCURRENT_GEN (default 1 = strict serialize).
+_GEN_GATE = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("NANO_MAX_CONCURRENT_GEN", "1")))
+)
+_GEN_GATE_ON = False  # flipped True the first time an MLX engine is built
+
+
+@contextlib.contextmanager
+def _gpu_gen_gate():
+    """Serialize GPU generation when gating is active (MLX); no-op otherwise."""
+    if not _GEN_GATE_ON:
+        yield
+        return
+    _GEN_GATE.acquire()
+    try:
+        yield
+    finally:
+        _GEN_GATE.release()
+
+
+def _gated(fn):
+    """Hold the GPU gate for a whole (non-streaming) generate call. Streaming
+    methods are generators — they gate inside `_stream_mp3` instead, so the gate
+    spans the actual generation rather than just the generator's creation."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _gpu_gen_gate():
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 class InferenceEngine:
     def __init__(self, ckpt_path: str | None = None, device: str | None = None):
         self.device = device or os.environ.get("NANO_DEVICE") or (
@@ -85,7 +128,14 @@ class InferenceEngine:
             else "mps" if torch.backends.mps.is_available()
             else "cpu"
         )
-        self.codec = DACodec(device=self.device)
+        # NANO_CODEC selects the codec: "dac" (default, mono) or "spectrostream"
+        # (v9, joint stereo). decode() then returns [samples] (mono) or [2,samples].
+        self.codec = get_codec(device=self.device)
+        self.n_channels = getattr(self.codec, "N_CHANNELS", 1)
+        if self.n_channels == 2:
+            # CC-BY-4.0: SpectroStream weights are Google Magenta RealTime.
+            print("[inference] SpectroStream codec (stereo) — audio decode uses "
+                  "SpectroStream (CC-BY-4.0, Google Magenta RealTime)", flush=True)
         self.text_encoder: CLAPTextEncoder | None = None
         self.sweetener: PromptSweetener | None = None  # lazy — only built on first use
         self._demucs = None  # (model, apply_fn) — lazy, only built on first /stem call
@@ -99,13 +149,14 @@ class InferenceEngine:
             if any(k.startswith("_orig_mod.") for k in state):
                 state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
-            # Backend on Apple Silicon: PyTorch-MPS by default (bf16, shares the
-            # CUDA code path and is fully parity-tested), MLX only on explicit
-            # opt-in (NANO_MLX=1) — MLX is faster for single-token decode but a
-            # separate runtime. Elsewhere: PyTorch.
+            # Backend on Apple Silicon: MLX by default (int8, ~1.9x faster than
+            # torch-MPS on the v10 DAC shape and now numerically correct — the CFG
+            # stage-batching that used to collapse DAC to noise is run unbatched,
+            # and activations/head default to fp32). Opt back out to the
+            # parity-tested torch-MPS path with NANO_MLX=0. Elsewhere: PyTorch.
             self.backend = (
                 "mlx"
-                if os.environ.get("NANO_MLX", "0") == "1"
+                if os.environ.get("NANO_MLX", "1") != "0"
                 and self.device == "mps"
                 and _mlx_available()
                 else "torch"
@@ -116,13 +167,25 @@ class InferenceEngine:
                 from model.nano_audio_gpt_mlx import MLXNanoAudioGPT
 
                 bits = int(os.environ.get("NANO_MLX_BITS", "8"))
-                # bf16 (not fp16): this is the training dtype, and fp16's narrow
-                # exponent range collapses the rollout (see the torch-path note).
+                # Activation dtype. bf16 is the training dtype, BUT on the v10 DAC
+                # shape MLX's bf16 matmul accumulation drifts ~2% argmax vs torch
+                # and the rollout compounds it into noise (torch-bf16 itself is
+                # 97.6% vs fp32 and stays coherent; MLX bf16-act is only ~95.8%).
+                # fp32 activations (int8 weights kept) recover ~97.8% ≈ the torch
+                # coherence bar. NANO_MLX_ACT_DTYPE=fp32|bf16 (default fp32 for DAC
+                # correctness). The head is always fp32 (MLXNanoAudioGPT fp32_head).
+                act = os.environ.get("NANO_MLX_ACT_DTYPE", "fp32").lower()
+                act_dtype = mx.float32 if act == "fp32" else mx.bfloat16
                 self.model = MLXNanoAudioGPT(
-                    cfg, state, dtype=mx.bfloat16, bits=bits if bits in (4, 8) else None
+                    cfg, state, dtype=act_dtype, bits=bits if bits in (4, 8) else None
                 )
                 print(f"[inference] backend: mlx (Apple Silicon), weights="
-                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}")
+                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}"
+                      f", act={act}, fp32_head={self.model._fp32_head}")
+                # One local GPU — serialize generation so concurrent requests
+                # can't overcommit it into a watchdog GPU hang (see _gpu_gen_gate).
+                global _GEN_GATE_ON
+                _GEN_GATE_ON = True
             else:
                 self.model = NanoAudioGPT(cfg).to(self.device)
                 self.model.load_state_dict(state)
@@ -211,6 +274,45 @@ class InferenceEngine:
                   f"vocab_per_codebook={cfg.vocab_per_codebook}")
             print(f"[inference] model: {self.model.num_params()/1e6:.2f}M params on {self.device}")
 
+            # From-scratch bootstrap seed: ~1s of ENCODED-SILENCE tokens instead of
+            # _resolve_prompt's uniform-random column. The random seed frame sits
+            # far off the training manifold; at K=24/25Hz it poisons the whole
+            # rollout (from-scratch beat ~0.15) and the poison spans the entire
+            # 23-frame delay ramp. A full-ramp silence runway restores structure
+            # (beat ~0.48, matching real-context /extend at 0.52 — 2026-07-13 A/B;
+            # a 1-frame silence seed does NOT help, the ramp must be covered).
+            # v8-era history: a DAC silence seed was removed for collapsing
+            # high-energy prompts to silence — the v9 A/B showed no collapse
+            # (techno cfg5: RMS 0.087, 0% silent frames), so it returns for v9.
+            # Torch backend only; failure degrades to the legacy random seed.
+            # SPECTROSTREAM-ONLY: on DAC the silence runway re-created the exact
+            # v8-era collapse (2026-07-22, v10_dac_2b: 100% silence at every
+            # cfg 1-10, both modes, steps 58k/84k/87k; the same checkpoint
+            # /extend-s real audio fine and makes bursty audio from the legacy
+            # random seed). DAC's silence attractor is too strong — never seed
+            # a DAC rollout with encoded silence.
+            self._silence_seed: torch.Tensor | None = None
+            _is_ss = type(self.codec).__name__.startswith("SpectroStream")
+            if self.backend == "torch" and _is_ss:
+                try:
+                    n_ch = getattr(self.codec, "N_CHANNELS", 1)
+                    n_seed = self.model.cfg.n_codebooks + 1  # cover the delay ramp
+                    sil = torch.zeros(n_ch, int(self.codec.SAMPLE_RATE * 1.5))
+                    seed = self.codec.encode(sil)
+                    if seed.dim() == 3:
+                        seed = seed[0]
+                    self._silence_seed = (
+                        seed[: self.model.cfg.n_codebooks, :n_seed].cpu().long()
+                    )
+                    print(f"[inference] bootstrap seed: encoded silence "
+                          f"({self._silence_seed.shape[1]} frames)")
+                except Exception as e:  # noqa: BLE001 — seed is an enhancement, not load-bearing
+                    print(f"[inference] bootstrap seed unavailable ({type(e).__name__}: {e}); "
+                          "falling back to random seed frame")
+            elif self.backend == "torch":
+                print("[inference] bootstrap seed: random (DAC — silence seed "
+                      "collapses DAC rollouts, SpectroStream-only)")
+
             # load text encoder if model was trained with text conditioning
             if cfg.use_text_conditioning:
                 self.text_encoder = CLAPTextEncoder(d_out=cfg.d_model, device=self.device)
@@ -278,28 +380,28 @@ class InferenceEngine:
     def _build_conditioning(
         self,
         text: str | None = None,
+        lyrics: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
         gender: str | None = None,
         bpm: float | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Build conditioning from text (tags + lyrics), style audio, or both.
+        """Build conditioning from tags (``text``), lyrics, style audio, or a mix.
 
-        text may contain tags and lyrics separated by ". " (combined by the
-        server). Tags go through the pooled CLAP encoder; lyrics are phonemized
-        (g2p) into a token sequence for the LyricEncoder cross-attention — they no
-        longer go through CLAP. Style audio (when given) blends into the tag
-        embedding. ``gender`` ("male"/"female") and ``bpm`` (a tempo in BPM) ride
-        the lyric stream as leading markers — see below. Returns ``(tag_emb [1,1,D]
-        | None, lyric_ids [1,L] | None, lyric_mask [1,L] | None)``.
+        Tags and lyrics travel as SEPARATE fields — there is no ". " splitting, so
+        a long prose / multi-sentence tag description is never shattered into the
+        lyrics slot. ``text`` is the tag description: it's split into <=77-token
+        chunks and each chunk pooled by CLAP, so the decoder cross-attends to the
+        WHOLE description (``encode_chunked``) instead of one truncated vector.
+        ``lyrics`` is phonemized (g2p) for the LyricEncoder cross-attention. Style
+        audio (when given) is appended as an extra CLAP position. ``gender`` /
+        ``bpm`` ride the lyric stream as leading markers (see below). Returns
+        ``(tag_emb [1,N,D] | None, lyric_ids [1,L] | None, lyric_mask [1,L] |
+        None)``. The tag cross-attn mask is None for a single item (no padding —
+        the model attends to all N); batching builds it in ``_stack_conditioning``.
         """
-        # Split tags from lyrics (server joins them as "tags. lyrics")
-        tags_str = ""
-        lyrics_str = ""
-        if text and text.strip():
-            parts = text.split(". ", 1)
-            tags_str = parts[0]
-            lyrics_str = parts[1] if len(parts) > 1 else ""
+        tags_str = (text or "").strip()
+        lyrics_str = (lyrics or "").strip()
 
         # A selected vocal gender / tempo rides the lyric stream as a leading
         # [male]/[female] / [NNNbpm] bracket — the same dense header markers the
@@ -318,11 +420,12 @@ class InferenceEngine:
         if bpm is not None and bpm > 0:
             lyrics_str = f"[{bpm:g}bpm] {lyrics_str}".rstrip()
 
-        # --- Tags (pooled CLAP, position 0) + optional style-audio blend ---
+        # --- Tags (chunked CLAP sequence) + optional style-audio blend ---
         tag_emb = None
         if self.text_encoder is not None:
             if tags_str:
-                tag_emb = self.text_encoder.encode([tags_str]).to(self.device)  # [1,1,D]
+                tag_emb, _ = self.text_encoder.encode_chunked([tags_str])
+                tag_emb = tag_emb.to(self.device)  # [1,N,D]
             if style_audio_bytes:
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     f.write(style_audio_bytes)
@@ -331,8 +434,11 @@ class InferenceEngine:
                     audio_emb = self.text_encoder.encode_audio([style_path]).to(self.device)
                 finally:
                     os.unlink(style_path)
-                tag_emb = audio_emb if tag_emb is None else (
-                    tag_emb * (1 - style_weight) + audio_emb * style_weight
+                # Style ref shares CLAP's joint text/audio space, so it's just one
+                # more cross-attn position: scale the tag chunks by (1-w), append
+                # the style vector scaled by w. (Style-only -> the style vector.)
+                tag_emb = audio_emb if tag_emb is None else torch.cat(
+                    [tag_emb * (1 - style_weight), audio_emb * style_weight], dim=1
                 )
             if tag_emb is not None:
                 tag_emb = tag_emb.to(self._cond_dtype())
@@ -356,6 +462,78 @@ class InferenceEngine:
                 lyric_mask = lyric_ids != PAD_PHONEME_ID
 
         return tag_emb, lyric_ids, lyric_mask
+
+    def _stack_conditioning(
+        self,
+        per_item: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Stack a list of per-item ``_build_conditioning`` results into one batch.
+
+        Input is ``B`` tuples of ``(tag_emb [1,N_i,D] | None, lyric_ids [1,L] |
+        None, lyric_mask [1,L] | None)``; output is the batched
+        ``(tag_emb [B,Nmax,D] | None, tag_kv_mask [B,1,1,Nmax] | None, lyric_ids
+        [B,Lmax] | None, lyric_mask [B,Lmax] | None)`` the model's batch-general
+        decode loop consumes.
+
+        Two NaN/equivalence subtleties make this non-trivial:
+        - **Tags:** each item is now a chunked SEQUENCE whose length N_i differs
+          (different description lengths), so they're padded to ``Nmax`` and an
+          additive mask -inf's the pad of each row (no softmax dilution). A row
+          without tags is a single un-masked ZERO chunk, which (bias-free
+          cross-attn) is *exactly* "skip text conditioning" for that row — so a
+          mixed present/absent batch is well-defined and never fully masked. If no
+          row has tags the whole axis is ``None`` (the model skips it entirely).
+        - **Lyrics:** ``encode_lyrics`` masks padded positions with ``-inf``, and a
+          *fully* padded row would NaN the cross-attn softmax. So when the batch has
+          any lyrics, rows without their own stream are given the minimal BOS+header
+          stream (``text_with_markers_to_phoneme_ids("")`` — the same wordless
+          header the model trains on, never fully padded). If no row has lyrics the
+          axis is ``None``."""
+        B = len(per_item)
+        tags = [t for (t, _, _) in per_item]
+        lyr = [l for (_, l, _) in per_item]
+
+        if all(t is None for t in tags):
+            tag_emb = tag_kv_mask = None
+        else:
+            ref = next(t for t in tags if t is not None)
+            D = ref.shape[-1]
+            n_max = max((t.shape[1] if t is not None else 1) for t in tags)
+            tag_emb = torch.zeros(B, n_max, D, dtype=ref.dtype, device=ref.device)
+            keep = torch.zeros(B, n_max, dtype=torch.bool, device=ref.device)
+            for i, t in enumerate(tags):
+                if t is None:
+                    keep[i, 0] = True  # un-masked zero chunk == "no tags"
+                    continue
+                n = t.shape[1]
+                tag_emb[i, :n] = t[0]
+                keep[i, :n] = True
+            tag_kv_mask = CLAPTextEncoder.additive_kv_mask(keep, tag_emb.dtype)
+
+        if all(l is None for l in lyr):
+            lyric_ids = lyric_mask = None
+        else:
+            from model.lyric_encoder import (
+                BOS_PHONEME_ID, PAD_PHONEME_ID, text_with_markers_to_phoneme_ids,
+            )
+
+            rows: list[torch.Tensor] = []
+            for l in lyr:
+                if l is not None:
+                    rows.append(l[0])  # [L_i]
+                else:  # synthesize the wordless BOS+header stream (never fully padded)
+                    ids = text_with_markers_to_phoneme_ids(
+                        "", max_len=self.model.cfg.max_lyric_len
+                    ) or [BOS_PHONEME_ID]
+                    rows.append(torch.tensor(ids, dtype=torch.long, device=self.device))
+            Lmax = max(r.shape[0] for r in rows)
+            lyric_ids = torch.full(
+                (B, Lmax), PAD_PHONEME_ID, dtype=torch.long, device=self.device
+            )
+            for i, r in enumerate(rows):
+                lyric_ids[i, : r.shape[0]] = r
+            lyric_mask = lyric_ids != PAD_PHONEME_ID
+        return tag_emb, tag_kv_mask, lyric_ids, lyric_mask
 
     def _build_melody(self, melody_audio_bytes: bytes) -> "torch.Tensor":
         """Chroma for the uploaded hum -> melody tensor [1, T, 12] on device.
@@ -386,6 +564,7 @@ class InferenceEngine:
             return torch.float32 if self.device == "cpu" else self._torch_dtype
         return torch.float16
 
+    @_gated
     @torch.no_grad()
     def extend_audio(
         self,
@@ -398,6 +577,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
@@ -421,9 +601,8 @@ class InferenceEngine:
             f.write(full_audio_bytes)
             in_path = f.name
         try:
-            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
-            full_wav = torch.from_numpy(y).unsqueeze(0)
-            full_tokens = self.codec.encode(full_wav)
+            full_wav = self._load_wav(in_path)        # [C, samples] (C matches codec)
+            full_tokens = self._encode_prompt_tokens(full_wav)
         finally:
             os.unlink(in_path)
 
@@ -452,7 +631,9 @@ class InferenceEngine:
             raise ValueError("Overlap window is already at model context limit; reduce overlap_seconds.")
 
         prompt_dev = prompt_tokens.to(self.device)
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics, style_audio_bytes=style_audio_bytes,
+            style_weight=style_weight, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt_dev, num_new_frames=new_frames,
@@ -490,6 +671,7 @@ class InferenceEngine:
         return _encode_audio(full, self.codec.SAMPLE_RATE, meta)
 
 
+    @_gated
     @torch.no_grad()
     def cover_audio(
         self,
@@ -499,6 +681,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         melody_cfg_scale: float | None = None,
         lyric_cfg_scale: float | None = None,
@@ -522,17 +705,19 @@ class InferenceEngine:
         max_total = self.model.cfg.max_seq_len - K + 1
 
         melody = self._build_melody(melody_audio_bytes)  # [1, T, 12]
-        # prompt=None adds a single seed frame (T_prompt=1), so the melody (placed
-        # at the new-frame positions) can be at most max_total - 1 frames.
-        new_frames = min(melody.shape[1], max_total - 1)
+        # The seed runway occupies T_prompt frames, so the melody (placed at the
+        # new-frame positions) can be at most max_total - seed_frames frames.
+        seed_tokens, seed_frames = self._bootstrap()
+        new_frames = min(melody.shape[1], max_total - seed_frames)
         if new_frames <= 0:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
-            prompt=None, num_new_frames=new_frames,
+            prompt=seed_tokens, num_new_frames=new_frames,
             temperature=temperature, top_k=top_k, top_p=top_p,
             text_emb=cond_emb, text_emb_neg=neg_emb,
             lyric_ids=cond_lids, lyric_mask=cond_lmask,
@@ -540,9 +725,9 @@ class InferenceEngine:
             cfg_scale=cfg_scale,
             lyric_cfg_scale=lyric_cfg_scale,
             melody=melody, melody_cfg_scale=melody_cfg_scale,
-        )  # [K, 1 + new_frames]
+        )  # [K, seed_frames + new_frames]
 
-        out_tokens = out_tokens[:, 1:]  # strip the seed frame
+        out_tokens = out_tokens[:, seed_frames:]  # strip the seed runway
         wav = self.codec.decode(out_tokens.cpu())
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)
@@ -554,6 +739,7 @@ class InferenceEngine:
         )
         return _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
 
+    @_gated
     @torch.no_grad()
     def infill_audio(
         self,
@@ -658,13 +844,13 @@ class InferenceEngine:
             f.write(audio_bytes)
             in_path = f.name
         try:
-            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
-            wav = torch.from_numpy(y).unsqueeze(0)
-            codes = self.codec.encode(wav)
+            wav = self._load_wav(in_path)             # [C, samples] (C matches codec)
+            codes = self._encode_prompt_tokens(wav)
         finally:
             os.unlink(in_path)
         return wav, codes
 
+    @_gated
     @torch.no_grad()
     def generate_audio(
         self,
@@ -674,6 +860,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         style_audio_bytes: bytes | None = None,
         style_weight: float = 0.5,
@@ -689,18 +876,18 @@ class InferenceEngine:
         ``text`` and returns it as a third element: (audio_bytes, mime, clap).
         Default stays a 2-tuple so existing callers are unaffected.
 
-        The autoregressive loop is bootstrapped from a single column of random
-        DAC tokens (model.generate picks a fresh seed per call). With the current
-        tight sampling + CFG this produces coherent output the prompt can steer in
-        any direction. (A silence-seed mode existed once but only worked for quiet
-        prompts and collapsed high-energy ones to silence, so it was removed.)
+        The autoregressive loop is bootstrapped from a ~1s runway of encoded-
+        silence tokens (see ``_bootstrap``): the legacy single random seed column
+        sits far off the training manifold and at K=24/25Hz poisons the whole
+        rollout (2026-07-13 A/B: beat ~0.15 random vs ~0.48 silence-seeded). The
+        v8-era silence seed was removed for collapsing high-energy prompts to
+        silence; the v9 A/B showed no such collapse (techno cfg5 RMS 0.087), but
+        watch for it on quiet prompts.
         """
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1  # T_total such that T_total + K - 1 <= max_seq_len
 
-        # Pass None so model.generate() picks a fresh random seed per call.
-        seed_tokens = None
-        seed_frames = 1
+        seed_tokens, seed_frames = self._bootstrap()
 
         new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
         if seed_frames + new_frames > max_total:
@@ -708,7 +895,9 @@ class InferenceEngine:
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, style_audio_bytes, style_weight, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics, style_audio_bytes=style_audio_bytes,
+            style_weight=style_weight, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         out_tokens = self.model.generate(
             prompt=seed_tokens, num_new_frames=new_frames,
@@ -745,12 +934,129 @@ class InferenceEngine:
             # CLAP's loader never has to decode mp3.
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 tmp = f.name
-                sf.write(tmp, wav.squeeze().contiguous().cpu().numpy(), self.codec.SAMPLE_RATE)
+                # CLAP is mono — downmix a stereo render before scoring.
+                clap_wav = (wav.mean(dim=0) if wav.dim() == 2 and wav.shape[0] > 1
+                            else wav.squeeze())
+                sf.write(tmp, clap_wav.contiguous().cpu().numpy(), self.codec.SAMPLE_RATE)
             try:
                 clap = self.text_encoder.audio_text_similarity(tmp, text)
             finally:
                 os.unlink(tmp)
         return body, mime, clap
+
+    @_gated
+    @torch.no_grad()
+    def generate_audio_batch(
+        self,
+        requests: list[dict],
+        seconds: float = 30.0,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 7.0,
+        lyric_cfg_scale: float | None = None,
+        on_item=None,
+    ) -> list[tuple[bytes, str]]:
+        """Generate B clips from scratch in ONE batched forward — the throughput
+        path behind POST /generate_batch ("generate 8 at once" on a single GPU).
+
+        Because autoregressive decode is memory-bandwidth-bound (each step streams
+        all ~2B weights from HBM regardless of batch), B clips cost ≈ the wall-clock
+        of one. The model's decode loop is already batch-general; this method only
+        builds the batched prompt/conditioning and decodes each row to its own mp3.
+
+        ``requests``: one dict per clip with keys ``text`` / ``negative_text`` /
+        ``gender`` / ``bpm`` (all optional). ``seconds``, the sampling ladder,
+        ``cfg_scale`` and ``lyric_cfg_scale`` are SHARED across the batch — the
+        decode loop applies one set batch-wide (per-item sampling/length would mean
+        un-batching the sampler; not worth it). ``on_item(i, body, mime)`` is called
+        as each clip finishes encoding, so the caller can persist/emit eagerly.
+
+        Returns ``[(body, mime), ...]`` in request order."""
+        if not requests:
+            return []
+        B = len(requests)
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+        seed_tokens, seed_frames = self._bootstrap()
+        new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
+        if seed_frames + new_frames > max_total:
+            new_frames = max(0, max_total - seed_frames)
+        if new_frames == 0:
+            raise ValueError("Requested duration exceeds model context limit.")
+
+        pos = [
+            self._build_conditioning(r.get("text"), lyrics=r.get("lyrics"),
+                                     gender=r.get("gender"), bpm=r.get("bpm"))
+            for r in requests
+        ]
+        neg = [self._build_conditioning(r.get("negative_text")) for r in requests]
+        cond_emb, cond_tkv, cond_lids, cond_lmask = self._stack_conditioning(pos)
+        neg_emb, neg_tkv, neg_lids, neg_lmask = self._stack_conditioning(neg)
+
+        if seed_tokens is not None:
+            prompt = seed_tokens.unsqueeze(0).expand(B, -1, -1).contiguous()
+        else:
+            prompt, _ = self.model._resolve_prompt(None, batch_size=B)  # [B, K, 1]
+        has_cond = any(
+            x is not None for x in (cond_emb, neg_emb, cond_lids, neg_lids)
+        )
+        out = self.model.generate(
+            prompt=prompt, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb,
+            text_kv_mask=cond_tkv, text_kv_mask_neg=neg_tkv,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            cfg_scale=cfg_scale if has_cond else 1.0,
+            lyric_cfg_scale=lyric_cfg_scale,
+        )  # [B, K, seed_frames + new_frames]
+        out = out[:, :, seed_frames:].cpu()  # strip seed -> [B, K, new_frames]
+
+        results: list[tuple[bytes, str]] = []
+        for i in range(B):
+            wav = self.codec.decode(out[i])  # [samples]
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            meta = self._gen_metadata(
+                "generate", text=requests[i].get("text"),
+                negative_text=requests[i].get("negative_text"),
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                cfg_scale=cfg_scale, seconds=seconds,
+            )
+            body, mime = _encode_audio(wav, self.codec.SAMPLE_RATE, meta)
+            if on_item is not None:
+                on_item(i, body, mime)
+            results.append((body, mime))
+        return results
+
+    def _encode_prompt_tokens(self, wav: torch.Tensor) -> torch.Tensor:
+        """codec.encode sliced to the model's codebook count. The codec may store
+        a deeper RVQ stack than the model consumes (SpectroStream stores 32, the
+        model trains on the K=24 prefix — the same slice TokenDataset applies to
+        the packed corpus), so every audio-prompt path must take the prefix or
+        generate()'s K assertion trips."""
+        return self.codec.encode(wav)[: self.model.cfg.n_codebooks]
+
+    def _bootstrap(self) -> tuple[torch.Tensor | None, int]:
+        """From-scratch seed: (silence tokens [K, T] on device, T), or (None, 1)
+        when the silence seed is unavailable (model.generate then falls back to
+        its legacy random column). The runway covers the full K-1 delay ramp —
+        a 1-frame seed measurably does NOT restore bootstrap coherence."""
+        if self._silence_seed is None:
+            return None, 1
+        return self._silence_seed.to(self.device), int(self._silence_seed.shape[1])
+
+    def _load_wav(self, path: str) -> torch.Tensor:
+        """Load an uploaded clip to ``[C, samples]`` matching the codec's channel
+        count (mono for DAC, stereo for SpectroStream; a mono source is duplicated
+        to L=R) so prompt-encode and the kept-prefix stitch stay channel-consistent
+        with the decoded output."""
+        # Shared ffmpeg decoder — the SAME one tokenize uses, so prompt-encode
+        # tokens stay on-distribution with the trained corpus. Returns [C, N]
+        # (mono source upmixed to L=R for a stereo codec).
+        y = decode_pcm(path, self.codec.SAMPLE_RATE, self.n_channels)
+        return torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
 
     def _decode_chunk(
         self, all_new: torch.Tensor, f0: int, f1: int, ctx: int, hop: int
@@ -766,9 +1072,14 @@ class InferenceEngine:
         """
         start = max(0, f0 - ctx)
         window = all_new[:, start:f1]              # [K, w] long, cpu
-        wav = self.codec.decode(window)            # [samples] float, cpu
+        wav = self.codec.decode(window)            # [samples] (mono) or [2,samples]
         drop = (f0 - start) * hop
-        return wav[drop:].contiguous().numpy().astype("float32")
+        if wav.dim() == 1:
+            return wav[drop:].contiguous().numpy().astype("float32")  # mono [kept]
+        # stereo [2, samples] -> interleaved [kept*2] f32 (L0,R0,L1,R1,...) so the
+        # raw-PCM ffmpeg pipe in _stream_mp3 reads it with -ac 2.
+        kept = wav[:, drop:].transpose(0, 1).contiguous()  # [kept, 2]
+        return kept.reshape(-1).numpy().astype("float32")
 
     def _stream_mp3(self, producer_fn, *, meta, on_complete, cancel=None):
         """Run ONE persistent ffmpeg (raw f32 mono PCM -> mp3), yielding mp3 bytes
@@ -781,12 +1092,13 @@ class InferenceEngine:
         producer is cancelled, ffmpeg killed, and nothing is saved. Shared by the
         generate / extend / cover stream paths."""
         sr = self.codec.SAMPLE_RATE
+        n_ch = getattr(self, "n_channels", 1)  # mono unless a stereo codec is loaded
         if cancel is None:
             cancel = threading.Event()
         try:
             proc = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-f", "f32le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0",
+                 "-f", "f32le", "-ar", str(sr), "-ac", str(n_ch), "-i", "pipe:0",
                  "-codec:a", "libmp3lame", "-b:a", "192k",
                  "-f", "mp3", "-id3v2_version", "0", "pipe:1"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -805,7 +1117,11 @@ class InferenceEngine:
 
         def _produce():
             try:
-                producer_fn(_append, cancel)
+                # Hold the single-GPU gate for the whole generation (incl. the
+                # interleaved DAC decode the consumer drives between chunks), so
+                # concurrent stream requests serialize instead of hanging the GPU.
+                with _gpu_gen_gate():
+                    producer_fn(_append, cancel)
             except BaseException as e:  # BrokenPipe on disconnect, OOM, etc.
                 err_box["err"] = e
                 cancel.set()
@@ -843,7 +1159,11 @@ class InferenceEngine:
                 pass
 
         if completed and pcm_parts and on_complete is not None:
-            full = torch.from_numpy(np.concatenate(pcm_parts))[None]  # [1, samples]
+            flat = np.concatenate(pcm_parts)  # interleaved f32
+            if n_ch == 2:
+                full = torch.from_numpy(flat.reshape(-1, 2).T.copy())  # [2, samples]
+            else:
+                full = torch.from_numpy(flat)[None]  # [1, samples]
             body, mime = _encode_audio(full, sr, meta)
             on_complete(body, mime)
 
@@ -893,6 +1213,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         lyric_cfg_scale: float | None = None,
         gender: str | None = None,
@@ -907,15 +1228,17 @@ class InferenceEngine:
         is bit-identical to ``generate``; see ``_stream_mp3`` for the topology."""
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
+        seed_tokens, seed_frames = self._bootstrap()
         new_frames = int(seconds * self.codec.FRAME_RATE_HZ)
-        if 1 + new_frames > max_total:  # +1 seed frame
-            new_frames = max(0, max_total - 1)
+        if seed_frames + new_frames > max_total:
+            new_frames = max(0, max_total - seed_frames)
         if new_frames == 0:
             raise ValueError("Requested duration exceeds model context limit.")
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
-        prompt, _ = self.model._resolve_prompt(None)  # random seed frame [1, K, 1]
+        prompt = (seed_tokens.unsqueeze(0) if seed_tokens is not None
+                  else self.model._resolve_prompt(None)[0])  # [1, K, T_seed]
         meta = self._gen_metadata(
             "generate", text=text, negative_text=negative_text,
             temperature=temperature, top_k=top_k, top_p=top_p,
@@ -944,6 +1267,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         lyric_cfg_scale: float | None = None,
         gender: str | None = None,
@@ -960,9 +1284,8 @@ class InferenceEngine:
             f.write(full_audio_bytes)
             in_path = f.name
         try:
-            y, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=True)
-            full_wav = torch.from_numpy(y).unsqueeze(0)
-            full_tokens = self.codec.encode(full_wav)
+            full_wav = self._load_wav(in_path)        # [C, samples] (C matches codec)
+            full_tokens = self._encode_prompt_tokens(full_wav)
         finally:
             os.unlink(in_path)
 
@@ -992,7 +1315,7 @@ class InferenceEngine:
         prefix_pcm = full_wav[:, :keep_samples].squeeze(0).contiguous().numpy().astype("float32")
 
         prompt, _ = self.model._resolve_prompt(prompt_tokens.to(self.device))
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
         meta = self._gen_metadata(
             "extend", text=text, negative_text=negative_text,
@@ -1020,6 +1343,7 @@ class InferenceEngine:
         top_p: float | None | list[float | None] = 0.95,
         cfg_scale: float = 3.0,
         text: str | None = None,
+        lyrics: str | None = None,
         negative_text: str | None = None,
         melody_cfg_scale: float | None = None,
         lyric_cfg_scale: float | None = None,
@@ -1040,14 +1364,16 @@ class InferenceEngine:
         K = self.model.cfg.n_codebooks
         max_total = self.model.cfg.max_seq_len - K + 1
         melody = self._build_melody(melody_audio_bytes)  # [1, T, 12]
-        new_frames = min(melody.shape[1], max_total - 1)
+        seed_tokens, seed_frames = self._bootstrap()
+        new_frames = min(melody.shape[1], max_total - seed_frames)
         if new_frames <= 0:
             raise ValueError("Melody audio is too short or context limit too small.")
         melody = melody[:, :new_frames, :]
 
-        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, gender=gender, bpm=bpm)
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(text, lyrics=lyrics, gender=gender, bpm=bpm)
         neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
-        prompt, _ = self.model._resolve_prompt(None)  # seed frame; chroma drives contour
+        prompt = (seed_tokens.unsqueeze(0) if seed_tokens is not None
+                  else self.model._resolve_prompt(None)[0])  # seed runway; chroma drives contour
         meta = self._gen_metadata(
             "cover", text=text, negative_text=negative_text,
             temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
@@ -1084,6 +1410,7 @@ class InferenceEngine:
                 ) from e
         return self._demucs
 
+    @_gated
     @torch.no_grad()
     def separate_stems(self, audio_bytes: bytes, keep: list[str]) -> tuple[bytes, str]:
         """Separate the upload with Demucs and remix only the ``keep`` stems.
@@ -1105,14 +1432,12 @@ class InferenceEngine:
             f.write(audio_bytes)
             in_path = f.name
         try:
-            # Demucs is a stereo model — load stereo (mono->stereo if needed).
-            audio, _ = librosa.load(in_path, sr=self.codec.SAMPLE_RATE, mono=False)
+            # Demucs is a stereo model — decode stereo (mono upmixed to L=R by
+            # the shared ffmpeg decoder, matching the old librosa mono->stereo).
+            audio = decode_pcm(in_path, self.codec.SAMPLE_RATE, 2)  # [2, T] f32
         finally:
             os.unlink(in_path)
-        wav = torch.from_numpy(audio)  # [2, T] or [T]
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0).repeat(2, 1)  # mono -> stereo
-        wav = wav.unsqueeze(0).to(self.device)  # [1, 2, T]
+        wav = torch.from_numpy(audio).unsqueeze(0).to(self.device)  # [1, 2, T]
 
         sources = apply_fn(model, wav, device=self.device)  # [1, S, 2, T]
         mixed = sources[0, keep_idx].sum(dim=0)  # [2, T] — sum kept stems
@@ -1124,6 +1449,128 @@ class InferenceEngine:
             removed=",".join(n for n in names if n not in keep),
         )
         return _encode_audio(mono, self.codec.SAMPLE_RATE, meta)
+
+    @_gated
+    @torch.no_grad()
+    def add_stem(
+        self,
+        audio_bytes: bytes,
+        target_stem: str,
+        temperature: float | list[float] = 0.9,
+        top_k: int | None | list[int | None] = 50,
+        top_p: float | None | list[float | None] = 0.95,
+        cfg_scale: float = 3.0,
+        text: str | None = None,
+        negative_text: str | None = None,
+        stem_cfg_scale: float | None = None,
+        output: str = "mix",
+        lyrics: str | None = None,
+        lyric_cfg_scale: float | None = None,
+    ) -> tuple[bytes, str]:
+        """Generate a NEW isolated stem that fits an existing song (the /addstem path).
+
+        The generative inverse of ``/stem``'s removal: the upload is Demucs-separated,
+        the model conditions on the song's OTHER stems (everything except
+        ``target_stem``) + ``text`` (the desired stem's vibe, e.g. "funky 70s warbly
+        bassline") and generates ``target_stem`` from scratch. ``output="mix"`` (the
+        default) returns the song with the new stem summed in; ``output="stem"``
+        returns the isolated generated stem alone. Needs a stem-trained checkpoint
+        (``use_stem_conditioning``) and the ``demucs`` package. Returns (bytes, mime).
+
+        ``lyrics`` applies ONLY when ``target_stem='vocals'`` — the model then sings
+        those words (phoneme + marker stream, like /generate) over the song's other
+        stems. Ignored for drums/bass/other (instrumental stems have no words).
+        """
+        if not getattr(self.model.cfg, "use_stem_conditioning", False):
+            raise RuntimeError(
+                "This checkpoint was trained without stem conditioning — /addstem "
+                "needs a model with use_stem_conditioning=True."
+            )
+        from diskrot.stems import extract_stem_tokens
+        from model.stem_encoder import STEM_TYPES, STEM_TYPE_TO_ID
+
+        target = (target_stem or "").lower().strip()
+        if target not in STEM_TYPE_TO_ID:
+            raise ValueError(
+                f"unknown target_stem {target_stem!r}; valid: {', '.join(STEM_TYPES)}")
+        target_id = STEM_TYPE_TO_ID[target]
+
+        demucs = self._ensure_demucs()
+        K = self.model.cfg.n_codebooks
+        max_total = self.model.cfg.max_seq_len - K + 1
+
+        # Separate + tokenize every stem of the upload via the SHARED extractor —
+        # byte-identical to the training stem cache (diskrot.stems).
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_bytes)
+            in_path = f.name
+        try:
+            tokens = extract_stem_tokens(in_path, self.codec, demucs, device=self.device)
+            orig_wav = self._load_wav(in_path) if output == "mix" else None
+        finally:
+            os.unlink(in_path)
+
+        cond_names = [n for n in STEM_TYPES if n != target]
+        new_frames = min(int(tokens[target].shape[1]), max_total - 1)
+        if new_frames <= 0:
+            raise ValueError("Audio is too short or the context limit too small.")
+        dev = self.device
+        # Condition on the OTHER stems (target excluded), sliced to the model's K.
+        cond_stack = torch.stack(
+            [tokens[n][:K, :new_frames] for n in cond_names], dim=0
+        )[None].to(dev)  # [1, S, K, new_frames] long
+        cond_types = torch.tensor(
+            [STEM_TYPE_TO_ID[n] for n in cond_names], device=dev, dtype=torch.long)[None]
+        cond_present = torch.ones(1, len(cond_names), device=dev)
+        target_type = torch.tensor([target_id], device=dev, dtype=torch.long)
+
+        # Lyrics only apply to a vocals target (the only stem that sings words). For
+        # the other stems the lyric stream stays off, matching how the model trained.
+        use_lyrics = (target == "vocals" and bool((lyrics or "").strip())
+                      and getattr(self.model.cfg, "use_lyric_conditioning", False))
+        cond_emb, cond_lids, cond_lmask = self._build_conditioning(
+            text, lyrics=lyrics if use_lyrics else None)
+        neg_emb, neg_lids, neg_lmask = self._build_conditioning(negative_text)
+        out_tokens = self.model.generate(
+            prompt=None, num_new_frames=new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=cond_emb, text_emb_neg=neg_emb, cfg_scale=cfg_scale,
+            lyric_ids=cond_lids, lyric_mask=cond_lmask,
+            lyric_ids_neg=neg_lids, lyric_mask_neg=neg_lmask,
+            lyric_cfg_scale=lyric_cfg_scale if use_lyrics else None,
+            stem_tokens=cond_stack, stem_types=cond_types, stem_present=cond_present,
+            target_stem_type=target_type, stem_cfg_scale=stem_cfg_scale,
+        )  # [K, 1 + new_frames]
+        out_tokens = out_tokens[:, 1:]  # strip the seed frame
+        stem_wav = self.codec.decode(out_tokens.cpu())  # [C, samples] or [samples]
+        if stem_wav.dim() == 1:
+            stem_wav = stem_wav.unsqueeze(0)
+
+        if output == "stem":
+            result = stem_wav
+        else:
+            ow = orig_wav.unsqueeze(0) if orig_wav.dim() == 1 else orig_wav
+            # Match channel count, then sum the new stem onto the song (truncate to
+            # the shorter side) and normalize if the sum clips.
+            if ow.shape[0] != stem_wav.shape[0]:
+                if stem_wav.shape[0] == 1:
+                    stem_wav = stem_wav.repeat(ow.shape[0], 1)
+                elif ow.shape[0] == 1:
+                    ow = ow.repeat(stem_wav.shape[0], 1)
+            n = min(ow.shape[1], stem_wav.shape[1])
+            result = ow[:, :n] + stem_wav[:, :n]
+            peak = result.abs().max()
+            if peak > 1.0:
+                result = result / peak
+
+        meta = self._gen_metadata(
+            "addstem", text=text, negative_text=negative_text,
+            temperature=temperature, top_k=top_k, top_p=top_p, cfg_scale=cfg_scale,
+            target_stem=target, output=output, stem_cfg_scale=stem_cfg_scale,
+            lyrics=(lyrics if use_lyrics else None),
+            seconds=new_frames / self.codec.FRAME_RATE_HZ,
+        )
+        return _encode_audio(result, self.codec.SAMPLE_RATE, meta)
 
 
 def _crossfade_concat(
@@ -1151,13 +1598,20 @@ def _crossfade_concat(
 def _encode_audio(
     wav: torch.Tensor, sr: int, metadata: dict[str, str] | None = None
 ) -> tuple[bytes, str]:
-    """Encode [1, samples] mono float audio to mp3 (via subprocess ffmpeg) or fall back to wav.
+    """Encode mono [1,samples] OR stereo [2,samples] float audio to mp3 (via
+    subprocess ffmpeg) or fall back to wav. ffmpeg/libmp3lame preserve the channel
+    count from the written WAV, so no -ac is needed.
 
     Any `metadata` dict is written into the mp3 as ID3v2 TXXX (user-defined) frames
     — keys are namespaced `nano_*`, none of which collide with standard frames, so
     ffmpeg's id3v2 muxer emits each as a TXXX frame. The wav fallback carries no
     metadata (only reached when ffmpeg is unavailable)."""
-    audio = wav.squeeze().contiguous().cpu().numpy()  # [samples]
+    arr = wav.detach().contiguous().cpu().numpy()
+    # soundfile wants channels-LAST: mono -> [samples]; stereo [2,samples] -> [samples,2].
+    if arr.ndim == 2:
+        audio = arr[0] if arr.shape[0] == 1 else arr.T
+    else:
+        audio = arr
 
     wav_buf = io.BytesIO()
     sf.write(wav_buf, audio, sr, format="WAV", subtype="PCM_16")

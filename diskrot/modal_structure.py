@@ -22,15 +22,14 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import (
+    ProgressReporter,
+    assert_stage_produced_output,
+    corpus_mount,
+    wave_subdir,
+)
+
 app = modal.App("nano-structure")
-
-
-def _cache_demucs():
-    # allin1 uses demucs internally for source separation; pre-cache it into the
-    # image so containers don't each re-download on cold start.
-    from demucs.pretrained import get_model
-
-    get_model("htdemucs")
 
 
 image = (
@@ -82,11 +81,32 @@ image = (
         "demucs",
     )
     .run_commands("pip install 'protobuf>=4'")
-    .run_function(_cache_demucs)
+    # Cache the Demucs htdemucs weights into the image layer (allin1 uses demucs
+    # internally for source separation, so containers don't each re-download on
+    # cold start). MUST be run_commands (a pure shell step), NOT run_function: a
+    # build-time run_function imports this module to find the callable, but
+    # `diskrot` is only added by the add_local_python_source below (copy=False →
+    # absent at build time), so the top-level `from diskrot...` import fails with
+    # ModuleNotFoundError.
+    .run_commands(
+        "python -c \"from demucs.pretrained import get_model; get_model('htdemucs')\""
+    )
+    # Kill the FutureWarning flood that buries the stage's real progress lines.
+    # Two offenders, both routed through Python's `warnings` module (NOT logging,
+    # so the natten-logger silencing in @enter below can't reach them):
+    #   * natten's @custom_fwd/@custom_bwd decorators warn at IMPORT of
+    #     natten.functional (torch.cuda.amp.custom_* deprecation), and
+    #   * allin1's loaders warn on every torch.load(weights_only=False).
+    # An in-process warnings.filterwarnings() wouldn't cover it — demucs/allin1
+    # spawn child processes that re-import natten fresh, re-emitting the
+    # import-time warnings. PYTHONWARNINGS is inherited by every subprocess, so it
+    # silences parent and children alike. Both are FutureWarning from pinned deps
+    # we don't develop, so blanket-ignoring that one category is pure noise removal.
+    .env({"PYTHONWARNINGS": "ignore::FutureWarning"})
     .add_local_python_source("model", "diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount()  # R2 audio bucket (read-only); see modal_common.corpus_mount
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 
@@ -103,7 +123,17 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     # bottleneck (the silent gap after the fast GPU stages). 4 cores cover the two
     # concurrent batches' beat tracking (one core each) plus Demucs/torch CPU work.
     cpu=4.0,
-    timeout=60 * 60,
+    # allin1 HANGS (not crashes) on rare pathological files, and a hung chunk stalls
+    # its container until the timeout — the old 1h ceiling froze the whole fan-out at
+    # ~99% for up to an hour (observed on base_2: stuck at 4,450/4,498, never
+    # recovering before a manual stop). 10 min bounds that: a healthy 8-song chunk
+    # runs ~4 min (≈20s allin1 setup + the CPU-bound madmom beat tracking), so this
+    # keeps normal chunks safe while killing a hang fast — Modal returns it as a
+    # per-input error (return_exceptions=True) and the pass completes. Collateral: a
+    # timed-out chunk drops ALL its songs (incl. any legit ones sharing it with the
+    # hung file) to <no_section> — acceptable for this optional, sampled stage. Cut
+    # batch_size if that collateral matters more than the per-chunk setup amortization.
+    timeout=10 * 60,
     max_containers=100,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     # allin1 pulls its checkpoint from the HF Hub at runtime; the token lifts the
@@ -124,8 +154,20 @@ class Analyzer:
     def load_models(self):
         # Importing allin1 + warming demucs amortizes model load across the many
         # files this container will process.
+        import logging
+
         import allin1  # noqa: F401
         from demucs.pretrained import get_model
+
+        # allin1's beat/segment backbone calls NATTEN's OLD op names
+        # (natten1dqkrpb/…), which natten 0.17.1 (pinned above) warns about several
+        # times PER model forward. Across the fan-out that's a log flood that buries
+        # the stage's real progress. The pin means the deprecated ops still work, so
+        # the warning is pure noise — silence NATTEN's logger AFTER importing allin1
+        # (which imports natten and configures the logger), so this is the last word.
+        # Both the parent and the emitting child, since natten sets the child level.
+        for _name in ("natten", "natten.functional"):
+            logging.getLogger(_name).setLevel(logging.ERROR)
 
         get_model("htdemucs")
         # Pre-build allin1's segment model once so two concurrent first-calls don't
@@ -175,14 +217,23 @@ STRUCTURE_DIR = "/tokens/structure"
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending() -> list[str]:
-    """Return mp3 filenames not yet in the sharded structure dir."""
-    from diskrot.structure import load_structure_shards
+def list_pending(wave_id: str = "", sample_pct: int = 100) -> list[str]:
+    """Return mp3 names (relative to /corpus) not yet in the sharded structure
+    dir. ``wave_id`` scopes the glob to /corpus/waves/wave_<id>; structure shards
+    key on the song stem either way. ``sample_pct`` (<100) keeps only the
+    deterministic ``_sample_keep`` subset — the cost-reduction lever; the rest of
+    the corpus is never dispatched and falls back to ``<no_section>`` at train
+    time. Filtering here is the single chokepoint, so resume-by-skip is unaffected
+    (already-done sampled songs are skipped; non-sampled songs are never queued)."""
+    from diskrot.structure import _sample_keep, load_structure_shards
 
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
     existing = load_structure_shards(STRUCTURE_DIR)
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
-    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, {len(pending)} pending")
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
+               if mp3.stem not in existing and _sample_keep(mp3.stem, sample_pct)]
+    sampled = "" if sample_pct >= 100 else f" (sampled to {sample_pct}%)"
+    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, "
+          f"{len(pending)} pending{sampled}")
     return pending
 
 
@@ -252,16 +303,20 @@ def save_results(results: list[tuple[str, dict | None, str | None]]):
     nonpreemptible=True,
     retries=modal.Retries(max_retries=3, backoff_coefficient=1.0, initial_delay=10.0),
 )
-def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
+def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
+                wave_id: str = "", sample_pct: int = 100):
     """Dispatch analysis and merge results into the sharded structure dir.
+    ``wave_id`` scopes the pass to /corpus/waves/wave_<id>.
 
     Runs the ``.map()`` collect/flush loop *remotely* so ``--detach`` survives
     terminal close. ``limit`` (>0) caps the number of pending files dispatched —
     use it for the calibration run. ``list_pending`` skips songs already in the
     shards, so re-launching resumes. ``batch_size`` songs share one allin1 call
     (one demucs subprocess + one ensemble load per chunk instead of per song).
+    ``sample_pct`` (<100) runs allin1 on only a deterministic fraction of songs
+    (cost reduction; the rest fall back to ``<no_section>``).
     """
-    pending = list_pending.remote()
+    pending = list_pending.remote(wave_id=wave_id, sample_pct=sample_pct)
     if limit and limit > 0:
         pending = pending[:limit]
     if not pending:
@@ -275,6 +330,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
     batch: list = []
     n_seen = 0
     n_errors = 0
+    rep = ProgressReporter(len(pending), "structure", unit="files")
     # order_outputs=False: a preempted chunk must not head-of-line-block the yield
     # (idling other billing containers); results flush by key so order is moot.
     # return_exceptions=True: a poison chunk must not crash the orchestrator
@@ -289,6 +345,7 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
                       f"{type(result).__name__}: {str(result)[:140]}")
             continue
         n_seen += len(result)
+        rep.update(len(result))
         batch.extend(result)
         if len(batch) >= flush_every:
             print(f"flushing {len(batch)} results ({n_seen}/{len(pending)} done)")
@@ -297,20 +354,27 @@ def orchestrate(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
     if batch:
         print(f"final flush of {len(batch)} results ({n_seen}/{len(pending)} done)")
         save_results.remote(batch)
+    rep.done()
     if n_errors:
         print(f"chunk errors: {n_errors} "
               f"(transient — affected files stay pending; re-run to finish them)")
+    assert_stage_produced_output("structure", n_seen, len(pending), n_errors)
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 50, limit: int = 0, batch_size: int = 8):
+def main(flush_every: int = 50, limit: int = 0, batch_size: int = 8,
+         wave_id: str = "", sample_pct: int = 100):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` (both pieces required: ``.spawn()`` so the entrypoint
     exits without blocking, and ``--detach`` so the app isn't auto-stopped when
     the entrypoint completes). ``--limit 200`` runs the calibration subset.
+    --wave-id N scopes analysis to /corpus/waves/wave_N. ``--sample-pct 50`` runs
+    allin1 on only half the songs (the rest fall back to <no_section>); pair it
+    with the cheap dense ``modal_tempo.py`` pass to keep tempo coverage full.
     """
-    call = orchestrate.spawn(flush_every, limit, batch_size)
+    call = orchestrate.spawn(flush_every, limit, batch_size, wave_id=wave_id,
+                             sample_pct=sample_pct)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

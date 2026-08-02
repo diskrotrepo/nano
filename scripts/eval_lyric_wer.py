@@ -38,7 +38,11 @@ def _prefetch_g2p() -> None:
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libsndfile1")
+    # espeak-ng + phonemizer: required by the v10/IPA-256 lyric path — without
+    # them text_to_phoneme_ids silently drops every word and WER measures a
+    # wordless header (the 2026-07-23 no-vocals eval artifact).
+    .apt_install("ffmpeg", "libsndfile1", "espeak-ng")
+    .pip_install("phonemizer>=3.2")
     # Pin torch to the CUDA-12.1 build: faster-whisper's ctranslate2 links
     # libcublas.so.12, so an unpinned torch>=2.4 (now resolves to a CUDA-13
     # wheel → libcublas.so.13) crashes WhisperModel init at transcribe-back.

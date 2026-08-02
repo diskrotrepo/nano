@@ -2,7 +2,7 @@
 
 Local training on a single NVIDIA RTX 5090 (32 GB VRAM). Suitable for the full pipeline without cloud costs. Linux + CUDA 12.x assumed.
 
-All time estimates below are quoted **per 1,000 songs** on a small experimentation corpus — enough to validate the pipeline locally, but not enough to produce a musical model (see [README.modal.md](README.modal.md) for recommended corpus sizing). Local training runs the **same ~1.5B model** as Modal: the local `diskrot.train` CLI has no architecture flags, so it uses the `GPTConfig` defaults ([model/nano_audio_gpt.py](model/nano_audio_gpt.py)) — d_model=2048, 22 layers, 30s segments, gradient checkpointing on. **At 1.5B this will not fit in 32 GB** even at `--batch-size 1`, so on a 5090 this path is realistically for **validating the pipeline end-to-end**, not full training. To actually train locally, hand-edit the `GPTConfig` defaults to a smaller shape (e.g. the old d_model=1024 / 16-layer / d_ff=4096 ~287M config) first. There's also no sharded-mmap path locally (the whole token cache loads into RAM). For the full 1.5B model on the full corpus, use [README.modal.md](README.modal.md).
+All time estimates below are quoted **per 1,000 songs** on a small experimentation corpus — enough to validate the pipeline locally, but not enough to produce a musical model (see [README.modal.md](README.modal.md) for recommended corpus sizing). Local training runs the **same ~2.08B model** as Modal: the local `diskrot.train` CLI has no architecture flags, so it uses the `GPTConfig` defaults ([model/nano_audio_gpt.py](model/nano_audio_gpt.py)) — d_model=2048, 22 layers, 30s segments, gradient checkpointing on. Without a `NANO_CODEC` override the local path uses the DAC defaults (9 codebooks, ~2.0B); the Modal v9 run instead sets `NANO_CODEC=spectrostream` (SpectroStream, 24 codebooks, joint stereo). **At ~2.08B this will not fit in 32 GB** even at `--batch-size 1`, so on a 5090 this path is realistically for **validating the pipeline end-to-end**, not full training. To actually train locally, hand-edit the `GPTConfig` defaults to a smaller shape (e.g. the old d_model=1024 / 16-layer / d_ff=4096 ~287M config) first. There's also no sharded-mmap path locally (the whole token cache loads into RAM). For the full ~2.08B model on the full corpus, use [README.modal.md](README.modal.md).
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ python -m diskrot.tokenize --corpus /path/to/mp3s --out ./token_cache --device c
 
 ## 2. Auto-tag (optional, needed for text conditioning)
 
-Takes about 20–30 minutes per 1,000 songs.
+The default captioner is the audio-LLM **Qwen2-Audio-7B-Instruct** (whole-song, rich multi-facet caption). In fp16 it needs ~15 GB of VRAM, which fits alongside the pipeline on a 5090's 32 GB. For a lighter run set `NANO_CAPTIONER=bart` to fall back to the legacy LP-MusicCaps BART captioner. Takes about 20–30 minutes per 1,000 songs.
 
 ```bash
 python -m diskrot.auto_tag --corpus /path/to/mp3s --out ./token_cache/tags.json --device cuda
@@ -44,7 +44,7 @@ python -m diskrot.auto_tag --corpus /path/to/mp3s --out ./token_cache/tags.json 
 
 ## 3. Transcribe lyrics (optional)
 
-Takes about 3–4 hours per 1,000 songs (single GPU, sequential).
+Demucs-free: Whisper large-v3-turbo + Silero VAD run on the raw mix (vocal isolation was removed — it was a no-op-to-worse ASR input). Vocal gender comes from the auto-tag captioner instead. Takes about 3–4 hours per 1,000 songs (single GPU, sequential).
 
 ```bash
 python -m diskrot.transcribe_lyrics --corpus /path/to/mp3s --out ./token_cache/lyrics --device cuda
@@ -52,7 +52,7 @@ python -m diskrot.transcribe_lyrics --corpus /path/to/mp3s --out ./token_cache/l
 
 ## 4. Train
 
-Trains the ~1.5B model on 30-second segments. The CLI defaults to 125K steps (lr 2.5e-4, patience 15); cut `--steps` for a quick experimental run. **The default 1.5B shape will OOM on a 32 GB 5090** even at `--batch-size 1` — for real local training, first shrink the `GPTConfig` defaults (see the note at the top). The command below is shown as a pipeline-validation smoke test.
+Trains the ~2.08B model on 30-second segments. The CLI defaults to 125K steps (lr 2.5e-4, patience 15); cut `--steps` for a quick experimental run. **The default ~2.08B shape will OOM on a 32 GB 5090** even at `--batch-size 1` — for real local training, first shrink the `GPTConfig` defaults (see the note at the top). The command below is shown as a pipeline-validation smoke test.
 
 ```bash
 python -m diskrot.train \
@@ -65,7 +65,7 @@ python -m diskrot.train \
   --lyrics-path ./token_cache/lyrics
 ```
 
-`--batch-size 2` only fits once you've shrunk `GPTConfig` to a smaller shape; the default 1.5B model won't fit at any batch size on 32 GB. Drop `--tags-path` / `--lyrics-path` if you skipped steps 2 and 3.
+`--batch-size 2` only fits once you've shrunk `GPTConfig` to a smaller shape; the default ~2.08B model won't fit at any batch size on 32 GB. Drop `--tags-path` / `--lyrics-path` if you skipped steps 2 and 3.
 
 Checkpoints land in `./checkpoints/`. Then follow the [inference instructions](README.md#inference) in the main README.
 

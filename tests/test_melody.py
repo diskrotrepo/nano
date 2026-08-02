@@ -127,7 +127,7 @@ def test_train_inference_chroma_equivalence(tmp_path, monkeypatch):
 
     # The crop window applied to the melody matches the one applied to the tokens.
     monkeypatch.setattr(dataset_mod.random, "randint", lambda lo, hi: 2)
-    tokens, _tags, _lids, melody = ds[0]
+    tokens, _tags, _lids, melody, *_ = ds[0]
     assert melody.shape == (seg, 12)
     expect = torch.from_numpy(stored[:, 2:2 + seg]).to(torch.float32).T
     assert torch.allclose(melody, expect)

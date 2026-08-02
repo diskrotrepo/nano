@@ -2,7 +2,7 @@
 
 Local training on an Apple Silicon M4 Max via PyTorch's MPS backend. Workable for small corpora and experimentation; for full-scale runs prefer [Modal](README.modal.md) or [a 5090](README.5090.md).
 
-All time estimates below are quoted **per 1,000 songs** on a small experimentation corpus — enough to validate the pipeline locally, but not enough to produce a musical model (see [README.modal.md](README.modal.md) for recommended corpus sizing). Local training runs the **same ~1.5B model** as Modal: the local `diskrot.train` CLI has no architecture flags, so it uses the `GPTConfig` defaults ([model/nano_audio_gpt.py](model/nano_audio_gpt.py)) — d_model=2048, 22 layers, 30s segments, gradient checkpointing on. **At 1.5B this needs a large-memory M4 Max (64/128 GB) just to fit, and MPS training is extremely slow at that size** — so on Apple Silicon this path is realistically for **validating the pipeline**, not full training. To actually train locally, hand-edit the `GPTConfig` defaults to a smaller shape (e.g. the old d_model=1024 / 16-layer ~287M config) first. It loads the whole token cache into RAM (no sharded-mmap path locally). For the full 1.5B model on the full corpus, use [README.modal.md](README.modal.md).
+All time estimates below are quoted **per 1,000 songs** on a small experimentation corpus — enough to validate the pipeline locally, but not enough to produce a musical model (see [README.modal.md](README.modal.md) for recommended corpus sizing). Local training runs the **same ~2.08B model** as Modal: the local `diskrot.train` CLI has no architecture flags, so it uses the `GPTConfig` defaults ([model/nano_audio_gpt.py](model/nano_audio_gpt.py)) — d_model=2048, 22 layers, 30s segments, gradient checkpointing on. Without a `NANO_CODEC` override the local path uses the DAC defaults (9 codebooks, ~2.0B); the Modal v9 run instead sets `NANO_CODEC=spectrostream` (SpectroStream, 24 codebooks, joint stereo). **At ~2.08B this needs a large-memory M4 Max (64/128 GB) just to fit, and MPS training is extremely slow at that size** — so on Apple Silicon this path is realistically for **validating the pipeline**, not full training. To actually train locally, hand-edit the `GPTConfig` defaults to a smaller shape (e.g. the old d_model=1024 / 16-layer ~287M config) first. It loads the whole token cache into RAM (no sharded-mmap path locally). For the full ~2.08B model on the full corpus, use [README.modal.md](README.modal.md).
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ python -m diskrot.tokenize --corpus /path/to/mp3s --out ./token_cache --device m
 
 ## 2. Auto-tag (optional, needed for text conditioning)
 
-Takes about 45–65 minutes per 1,000 songs on MPS.
+The default captioner is the audio-LLM **Qwen2-Audio-7B-Instruct** (whole-song, rich multi-facet caption). In fp16 it needs ~15 GB, so a large-memory M4 Max (64/128 GB) is required to run it; on a smaller machine set `NANO_CAPTIONER=bart` to fall back to the lighter legacy LP-MusicCaps BART captioner. Takes about 45–65 minutes per 1,000 songs on MPS.
 
 ```bash
 python -m diskrot.auto_tag --corpus /path/to/mp3s --out ./token_cache/tags.json --device mps
@@ -44,7 +44,7 @@ python -m diskrot.auto_tag --corpus /path/to/mp3s --out ./token_cache/tags.json 
 
 ## 3. Transcribe lyrics (optional)
 
-Demucs and faster-whisper run on CPU on macOS (no MPS support for these models). Takes about 6–8 hours per 1,000 songs.
+Demucs-free: only Whisper large-v3-turbo + Silero VAD run, on the raw mix (vocal isolation was removed — it was a no-op-to-worse ASR input). Whisper runs on CPU on macOS (no MPS support), and vocal gender comes from the auto-tag captioner instead. Takes about 6–8 hours per 1,000 songs.
 
 ```bash
 python -m diskrot.transcribe_lyrics --corpus /path/to/mp3s --out ./token_cache/lyrics
@@ -52,7 +52,7 @@ python -m diskrot.transcribe_lyrics --corpus /path/to/mp3s --out ./token_cache/l
 
 ## 4. Train
 
-Trains the ~1.5B model on 30-second segments. The CLI defaults to 125K steps (lr 2.5e-4, patience 15); cut `--steps` for a quick experimental run. **The default 1.5B shape needs a 64/128 GB M4 Max just to fit and is impractically slow on MPS** — for real local training, first shrink the `GPTConfig` defaults (see the note at the top). The command below is shown as a pipeline-validation smoke test.
+Trains the ~2.08B model on 30-second segments. The CLI defaults to 125K steps (lr 2.5e-4, patience 15); cut `--steps` for a quick experimental run. **The default ~2.08B shape needs a 64/128 GB M4 Max just to fit and is impractically slow on MPS** — for real local training, first shrink the `GPTConfig` defaults (see the note at the top). The command below is shown as a pipeline-validation smoke test.
 
 ```bash
 python -m diskrot.train \
@@ -65,7 +65,7 @@ python -m diskrot.train \
   --lyrics-path ./token_cache/lyrics
 ```
 
-`--batch-size 2` only fits once you've shrunk `GPTConfig` to a smaller shape; the default 1.5B model is too heavy to train at any usable speed on MPS. Drop `--tags-path` / `--lyrics-path` if you skipped steps 2 and 3.
+`--batch-size 2` only fits once you've shrunk `GPTConfig` to a smaller shape; the default ~2.08B model is too heavy to train at any usable speed on MPS. Drop `--tags-path` / `--lyrics-path` if you skipped steps 2 and 3.
 
 Checkpoints land in `./checkpoints/`. Then follow the [inference instructions](README.md#inference) in the main README.
 

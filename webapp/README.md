@@ -2,7 +2,7 @@
 
 A minimalist Flutter web front-end for the nano inference server — white-on-black
 with hot-pink highlights. Exposes every parameter the server accepts across all
-three generation modes.
+four generation modes.
 
 ## Run
 
@@ -22,16 +22,24 @@ url** field at any reachable host — e.g. a deployed Modal endpoint.
 
 ## What's exposed
 
-- **Modes**: `generate` (from scratch), `continue` (extend an uploaded clip from
-  a prompt window), `extend` (append onto the end via an overlap window).
+- **Modes**: `generate` (from scratch), `extend` (append onto the end via an
+  overlap window), `cover` (re-render an uploaded melody's chromagram in the
+  prompt's timbre), `stem` (pure Demucs source separation — keep/drop stems).
+- **Model picker**: `GET /models` lists the server's switchable checkpoints
+  (`NANO_MODELS`); the chosen id rides every request as the `model` field.
 - **Conditioning** (all modes): tags/style prompt, lyrics, negative prompt,
   `sweeten` toggle, optional style-audio upload + `style_weight`.
 - **Sampling** (all modes): `temperature`, `top_k`, `top_p`, `cfg_scale`,
   `lyric_cfg_scale`, plus per-codebook comma-separated overrides for
   temperature / top_k / top_p (under "per-codebook overrides").
 - **generate**: `seconds`, `score_clap`.
-- **continue**: input audio, `add_seconds`, `prompt_seconds`.
 - **extend**: input audio, `add_seconds`, `overlap_seconds`.
+- **cover**: input audio (the melody to cover — its audio never appears in the
+  output, only its chromagram conditions generation) + `melody_cfg_scale`.
+- **stem**: input audio + which Demucs stems to keep (drums/bass/other/vocals) —
+  no model, the server just separates and remixes.
+- **Streaming**: generate plays progressively via `GET /generate_stream`; extend
+  and cover stream over `POST /extend_stream` / `POST /cover_stream`.
 
 The result is played inline, downloadable as `.mp3`/`.wav`, and surfaces the
 `X-Nano-Sweetened-Prompt` and `X-Nano-Clap-Score` response headers when present.

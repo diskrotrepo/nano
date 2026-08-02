@@ -10,6 +10,7 @@ Serves random fixed-length crops via ``__getitem__``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import time
@@ -20,7 +21,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from model.codec import DACodec
+from model.codec import DACodec, codec_constants
+
+# Frame rate of the active codec's tokens (NANO_CODEC): DAC=86 Hz, SpectroStream=25
+# Hz. Drives the seconds<->frames math in crop biasing + structure markers, so it
+# MUST match the codec the corpus was tokenized with.
+_FRAME_RATE_HZ = codec_constants()["frame_rate_hz"]
 
 
 def _load_tags(tags_path: str | Path | None, verbose: bool = True) -> dict[str, str]:
@@ -29,12 +35,70 @@ def _load_tags(tags_path: str | Path | None, verbose: bool = True) -> dict[str, 
     tp = Path(tags_path)
     if not tp.exists():
         return {}
-    raw = json.loads(tp.read_text())
+    # Sharded dir (tags/tags_NNN.json) at scale, or the legacy single tags.json.
+    if tp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(tp, "tags")
+    else:
+        raw = json.loads(tp.read_text())
     tags = {key: val["description"] for key, val in raw.items()
             if isinstance(val, dict) and "description" in val}
     if verbose:
         print(f"[tags] loaded {len(tags)} entries from {tp}", flush=True)
     return tags
+
+
+def _load_tag_gender(tags_path: str | Path | None) -> dict[str, str]:
+    """{stem: 'male'|'female'} from the audio-LLM captioner's per-song ``gender``
+    field in tags.json — the v9 vocal-gender source (replaces the F0-on-Demucs
+    estimate written by transcribe). Only canonical male/female are kept; missing /
+    instrumental / null fall through to the lyrics-entry gender (legacy), then
+    ``<unknown_gender>``. Parsed from the same tags.json as ``_load_tags`` (one
+    extra parse in the parent build, never per-step)."""
+    if tags_path is None:
+        return {}
+    tp = Path(tags_path)
+    if not tp.exists():
+        return {}
+    if tp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(tp, "tags")
+    else:
+        raw = json.loads(tp.read_text())
+    return {key: val["gender"] for key, val in raw.items()
+            if isinstance(val, dict) and val.get("gender") in ("male", "female")}
+
+
+def _load_stem_caps(tags_path: str | Path | None) -> dict[str, tuple[str, ...]]:
+    """Per-stem captions for the /addstem path, from tags.json's optional ``stems``
+    field — ``{name: {"drums": "...", "bass": "...", ...}}``. Returns
+    ``{name: (cap_for_STEM_TYPES[0], ...)}`` in canonical STEM_TYPES order, with
+    "" for any missing stem. Absent entirely when the captioner hasn't emitted
+    per-stem captions yet — the train loop then falls back to the full-song
+    description, so stem-add training works either way (steering just improves once
+    per-stem captions exist)."""
+    if tags_path is None:
+        return {}
+    tp = Path(tags_path)
+    if not tp.exists():
+        return {}
+    from model.stem_encoder import STEM_TYPES
+    if tp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(tp, "tags")
+    else:
+        raw = json.loads(tp.read_text())
+    out: dict[str, tuple[str, ...]] = {}
+    for key, val in raw.items():
+        if not isinstance(val, dict):
+            continue
+        stems = val.get("stems")
+        if not isinstance(stems, dict):
+            continue
+        caps = tuple(str(stems.get(name, "") or "") for name in STEM_TYPES)
+        if any(caps):
+            out[key] = caps
+    return out
 
 
 def _load_phonemes(
@@ -84,12 +148,40 @@ def _load_keys(keys_path: str | Path | None, verbose: bool = True) -> dict[str, 
     kp = Path(keys_path)
     if not kp.exists():
         return {}
-    raw = json.loads(kp.read_text())
+    # Sharded dir (keys/keys_NNN.json) at scale, or the legacy single keys.json.
+    if kp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(kp, "keys")
+    else:
+        raw = json.loads(kp.read_text())
     keys = {name: val["key"] for name, val in raw.items()
             if isinstance(val, dict) and isinstance(val.get("key"), str)}
     if verbose:
         print(f"[keys] loaded {len(keys)} entries from {kp}", flush=True)
     return keys
+
+
+def _load_tempo(tempo_path: str | Path | None, verbose: bool = True) -> dict[str, float]:
+    """Load per-song bpm (diskrot.tempo_detect's tempo.json) for the ``<tempo_*>``
+    header marker. The cheap DENSE tempo source — preferred over the (sampled)
+    structure pass's bpm in ``load_mmap_bundle``. Sparse: a song without an entry
+    falls back to the structure bpm (if any) or ``<unknown_tempo>``. Mirrors
+    ``_load_keys`` (sharded dir or a single JSON)."""
+    if tempo_path is None:
+        return {}
+    tp = Path(tempo_path)
+    if not tp.exists():
+        return {}
+    if tp.is_dir():
+        from diskrot.sharded_store import load_json_shards
+        raw = load_json_shards(tp, "tempo")
+    else:
+        raw = json.loads(tp.read_text())
+    tempo = {name: float(val["bpm"]) for name, val in raw.items()
+             if isinstance(val, dict) and isinstance(val.get("bpm"), (int, float))}
+    if verbose:
+        print(f"[tempo] loaded {len(tempo)} entries from {tp}", flush=True)
+    return tempo
 
 
 # Word-entry validity lives in transcribe_lyrics.is_valid_word (the schema
@@ -200,14 +292,17 @@ def _active_label_at(segs: list[dict] | None, t: float) -> str:
 
 
 def collate_lyrics(batch):
-    """DataLoader collate for TokenDataset's (tokens, tags, lyric_ids, melody) items.
+    """DataLoader collate for TokenDataset's (tokens, tags, lyric_ids, melody, stem)
+    items.
 
     Pads the variable-length phoneme-id sequences to the batch max and builds a
     bool mask (True = real phoneme). Required because default_collate can't stack
     ragged lyric tensors. The melody (chroma) crop is fixed-length (== segment
-    frames) so it stacks directly; it's ``None`` for non-melody packs. Returns
-    (tokens [B,K,T], tags list[str], lyric_ids [B,Lmax], lyric_mask [B,Lmax],
-    melody [B,T,12] | None).
+    frames) so it stacks directly; it's ``None`` for non-melody packs. The stem item
+    is ``(stems [n_stems,K,seg] int16, present float)`` for stem packs, ``None``
+    otherwise — stacked into ``stems [B,n_stems,K,seg]`` + ``stem_present [B]``.
+    Returns (tokens [B,K,T], tags list[str], lyric_ids [B,Lmax], lyric_mask [B,Lmax],
+    melody [B,T,12] | None, stems [B,n_stems,K,seg] | None, stem_present [B] | None).
     """
     from model.lyric_encoder import PAD_PHONEME_ID
 
@@ -221,7 +316,13 @@ def collate_lyrics(batch):
     mask = ids != PAD_PHONEME_ID
     melodies = [b[3] for b in batch]
     melody = torch.stack(melodies) if melodies and melodies[0] is not None else None
-    return tokens, tags, ids, mask, melody
+    stems_in = [b[4] for b in batch] if len(batch[0]) > 4 else None
+    stems = stem_present = stem_caps = None
+    if stems_in and stems_in[0] is not None:
+        stems = torch.stack([s[0] for s in stems_in])  # [B, n_stems, K, seg] int16
+        stem_present = torch.tensor([s[1] for s in stems_in], dtype=torch.float32)
+        stem_caps = [s[2] for s in stems_in]  # list[tuple[str,...]] in STEM_TYPES order
+    return tokens, tags, ids, mask, melody, stems, stem_present, stem_caps
 
 
 
@@ -232,13 +333,16 @@ def _build_mmap_split_index(
     segment_frames: int,
     val_ratio: float,
     seed: int,
+    pad_short: bool = False,
 ) -> tuple[list[tuple[int, int, str, int]], list[tuple[int, int, str, int]], dict]:
     """Build (train_entries, val_entries, shard_metas) over a packed/ dir.
 
     ``entries`` is a list of (shard_id, local_idx, name, n_frames). Songs too
-    short for ``segment_frames`` are filtered out. Train/val split uses the
-    same ``random.Random(seed).shuffle()`` discipline as ``_split_files`` and
-    ``_split_packed`` (sort by name first for shard-order independence).
+    short for ``segment_frames`` are filtered out UNLESS ``pad_short`` (then they
+    are kept and the dataset pads+masks the tail — the v9 full-song path, so every
+    song trains on its full length). Train/val split is a stable
+    per-song hash of the name (+ seed), so adding songs/waves never moves an
+    existing song between splits (see the split block below).
 
     ``shard_metas`` is a dict ``{shard_id: meta}`` so the dataset can read
     offsets without re-opening each JSON sidecar per access.
@@ -251,20 +355,41 @@ def _build_mmap_split_index(
     for shard_id, local_idx, name, n_frames in iter_all_names(packed_dir):
         if shard_id not in shard_metas:
             shard_metas[shard_id] = load_shard_meta(packed_dir, shard_id)
-        # +2 mirrors _load_one: leave headroom for the random crop offset.
-        if n_frames < segment_frames + 2:
+        # +2 mirrors _load_one: leave headroom for the random crop offset. With
+        # pad_short, keep every song (>=1 frame) — songs shorter than the clip are
+        # padded+masked in __getitem__ rather than dropped.
+        if not pad_short and n_frames < segment_frames + 2:
+            continue
+        if pad_short and n_frames < 1:
             continue
         all_entries.append((shard_id, local_idx, name, n_frames))
 
-    # Same deterministic shuffle as _split_packed: sort by name then
-    # random.Random(seed).shuffle(). Same seed -> same split as the v1 path
-    # so re-training on a repacked corpus with the same seed gives the same
-    # train/val partition.
-    all_entries.sort(key=lambda e: e[2])
-    rng = random.Random(seed)
-    rng.shuffle(all_entries)
-    n_val = max(1, int(len(all_entries) * val_ratio))
-    return all_entries[n_val:], all_entries[:n_val], shard_metas
+    # Stable, corpus-growth-invariant split: a song's train/val assignment is a
+    # pure function of its name (+ seed), NOT of the corpus size. So appending
+    # waves never moves an existing song between splits. (The old
+    # sort+random.Random(seed).shuffle()+slice reshuffled the whole corpus every
+    # time it grew, silently churning val membership and leaking val<->train
+    # across waves.) Bucket on sha1(name) — the same hashing discipline the
+    # metadata shards use (transcribe_lyrics._shard_for) — into 10k buckets so
+    # val_ratio is honored to 0.0001 and the realized ratio converges as the
+    # corpus grows. One-time breaking change vs the shuffle split: val membership
+    # differs, so val loss is comparable across all FUTURE runs but not to
+    # pre-switch checkpoints.
+    all_entries.sort(key=lambda e: e[2])  # stable, shard-order-independent order
+    val_cut = int(val_ratio * 10_000)
+
+    def _is_val(name: str) -> bool:
+        h = int(hashlib.sha1(f"{seed}:{name}".encode()).hexdigest()[:8], 16)
+        return (h % 10_000) < val_cut
+
+    train_entries = [e for e in all_entries if not _is_val(e[2])]
+    val_entries = [e for e in all_entries if _is_val(e[2])]
+    # Guarantee a non-empty val set on tiny corpora (e.g. tests / pipeline runs)
+    # where the hash bucket might miss; mirrors the old max(1, ...) floor.
+    if not val_entries and all_entries:
+        val_entries = [all_entries[0]]
+        train_entries = all_entries[1:]
+    return train_entries, val_entries, shard_metas
 
 
 def load_mmap_bundle(
@@ -277,6 +402,8 @@ def load_mmap_bundle(
     structure_path: str | Path | None = None,
     keys_path: str | Path | None = None,
     phonemes_path: str | Path | None = None,
+    tempo_path: str | Path | None = None,
+    pad_short: bool = False,
 ) -> dict:
     """Parent-process bundle for the v2 sharded mmap path.
 
@@ -288,17 +415,28 @@ def load_mmap_bundle(
     packed_dir = Path(packed_dir)
     t0 = time.time()
     train_entries, val_entries, shard_metas = _build_mmap_split_index(
-        packed_dir, segment_frames, val_ratio, seed,
+        packed_dir, segment_frames, val_ratio, seed, pad_short=pad_short,
     )
     # Melody is available iff the pack wrote the parallel chroma sidecars (index
     # flag). The dataset then co-crops chroma with the SAME crop window.
     from diskrot.pack_cache import load_shard_index
-    has_melody = bool(load_shard_index(packed_dir).get("has_melody", False))
+    _index = load_shard_index(packed_dir)
+    has_melody = bool(_index.get("has_melody", False))
+    # Stems available iff the pack wrote the parallel stem sidecars (the /addstem
+    # path). Co-cropped with the SAME window; per-song presence comes from each
+    # shard meta's stem_present list.
+    has_stems = bool(_index.get("has_stems", False))
     print(f"[mmap-bundle] {len(train_entries)} train + {len(val_entries)} val "
           f"entries across {len(shard_metas)} shards "
-          f"(melody={'on' if has_melody else 'off'}) ({time.time()-t0:.1f}s)",
+          f"(melody={'on' if has_melody else 'off'}, "
+          f"stems={'on' if has_stems else 'off'}) ({time.time()-t0:.1f}s)",
           flush=True)
     structure, bpm = _load_structure(structure_path)
+    # tempo.json (diskrot.tempo_detect) is the cheap DENSE tempo source and takes
+    # precedence over the structure pass's bpm, which now covers only a sampled
+    # fraction of the corpus. Merge tempo last so it wins per-song; structure bpm
+    # remains a fallback for any song tempo.json missed.
+    bpm = {**bpm, **_load_tempo(tempo_path)}
     lyrics, instrumental = _load_lyrics(lyrics_path, with_instrumental=True)
     return {
         "packed_dir": str(packed_dir),
@@ -306,6 +444,8 @@ def load_mmap_bundle(
         "val_entries": val_entries,
         "shard_metas": shard_metas,
         "tags": _load_tags(tags_path),
+        "tag_gender": _load_tag_gender(tags_path),
+        "stem_caps": _load_stem_caps(tags_path),
         "lyrics": lyrics,
         "instrumental": instrumental,
         "structure": structure,
@@ -313,6 +453,7 @@ def load_mmap_bundle(
         "keys": _load_keys(keys_path),
         "phonemes": _load_phonemes(phonemes_path),
         "has_melody": has_melody,
+        "has_stems": has_stems,
     }
 
 
@@ -338,7 +479,11 @@ class TokenDataset(Dataset):
         structure_path: str | Path | None = None,
         keys_path: str | Path | None = None,
         phonemes_path: str | Path | None = None,
+        tempo_path: str | Path | None = None,
         max_lyric_len: int = 256,
+        n_codebooks: int | None = None,
+        pad_short: bool = False,
+        pad_id: int = 1024,
     ):
         from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
 
@@ -361,9 +506,13 @@ class TokenDataset(Dataset):
             structure_path=structure_path,
             keys_path=keys_path,
             phonemes_path=phonemes_path,
+            tempo_path=tempo_path,
+            pad_short=pad_short,
         )
         # Delegate to from_mmap and steal its state into self.
-        ds = TokenDataset.from_mmap(bundle, split, segment_frames, max_lyric_len)
+        ds = TokenDataset.from_mmap(
+            bundle, split, segment_frames, max_lyric_len, n_codebooks,
+            pad_short=pad_short, pad_id=pad_id)
         self.__dict__.update(ds.__dict__)
 
     @classmethod
@@ -373,6 +522,9 @@ class TokenDataset(Dataset):
         split: str,
         segment_frames: int,
         max_lyric_len: int = 256,
+        n_codebooks: int | None = None,
+        pad_short: bool = False,
+        pad_id: int = 1024,
     ) -> "TokenDataset":
         """Wire up a TokenDataset over the sharded mmap bundle.
 
@@ -385,25 +537,45 @@ class TokenDataset(Dataset):
         ds = cls.__new__(cls)
         ds.segment_frames = segment_frames
         ds.max_lyric_len = max_lyric_len
+        # Model's codebook count (RVQ prefix of the stored depth); None = use all
+        # stored codebooks. See __getitem__ for the slice.
+        ds.n_codebooks = n_codebooks
+        # Full-song padding: keep songs shorter than segment_frames and pad their
+        # crop to segment_frames with pad_id (tokens, masked in loss via
+        # ignore_index) / zeros (melody). Off = legacy drop-short behavior.
+        ds.pad_short = pad_short
+        ds.pad_id = pad_id
         ds._packed_dir = bundle["packed_dir"]
         ds._mmap_entries = bundle[f"{split}_entries"]
         ds._shard_metas = bundle["shard_metas"]
         ds._mmap_handles = {}
         ds._has_melody = bool(bundle.get("has_melody", False))
         ds._mel_handles = {}
+        # Stem-token sidecar (the /addstem path): co-cropped with the same window.
+        # Per-song presence is read from each shard meta's stem_present list at
+        # crop time (a missing/absent song -> present=0, zero-filled bin).
+        ds._has_stems = bool(bundle.get("has_stems", False))
+        ds._stem_handles = {}
         ds.names = [e[2] for e in ds._mmap_entries]
         name_set = set(ds.names)
         all_tags = bundle.get("tags", {})
         all_lyrics = bundle.get("lyrics", {})
         all_structure = bundle.get("structure", {})
         ds._tags = {n: all_tags[n] for n in name_set if n in all_tags}
+        # Per-song vocal gender from the audio-LLM captioner (tags.json), the v9
+        # gender-marker source. Read tags-first in _get_segment_lyric_ids with a
+        # fallback to the legacy lyrics-entry gender, so old (pre-v4) corpora keep
+        # their F0 labels until a --redo re-captions them.
+        all_tag_gender = bundle.get("tag_gender", {})
+        ds._gender = {n: all_tag_gender[n] for n in name_set if n in all_tag_gender}
         ds._lyrics = {n: all_lyrics[n] for n in name_set if n in all_lyrics}
         # Per-song structure segments (sorted by start), used to inject section
         # markers into the time-aligned lyric stream. Songs without an entry get a
         # <no_section> prefix, so a partial structure pass is fine.
         ds._structure = {n: all_structure[n] for n in name_set if n in all_structure}
-        # Per-song bpm (allin1 tempo), used for the <tempo_*> header marker. Sparse:
-        # songs without a bpm aren't in the map and get <unknown_tempo> at crop time.
+        # Per-song bpm for the <tempo_*> header marker — tempo.json (dense,
+        # diskrot.tempo_detect) merged over the sampled structure pass's bpm in
+        # load_mmap_bundle. Sparse: songs without a bpm get <unknown_tempo> at crop.
         all_bpm = bundle.get("bpm", {})
         ds._bpm = {n: all_bpm[n] for n in name_set if n in all_bpm}
         # Per-song key labels (diskrot.key_detect), used for the <key_*> header
@@ -418,6 +590,11 @@ class TokenDataset(Dataset):
         # form — consulted before live g2p in _get_segment_lyric_ids.
         all_phonemes = bundle.get("phonemes", {})
         ds._phonemes = {n: all_phonemes[n] for n in name_set if n in all_phonemes}
+        # Per-stem captions (tags.json ``stems`` field) for the target-stem tag on a
+        # stem-add batch. Empty until the captioner emits them — the train loop then
+        # falls back to the full-song description.
+        all_stem_caps = bundle.get("stem_caps", {})
+        ds._stem_caps = {n: all_stem_caps[n] for n in name_set if n in all_stem_caps}
         # Per-song phoneme groups (one list[int] per word), built lazily on first
         # access and reused across crops — g2p runs once per song while it stays
         # hot. Bounded LRU (OrderedDict): each forked DataLoader worker fills its
@@ -438,6 +615,7 @@ class TokenDataset(Dataset):
         state = self.__dict__.copy()
         state["_mmap_handles"] = {}
         state["_mel_handles"] = {}
+        state["_stem_handles"] = {}
         return state
 
     def __len__(self) -> int:
@@ -478,6 +656,29 @@ class TokenDataset(Dataset):
         offsets = self._shard_metas[shard_id]["offsets"]
         return mm[:, offsets[local_idx]:offsets[local_idx + 1]]  # numpy view
 
+    def _get_shard_stem_mmap(self, shard_id: int) -> np.memmap:
+        mm = self._stem_handles.get(shard_id)
+        if mm is not None:
+            return mm
+        from diskrot.pack_cache import open_shard_stem_mmap
+
+        assert self._packed_dir is not None
+        mm, _ = open_shard_stem_mmap(self._packed_dir, shard_id)
+        self._stem_handles[shard_id] = mm
+        return mm
+
+    def _get_stem(self, idx: int):
+        """Per-song stem view [n_stems*stored_K, T_full] + present flag, at the SAME
+        offsets as the tokens. ``present`` is False for a song whose stems were
+        absent at pack time (its rows are zero-filled — not a real stem)."""
+        shard_id, local_idx, _, _ = self._mmap_entries[idx]
+        mm = self._get_shard_stem_mmap(shard_id)
+        meta = self._shard_metas[shard_id]
+        offsets = meta["offsets"]
+        present_list = meta.get("stem_present") or []
+        present = bool(present_list[local_idx]) if local_idx < len(present_list) else False
+        return mm[:, offsets[local_idx]:offsets[local_idx + 1]], present  # numpy view
+
     def _get_segment_lyrics(self, name: str, start_sec: float, end_sec: float) -> str:
         entry = self._lyrics.get(name)
         if not entry or not entry.get("words"):
@@ -495,8 +696,9 @@ class TokenDataset(Dataset):
             BOS  <gender>  <tempo>  <key>  <vocals>  <active-section>  w w  <inline-section>  w ...
 
         - Always starts with BOS, then exactly one gender marker (the song's
-          F0-labeled vocal gender, ``<unknown_gender>`` if instrumental /
-          unlabeled), one tempo marker (the allin1 bpm bucketed, ``<unknown_tempo>``
+          audio-LLM-labeled vocal gender from tags.json, legacy F0 fallback,
+          ``<unknown_gender>`` if instrumental / unlabeled), one tempo marker (the
+          allin1 bpm bucketed, ``<unknown_tempo>``
           if no bpm), one key marker (the key_detect estimate, ``<unknown_key>``
           if none), one vocal-presence marker (``<vocals>`` if the song has usable
           transcribed words, ``<instrumental>`` if transcription found none,
@@ -514,12 +716,18 @@ class TokenDataset(Dataset):
         from model.lyric_encoder import (
             BOS_PHONEME_ID, VOCAL_TOKEN_TO_ID, UNKNOWN_VOCALS_ID, append_unit,
             append_unit_capped, bpm_to_id, gender_label_to_id, key_label_to_id,
-            structure_label_to_id, text_to_word_phoneme_groups,
+            lang_label_to_id, structure_label_to_id, text_to_word_phoneme_groups,
         )
 
         segs = self._structure.get(name)
         entry = self._lyrics.get(name)
-        gender = entry.get("gender") if isinstance(entry, dict) else None
+        # Vocal gender: audio-LLM caption (tags.json) first, legacy F0 lyrics-entry
+        # gender as the fallback for pre-v4 corpora. None -> <unknown_gender>.
+        gender = self._gender.get(name) or (
+            entry.get("gender") if isinstance(entry, dict) else None)
+        # v9: detected language (transcribe stores it) -> <lang_*> header marker +
+        # the language the lyrics are phonemized in. None -> <unknown_lang> / en.
+        language = entry.get("language") if isinstance(entry, dict) else None
         bpm = self._bpm.get(name)
         if entry:
             vocal_id = VOCAL_TOKEN_TO_ID["vocals"]
@@ -527,14 +735,15 @@ class TokenDataset(Dataset):
             vocal_id = VOCAL_TOKEN_TO_ID["instrumental"]
         else:
             vocal_id = UNKNOWN_VOCALS_ID
-        # Compact 5-marker header (no internal word-boundary):
-        # BOS <gender> <tempo> <key> <vocals> <section>.
+        # Compact 6-marker header (no internal word-boundary):
+        # BOS <gender> <tempo> <key> <vocals> <lang> <section>.
         ids = [BOS_PHONEME_ID]
         append_unit(ids, [
             gender_label_to_id(gender),
             bpm_to_id(bpm),
             key_label_to_id(self._keys.get(name)),
             vocal_id,
+            lang_label_to_id(language),
             structure_label_to_id(_active_label_at(segs, start_sec)),
         ])
 
@@ -551,7 +760,8 @@ class TokenDataset(Dataset):
                 groups = [flat[offs[i]:offs[i + 1]].tolist()
                           for i in range(len(offs) - 1)]
             else:
-                groups = text_to_word_phoneme_groups([w["word"] for w in entry["words"]])
+                groups = text_to_word_phoneme_groups(
+                    [w["word"] for w in entry["words"]], language=language)
             self._word_phones[name] = groups
             if len(self._word_phones) > self._word_phones_cap:
                 self._word_phones.popitem(last=False)  # evict least-recently-used
@@ -595,30 +805,44 @@ class TokenDataset(Dataset):
             words = entry.get("words") if isinstance(entry, dict) else None
             if words:
                 w = random.choice(words)
-                seg_sec = self.segment_frames / DACodec.FRAME_RATE_HZ
+                seg_sec = self.segment_frames / _FRAME_RATE_HZ
                 # start_sec range that keeps word w fully inside the crop window,
                 # clamped to the valid range; drawn uniformly within it.
                 lo = max(0.0, float(w["end"]) - seg_sec)
-                hi = min(max_start / DACodec.FRAME_RATE_HZ, float(w["start"]))
+                hi = min(max_start / _FRAME_RATE_HZ, float(w["start"]))
                 if lo <= hi:
-                    start = int(round(random.uniform(lo, hi) * DACodec.FRAME_RATE_HZ))
+                    start = int(round(random.uniform(lo, hi) * _FRAME_RATE_HZ))
                     return max(0, min(start, max_start))
         return random.randint(0, max_start)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str, torch.Tensor, torch.Tensor | None]:
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, str, torch.Tensor, torch.Tensor | None, tuple | None]:
         t = self._get(idx)  # [K, T_full] int16 — torch.Tensor or np.memmap view
         T = t.shape[1]
         start = self._choose_crop_start(idx, T)
-        crop = t[:, start:start + self.segment_frames]
+        # Slice stored codebooks -> the model's n_codebooks (RVQ prefix). The corpus
+        # may be packed at a deeper STORED depth (e.g. SpectroStream 32) than the
+        # model trains on (e.g. 24); slicing the mmap view here drops the unused
+        # codebooks before collate. ``n_codebooks=None`` -> all stored (DAC, or a
+        # model that uses the full stored depth). t[:None] == t[:] in Python.
+        crop = t[:self.n_codebooks, start:start + self.segment_frames]
         if not isinstance(crop, torch.Tensor):
             # mmap path: materialize the ~46 KB int16 crop (30s case) so the
             # collate doesn't carry a memmap view across the worker boundary.
             crop = torch.from_numpy(np.ascontiguousarray(crop))
         tokens = crop
+        # Full-song padding: a song shorter than the clip yields a short crop; pad
+        # the time axis up to segment_frames with pad_id so it stacks with full-
+        # length crops. The padded targets are pad_id -> ignored by the loss
+        # (ignore_index=pad_id), so the model is never graded on the filler tail.
+        pad_n = self.segment_frames - tokens.shape[1]
+        if self.pad_short and pad_n > 0:
+            tokens = torch.nn.functional.pad(tokens, (0, pad_n), value=self.pad_id)
         tags = self._tags.get(self.names[idx], "")
         # time-aligned lyric phoneme ids for this segment
-        start_sec = start / DACodec.FRAME_RATE_HZ
-        end_sec = (start + self.segment_frames) / DACodec.FRAME_RATE_HZ
+        start_sec = start / _FRAME_RATE_HZ
+        end_sec = (start + self.segment_frames) / _FRAME_RATE_HZ
         lyric_ids = self._get_segment_lyric_ids(self.names[idx], start_sec, end_sec)
         # Co-crop the chroma with the IDENTICAL [start, start+segment_frames] window
         # so the melody lines up with the tokens frame-for-frame. -> [seg, 12] float.
@@ -626,4 +850,33 @@ class TokenDataset(Dataset):
         if self._has_melody:
             mel = np.ascontiguousarray(self._get_mel(idx)[:, start:start + self.segment_frames])
             melody = torch.from_numpy(mel).to(torch.float32).transpose(0, 1).contiguous()
-        return tokens, tags, torch.tensor(lyric_ids, dtype=torch.long), melody
+            # Co-pad the chroma to segment_frames with zero (silent) frames so it
+            # lines up with the padded tokens; zero chroma is in-distribution (the
+            # packer zero-fills missing melody) and the MelodyEncoder handles it.
+            if self.pad_short and melody.shape[0] < self.segment_frames:
+                melody = torch.nn.functional.pad(
+                    melody, (0, 0, 0, self.segment_frames - melody.shape[0]))
+        # Co-crop the stem tokens with the IDENTICAL window so all 4 stems line up
+        # with the tokens frame-for-frame. -> (stems [n_stems, K, seg] int16,
+        # present float). present=0 for songs whose stems were absent at pack time
+        # (zero-filled) — the train loop only does stem-add on present songs.
+        stem = None
+        if self._has_stems:
+            stem_view, present = self._get_stem(idx)  # [n_stems*stored_K, T_full]
+            sc = np.ascontiguousarray(stem_view[:, start:start + self.segment_frames])
+            st = torch.from_numpy(sc)  # [n_stems*stored_K, seg] int16
+            # Reshape [n_stems*stored_K, seg] -> [n_stems, stored_K, seg], then slice
+            # the model's codebook prefix exactly like the token stream. stored_K is
+            # the token stream's stored depth (t.shape[0]), so n_stems falls out.
+            stored_k = t.shape[0]
+            n_stems = st.shape[0] // stored_k
+            st = st.view(n_stems, stored_k, st.shape[1])
+            st = st[:, :self.n_codebooks, :].contiguous()
+            pad_n_s = self.segment_frames - st.shape[2]
+            if self.pad_short and pad_n_s > 0:
+                st = torch.nn.functional.pad(st, (0, pad_n_s), value=self.pad_id)
+            # Per-stem captions (STEM_TYPES order) so the train loop can steer the
+            # target stem via the tag path; () when none -> falls back to the song desc.
+            caps = self._stem_caps.get(self.names[idx], ())
+            stem = (st, float(present), caps)
+        return tokens, tags, torch.tensor(lyric_ids, dtype=torch.long), melody, stem

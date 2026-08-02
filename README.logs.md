@@ -25,16 +25,16 @@ modal container exec --no-pty \
   -- nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
 ```
 
-## Phase order (8×H100 DDP)
+## Phase order (4×B200 DDP)
 
-The DDP path ([modal_train.py](diskrot/modal_train.py)) preloads everything once in the parent process, then `mp.spawn`s 8 rank workers that share the parent's memory. Single-GPU runs skip the parent phases — they just call `train_run` directly inside the container.
+The DDP path ([modal_train.py](diskrot/modal_train.py)) preloads everything once in the parent process, then `mp.spawn`s 4 rank workers that share the parent's memory. Single-GPU runs skip the parent phases — they just call `train_run` directly inside the container.
 
 The dataset is loaded one of two ways depending on whether the `packed/` mmap dir exists:
 
 - **Sharded mmap** (`packed/packed_index.json` present — the production path at scale): `load_mmap_bundle` just opens each shard as an `np.memmap` and reads the JSON sidecars (seconds, not minutes — the heavy lifting was done by the offline pack step).
 - **In-RAM bundle** (no `packed/` — only viable on a tiny smoke-test cache): `load_shared_bundle` parallel-loads every `.pt` and concatenates into one shared-memory tensor.
 
-Timings below are for the production sharded-mmap path at scale on 8×H100.
+Timings below are for the production sharded-mmap path at scale on 4×B200.
 
 | # | Phase | Log marker | What's happening | Typical wall-clock |
 |---|---|---|---|---|
@@ -44,55 +44,55 @@ Timings below are for the production sharded-mmap path at scale on 8×H100.
 | 4 | Parent: val load | shard index read | Same, smaller split | < 5s |
 | 5 | Parent: pack | skipped (packing was done offline by the pack step) | — | 0 |
 | 6 | Parent: tags/lyrics | `[tags] loaded NNNNNN entries from /tokens/tags.json` | JSON read | ~30s |
-| 7 | Parent: CLAP precompute | `[clap-parent] sharding NNNNNN tags across 8 GPUs (batch=512, bf16)...` + per-GPU `[clap-gpu*]` progress | One-time CLAP text encoding, sharded across all GPUs | ~90 s (measured 2026-06-12: 241,603 tags in 89s) |
-| 8 | Workers spawn | `using preloaded shared bundle` + `loaded N precomputed CLAP tag embeddings` | All 8 ranks confirm they inherited the parent's mmap | < 5s |
-| 9 | Workers: setup | `segment_frames=2580`, `DDP active: world_size=8, per-rank batch=8`, `model: 1514.XX M params`, `torch.compile enabled` | NCCL init, model on GPU, torch.compile | ~2 min (large graph) |
+| 7 | Parent: CLAP precompute | `[clap-parent] sharding NNNNNN tags across 4 GPUs (batch=512, bf16)...` + per-GPU `[clap-gpu*]` progress | One-time CLAP text encoding, sharded across all GPUs | ~90 s (measured 2026-06-12: 241,603 tags in 89s, 8-way; now sharded 4-way) |
+| 8 | Workers spawn | `using preloaded shared bundle` + `loaded N precomputed CLAP tag embeddings` | All 4 ranks confirm they inherited the parent's mmap | < 5s |
+| 9 | Workers: setup | `segment_frames=4500`, `DDP active: world_size=4, per-rank batch=8`, `model: 2077.XX M params`, `torch.compile enabled` | NCCL init, model on GPU, torch.compile | ~2 min (large graph) |
 | 10 | Training loop | `step 25/400000 loss X.XXXX lr X.XXe-XX tok/s XX.Xk cb[X.XX X.XX ...]` every 25 steps | Real training | ~30–50 h |
 | 11 | Validation | `checkup at step N score X.XXXX ...` every 1000 steps | Eval pass over val_loader | ~30s per checkup |
-| 12 | Checkpointing | `saved ckpt -> /ckpts/v7_1500m/step_NNNNNNN.pt` every 5000 steps | Disk write + async volume commit | ~30s |
+| 12 | Checkpointing | `saved ckpt -> /ckpts/v9_stereo/step_NNNNNNN.pt` every 5000 steps | Disk write + async volume commit | ~30s |
 
-**Total setup before first `step` line: a few minutes** (the CLAP precompute that used to dominate at ~90 min on a single GPU is now sharded across all ranks — ~90 s at full corpus scale; what remains is NCCL init + the ~2 min torch.compile). Single-GPU runs skip phases 1–8 but each rank pays the load + CLAP cost itself — single-GPU is **not recommended** for this reason (and the memory footprint is too tight regardless).
+**Total setup before first `step` line: a few minutes** (the CLAP precompute that used to dominate at ~90 min on a single GPU is now sharded across all 4 ranks — ~90 s at full corpus scale; what remains is NCCL init + the ~2 min torch.compile). Single-GPU runs skip phases 1–8 but each rank pays the load + CLAP cost itself — single-GPU is **not recommended** for this reason (and the memory footprint is too tight regardless).
 
 ## Decoding individual log prefixes
 
 ### `[parent]`, `[bundle]`, `[train]`, `[val]`, `[tags]`, `[lyrics]`, `[clap-parent]`
 Emitted by the **parent process** of the DDP path. Only visible during setup phases 1–7. After `mp.spawn`, the parent goes silent (waits for ranks to finish). See [diskrot/dataset.py](diskrot/dataset.py) and [diskrot/modal_train.py:_precompute_clap_cache](diskrot/modal_train.py).
 
-### `DDP active: world_size=8, per-rank batch=8, global batch=64`
-Proves all 8 ranks initialized NCCL and joined the process group. If this line is missing, DDP did not start — workers may be silently stuck in CUDA init or NCCL discovery. Source: [train.py](diskrot/train.py).
+### `DDP active: world_size=4, per-rank batch=8, global batch=32`
+Proves all 4 ranks initialized NCCL and joined the process group. If this line is missing, DDP did not start — workers may be silently stuck in CUDA init or NCCL discovery. Source: [train.py](diskrot/train.py).
 
 ### `model: XX.XX M params on cuda`
-Confirms model is on GPU. Param count should be ~2.0B (2013.8M measured at v8 startup: the v7 decoder's 1514.3M + per-block lyric cross-attention ~369M + lyric/melody encoders ~130M), matching the `DEFAULTS` in [modal_train.py](diskrot/modal_train.py#L83-L99) (~1.14B / 1145.2M if text conditioning is off). A wildly different number means an architecture override on the CLI didn't land as intended.
+Confirms model is on GPU. Param count should be ~2.08B (2077M measured at v9 startup — the decoder plus per-block lyric cross-attention and the lyric/melody encoders), matching the `DEFAULTS` in [modal_train.py](diskrot/modal_train.py#L83-L99) (~1.2B / 1208M if text conditioning is off). A wildly different number means an architecture override on the CLI didn't land as intended.
 
-### `step N/T loss L lr LR grad G tok/s X.Xk cb[a b c d e f g h i]`
+### `step N/T loss L lr LR grad G tok/s X.Xk cb[a b c d e f g h i ...]` (24 cb values on v9)
 - **`loss`** — average over the last `log_every=25` steps. Watch for it to start in the 5–7 range and drop into 3.5–4.5 ("recognizably musical" per README.modal.md).
 - **`lr`** — current cosine-decayed learning rate (warmup for the first `warmup_steps`, 10,000 on Modal).
 - **`grad`** — window-max pre-clip gradient norm. Healthy is a stable O(0.1–1) band; a steady ramp across windows is the divergence precursor (the 2026-06-12 failures had to be diagnosed without this — don't ignore it). Values pinned at the clip value (1.0) every window mean the clip is doing real work.
-- **`tok/s`** — aggregate token throughput across all ranks. On 8×H100 DDP expect ~6–7× single-H100 (NCCL overhead). If `tok/s` is only ~1× a single-H100 run, DDP is broken or one rank is starving the others.
-- **`cb[...]`** — per-codebook losses (9 values). Codebook 0 is usually highest (carries most signal); later codebooks should be lower. If they're all equal, something's wrong with the delay pattern.
+- **`tok/s`** — aggregate token throughput across all ranks. On 4×B200 DDP (B200 ≈ ~2× H100 per GPU) expect the aggregate to roughly track 4 ranks × ~2× a single-H100 rate, minus NCCL overhead. If `tok/s` is only ~1× a single-H100 run, DDP is broken or one rank is starving the others.
+- **`cb[...]`** — per-codebook losses (24 values on the v9 SpectroStream model; the example in the header line above is truncated for space). Codebook 0 is usually highest (carries most signal); later codebooks should be lower. If they're all equal, something's wrong with the delay pattern.
 
 ### `checkup at step N score X.XXXX`
-Validation pass output. Three flavours:
+Validation pass output. With `use_ema=True` (the v9 default) the score — and the `best.pt` selection — is on the **EMA weights'** smoother val loss, not the raw model's. Three flavours:
 - `first checkup` — initial val loss, no comparison yet
 - `NEW BEST! beat previous best (X) by Y` — val loss improved, `best.pt` saved
 - `Y worse than best (X from step Z) — strike N of 20` — val loss regressed; counts toward early-stop patience
 
 When strikes hit `cfg.patience` (20 on Modal), training stops: `early stopping at step N — val loss has not improved for 20 evals`.
 
-### `saved ckpt -> /ckpts/v7_1500m/step_NNNNNNN.pt`
-Step checkpoint written to volume. Every 5000 steps + final step. `latest.pt` is also overwritten so resumes pick up the most recent. `best.pt` is updated separately on val-loss improvements. The subdir is whatever `--ckpt-subdir` resolved to (`v7_1500m` by default).
+### `saved ckpt -> /ckpts/v9_stereo/step_NNNNNNN.pt`
+Step checkpoint written to volume. Every 5000 steps + final step. `latest.pt` is also overwritten so resumes pick up the most recent. `best.pt` is updated separately on val-loss improvements (on the EMA val loss). The subdir is whatever `--ckpt-subdir` resolved to (`v9_stereo` by default).
 
 ## Healthy throughput numbers
 
-Sharded mmap path (large corpus / 8×H100):
+Sharded mmap path (large corpus / 4×B200):
 
 | Metric | Healthy | Trouble if |
 |---|---|---|
 | Train/val "load" | seconds (just mmap open + JSON read) | minutes (you're on the in-RAM path — confirm `[parent] v2 sharded layout detected` fired) |
 | Packing | n/a (offline, see [diskrot/pack_cache.py](diskrot/pack_cache.py)) | — |
-| CLAP precompute | ~2.5k tags/s per GPU, 8-way sharded (~90 s @ ~240k unique tags) | minutes-long ETAs per GPU (CLAP not on GPU?) |
+| CLAP precompute | ~2.5k tags/s per GPU, 4-way sharded (~90 s @ ~240k unique tags) | minutes-long ETAs per GPU (CLAP not on GPU?) |
 | First `step` line | within ~10 min of container start | > 30 min (something is silently stuck) |
-| `tok/s` on 8×H100 | ~6–7× the single-H100 rate (NCCL overhead) | ~1× (DDP broken) or far lower than expected (grad-checkpointing misconfigured or seq-len wrong) |
+| `tok/s` on 4×B200 | roughly 4 ranks × ~2× the single-H100 rate, minus NCCL overhead | ~1× (DDP broken) or far lower than expected (grad-checkpointing misconfigured or seq-len wrong) |
 
 ## Diagnosing silent runs
 
@@ -112,7 +112,7 @@ If `modal app logs ap-...` shows zero lines after several minutes:
    - `State: S` = sleeping (waiting on a syscall or socket)
    - `VmRSS` growing as pages fault in off the mmap shards = the loader is working (it does **not** preload the whole cache on the sharded path)
    - 4 python workers under PID 2 = DDP ranks spawned correctly
-4. **Check GPUs** with the nvidia-smi one-liner above. During CLAP precompute all GPUs are briefly busy (8-way shard); during training all should sit at 80–99%.
+4. **Check GPUs** with the nvidia-smi one-liner above. During CLAP precompute all GPUs are briefly busy (4-way shard); during training all should sit at 80–99%.
 
 ## Known-benign log noise
 
@@ -129,5 +129,5 @@ If `modal app logs ap-...` shows zero lines after several minutes:
 
 - **"No `step` line yet → something is broken."** Setup legitimately takes a few minutes (sharded CLAP precompute ~90 s, then NCCL init + torch.compile) before the first step. Past ~30 min, check `modal container exec` and confirm processes are progressing before killing anything.
 - **"`tok/s` is the per-rank throughput."** It's aggregate across all ranks. Comparing `tok/s` across runs only makes sense if `world_size` matches.
-- **"All ranks should print everything."** Only rank 0 (the main rank) prints. The other 7 are silent by design — see `if main:` guards throughout [train.py](diskrot/train.py). Their work shows up indirectly via `tok/s` and `DDP active: world_size=8`.
+- **"All ranks should print everything."** Only rank 0 (the main rank) prints. The other 3 are silent by design — see `if main:` guards throughout [train.py](diskrot/train.py). Their work shows up indirectly via `tok/s` and `DDP active: world_size=4`.
 - **"`free -m` doesn't exist, so something's wrong."** The slim Debian image used by [modal_tokenize.py:39](diskrot/modal_tokenize.py#L39) and [modal_train.py:41](diskrot/modal_train.py#L41) ships without `procps`. Use `/proc/<pid>/status` directly (see the diagnostic snippet above).

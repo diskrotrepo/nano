@@ -34,14 +34,27 @@ CLI::
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+from diskrot.progress import ProgressReporter
 from diskrot.transcribe_lyrics import _atomic_write_json, is_valid_word
 
 # Below this many valid words a "transcript" is a caption artifact, not lyrics.
 # Real vocal songs with fewer usable words than this train fine as
-# <instrumental> — vocally they're chant-level at most.
+# <instrumental> — vocally they're chant-level at most. NOTE: is_valid_word is
+# schema-only (string word + numeric start/end), language-agnostic — a real song
+# in ANY language has many word tokens, so this never nukes non-English vocals
+# (which v9's multilingual path wants to keep).
 MIN_WORDS = 6
+
+# Whisper mean-segment avg_logprob floor (the "confidence" filter). Default is
+# DELIBERATELY conservative (≈ off): hallucinated captions are usually HIGH
+# confidence (already caught by the word-count / junk-phrase checks), while a low
+# avg_logprob often just means non-English or quietly-sung real vocals — which the
+# multilingual path keeps. Dial up via NANO_MIN_AVG_LOGPROB after inspecting a
+# dry-run distribution. None on an entry (pre-field v7 lyrics) skips the check.
+MIN_AVG_LOGPROB = float(os.environ.get("NANO_MIN_AVG_LOGPROB", "-2.5"))
 
 # Caption-artifact phrases (lowercase substring match). These come from
 # Whisper's subtitle-corpus training data, not from any song.
@@ -80,6 +93,10 @@ def hallucination_reason(entry) -> str | None:
         for phrase in JUNK_PHRASES:
             if phrase in text:
                 return f"junk:{phrase}"
+    # Low-confidence safety net (conservative by default; see MIN_AVG_LOGPROB).
+    lp = entry.get("avg_logprob")
+    if isinstance(lp, (int, float)) and not isinstance(lp, bool) and lp < MIN_AVG_LOGPROB:
+        return "low_confidence"
     return None
 
 
@@ -99,7 +116,9 @@ def filter_lyrics(
     n_checked = n_flagged = n_shards = n_null = 0
     by_reason: dict[str, int] = {}
 
-    for shard in sorted(lyrics_dir.glob("lyrics_*.json")):
+    shards = sorted(lyrics_dir.glob("lyrics_*.json"))
+    rep = ProgressReporter(len(shards), "filter_lyrics", unit="shards") if verbose else None
+    for shard in shards:
         data = json.loads(shard.read_text())
         flagged = []
         for name, entry in data.items():
@@ -124,7 +143,11 @@ def filter_lyrics(
         if verbose and flagged:
             print(f"[filter] {shard.name}: {len(flagged)} hallucinated"
                   f"{' -> nulled' if apply else ' (dry run)'}", flush=True)
+        if rep is not None:
+            rep.update(1, extra=f"checked {n_checked:,}, flagged {n_flagged:,}")
 
+    if rep is not None:
+        rep.done(extra=f"checked {n_checked:,}, flagged {n_flagged:,}")
     n_ready = n_checked - n_flagged
     n_total = n_null + n_checked
     if verbose:

@@ -9,19 +9,107 @@ Usage:
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Literal
 
-import librosa
+import numpy as np
 import torch
 from tqdm import tqdm
 
-from model.codec import DACodec
+from diskrot.audio_io import decode_pcm
+from model.codec import DACodec, get_codec
 
 
 TokenizeStatus = Literal["done", "skipped_existing", "skipped_short", "failed"]
+
+# Pre-encode loudness normalization target (EBU R128 LUFS). -14 LUFS is the common
+# streaming reference (Spotify/YouTube); normalizing here homogenizes the corpus's
+# wildly varying source levels so the codec tokens have consistent statistics.
+# Env-overridable; the same value must be used across the whole corpus.
+_LOUDNORM_LUFS = float(os.environ.get("NANO_LOUDNORM_LUFS", "-14.0"))
+
+# Optional loudness-measurement speedup: measure the integrated LUFS on a boxcar-
+# decimated mono copy (factor D) instead of the full 48 kHz stereo signal — the
+# K-weighting IIR + gating then runs over ~1/D the samples. LUFS is low-frequency
+# weighted and robust, so the measured gain shifts <~0.1 dB vs full-rate, and the
+# gain is applied to the FULL-res signal (only the tiny gain differs, like the
+# resampler delta). 1 = off (measure at full rate). Small lever — loudnorm is only
+# a slice of the CPU tail and is hidden behind the GPU encode when GPU-bound — so
+# it defaults OFF; enable per-corpus (uniformly) only if profiling shows CPU-bound.
+_LOUDNORM_DECIMATE = max(1, int(os.environ.get("NANO_LOUDNORM_DECIMATE", "1")))
+
+# Conservative source-quality gate (checked on the RAW pre-normalization signal,
+# where level is meaningful — after loudness-norm everything is ~-14 LUFS). Tuned
+# to drop only genuinely broken files: near-silent (would train silence) and
+# EGREGIOUSLY clipped (a large fraction pinned at digital full-scale = a corrupt /
+# destroyed encode, NOT a merely-loud master). Low-bitrate is intentionally KEPT.
+_SILENCE_RMS_DBFS = float(os.environ.get("NANO_SILENCE_RMS_DBFS", "-50.0"))
+_CLIP_FRACTION = float(os.environ.get("NANO_CLIP_FRACTION", "0.20"))
+
+# Hard per-file length ceiling, in SECONDS at the codec's sample rate, beyond
+# which we SKIP the file pre-encode rather than feed it to the codec.
+#
+# The SpectroStream (TF/JAX) encoder builds an intermediate feature map whose
+# flat element count is LINEAR in input length, and TF computes its CUDA launch
+# config (`work_element_count`) as a signed int32. A long enough stereo file
+# overflows INT_MAX (2,147,483,647): TF CHECK-fails ("F0000 ...
+# gpu_launch_config.h: Check failed: work_element_count >= 0 (-1900404736 vs.
+# 0)") and calls abort() -> SIGABRT, killing the whole worker. abort() is
+# uncatchable from Python, so this MUST be a pre-encode skip, never a try/except.
+#
+# MEASURED (diskrot/modal_spectrostream_spike.py::measure, depth=32, A100): every
+# length 260..360s encodes cleanly, so the overflow length is ABOVE 360s (6:00)
+# — well beyond any real song. Working back from the production abort (2.394e9
+# elements => the offending file's ACTUAL decoded length was >~400s), the crash
+# came from an mp3 whose ffprobe duration was <=330s (so it passed modal_prepare's
+# MAX_DURATION_S=330 cap) but whose REAL audio is >~400s: a corrupt/VBR-metadata
+# file, NOT a long song. So the binding constraint is metadata-lying files, not
+# song length. We cap at 360s: provably safe (360s encoded without overflow), it
+# keeps ALL real music (prepare already drops ffprobe>330s and the guard re-checks
+# the TRUE decoded length via audio.shape[-1]), and it skips exactly those rare
+# liars. Do NOT lower this toward song lengths — that discards huge amounts of
+# legitimate 4-6min music to catch a handful of broken files. DAC (mono, 44.1k,
+# much smaller intermediates) never approaches int32; its ceiling is a backstop
+# only. Both env-overridable.
+_MAX_ENCODE_SECONDS_SS = float(os.environ.get("NANO_MAX_ENCODE_SECONDS_SS", "360.0"))
+_MAX_ENCODE_SECONDS_DAC = float(os.environ.get("NANO_MAX_ENCODE_SECONDS_DAC", "420.0"))
+
+
+def _max_encode_samples(codec) -> int:
+    """Max input samples (per channel, at codec.SAMPLE_RATE) we'll encode before
+    skipping. SpectroStream's TF int32 launch-config overflow is the binding
+    constraint; DAC gets a looser ceiling purely as a leak backstop."""
+    is_ss = int(getattr(codec, "N_CHANNELS", 1)) == 2 and int(codec.SAMPLE_RATE) >= 48000
+    secs = _MAX_ENCODE_SECONDS_SS if is_ss else _MAX_ENCODE_SECONDS_DAC
+    return int(secs * codec.SAMPLE_RATE)
+
+
+class QualitySkip(Exception):
+    """Raised by _load_audio when the conservative quality gate rejects a file
+    (near-silent / egregiously clipped). Carries the reason string."""
+
+
+class LengthSkip(Exception):
+    """Raised when a file's encoded length would overflow the codec's int32 CUDA
+    launch config (the SpectroStream abort()). A pre-encode skip — abort() can't
+    be caught after the fact. Carries a human-readable reason string."""
+
+
+def _audio_quality_reason(y: np.ndarray, sr: int) -> str | None:
+    """'silent' / 'clipped' / None for a RAW [C,samples] or [samples] waveform."""
+    if y.size == 0:
+        return "silent"
+    mono = y.mean(axis=0) if y.ndim == 2 else y
+    rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64))))
+    if rms <= 0.0 or 20.0 * np.log10(rms + 1e-12) < _SILENCE_RMS_DBFS:
+        return "silent"
+    if float(np.mean(np.abs(mono) >= 0.9995)) > _CLIP_FRACTION:
+        return "clipped"
+    return None
 
 
 @dataclass
@@ -31,10 +119,61 @@ class TokenizeResult:
     error: str | None = None
 
 
-def _load_audio(mp3_path: Path, sample_rate: int) -> torch.Tensor:
-    """CPU-side audio load + resample. Safe to call from a background thread."""
-    y, _ = librosa.load(str(mp3_path), sr=sample_rate, mono=True)
-    return torch.from_numpy(y).unsqueeze(0)
+def _normalize_loudness(y: np.ndarray, sr: int) -> np.ndarray:
+    """Loudness-normalize a [C, samples] or [samples] float32 waveform to
+    _LOUDNORM_LUFS (EBU R128 via pyloudnorm; peak-to--1dBFS fallback if pyloudnorm
+    is absent or the measure is non-finite), then guard against clipping. Silent
+    input is returned unchanged. Mono-summed measurement so L/R are scaled by the
+    same gain (stereo image preserved)."""
+    peak0 = float(np.abs(y).max()) if y.size else 0.0
+    if peak0 <= 0.0:
+        return y
+    try:
+        import pyloudnorm as pyln
+
+        mono = np.ascontiguousarray(y.mean(axis=0) if y.ndim == 2 else y)
+        meter_sr = sr
+        if _LOUDNORM_DECIMATE > 1:
+            d = _LOUDNORM_DECIMATE
+            trimmed = mono[: (mono.shape[-1] // d) * d]
+            if trimmed.size:
+                # boxcar (mean-pool) decimation — cheap anti-alias before the LUFS
+                # K-weighting; the measured gain is applied to the full-res signal.
+                mono = trimmed.reshape(-1, d).mean(axis=1).astype(np.float32)
+                meter_sr = sr // d
+        meter = pyln.Meter(meter_sr)
+        loud = meter.integrated_loudness(mono)
+        if np.isfinite(loud):
+            y = y * (10.0 ** ((_LOUDNORM_LUFS - loud) / 20.0))
+        else:
+            y = y * (10.0 ** (-1.0 / 20.0) / peak0)
+    except Exception:
+        y = y * (10.0 ** (-1.0 / 20.0) / peak0)  # peak-normalize to -1 dBFS
+    peak = float(np.abs(y).max())
+    if peak > 1.0:
+        y = y / peak  # never clip
+    return np.ascontiguousarray(y, dtype=np.float32)
+
+
+def _load_audio(
+    mp3_path: Path, sample_rate: int, n_channels: int = 1, normalize: bool = True,
+) -> torch.Tensor:
+    """CPU-side audio load + resample + loudness-normalize. Safe in a thread.
+
+    Returns ``[n_channels, samples]`` float32: mono -> [1, N]; stereo -> [2, N]
+    (a mono source is duplicated to L=R, so it round-trips to a stable centered
+    image). Decodes via the shared ffmpeg PCM path (``diskrot.audio_io.decode_pcm``)
+    — the SAME decoder inference uses, so corpus tokens and prompt-encode tokens
+    stay on-distribution — which also avoids librosa's slow/noisy audioread
+    fallback on the corpus's junk-header MP3s."""
+    y = decode_pcm(mp3_path, sample_rate, n_channels)  # [C, N] float32
+    # Conservative quality gate on the RAW signal (level is meaningful pre-norm).
+    reason = _audio_quality_reason(y, sample_rate)
+    if reason is not None:
+        raise QualitySkip(reason)
+    if normalize:
+        y = _normalize_loudness(y, sample_rate)
+    return torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
 
 
 def _save_tokens(tokens: torch.Tensor, out_path: Path) -> int:
@@ -56,7 +195,24 @@ def tokenize_one_file(
     if out_path.exists():
         return TokenizeResult(status="skipped_existing")
     try:
-        tokens = codec.encode(mp3_path)
+        # Route through _load_audio so loudness-norm + stereo handling + the
+        # quality gate apply on the single-file path too (encode() given a path
+        # would skip them).
+        audio = _load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS)
+        # Pre-encode length guard: a file long enough to overflow the codec's
+        # int32 CUDA launch config (SpectroStream) would abort() the worker —
+        # uncatchable — so skip it here, before encode().
+        max_samples = _max_encode_samples(codec)
+        if int(audio.shape[-1]) > max_samples:
+            raise LengthSkip(
+                f"{audio.shape[-1] / codec.SAMPLE_RATE:.0f}s > "
+                f"{max_samples / codec.SAMPLE_RATE:.0f}s cap (int32 overflow guard)"
+            )
+        tokens = codec.encode(audio)
+    except QualitySkip as e:
+        return TokenizeResult(status="skipped_short", error=f"quality:{e}")
+    except LengthSkip as e:
+        return TokenizeResult(status="skipped_short", error=f"too_long:{e}")
     except Exception as e:
         return TokenizeResult(status="failed", error=str(e))
     if tokens.shape[1] < min_frames:
@@ -70,87 +226,165 @@ def tokenize_files_streaming(
     items: list[tuple[Path, Path]],
     min_frames: int,
     batch_size: int = 4,
+    prefetch: int = 8,
 ) -> Iterator[TokenizeResult]:
-    """Tokenize a sequence of (mp3_path, out_path) pairs, processing in chunks
-    of ``batch_size``. Within each chunk a background thread prefetches the next
-    file's audio (CPU librosa load + resample) while the current one is being
-    handled; the loaded chunk is then encoded with a single batched DAC forward
-    pass to amortize GPU kernel launch overhead. Yields one TokenizeResult per
-    input item, in input order.
+    """Tokenize a sequence of (mp3_path, out_path) pairs.
 
-    Set batch_size=1 to disable encode batching (still benefits from prefetch
-    across chunk boundaries less, but useful for memory-constrained devices)."""
+    Two knobs, deliberately independent:
+      - ``batch_size`` — how many successfully-loaded audios are handed to one
+        ``codec.encode_batch`` call. For DAC this is a real padded GPU forward
+        (>1 amortizes kernel launches but multiplies peak GPU memory); for
+        SpectroStream ``encode_batch`` just loops per file, so batch_size has no
+        GPU/memory effect there.
+      - ``prefetch`` — how many files' CPU audio (ffmpeg decode + loudness-norm)
+        are loaded *ahead* by a background thread pool. This is what hides decode
+        latency behind the GPU/TF encode: while the main thread is blocked in
+        ``encode_batch``, the pool keeps the next ~``prefetch`` files decoded and
+        waiting, so the (often idle) GPU stays fed. Decoupling it from
+        ``batch_size`` means even ``batch_size=1`` (the SpectroStream path, where
+        batching buys nothing) still overlaps decode with encode.
+
+    Yields one TokenizeResult per input item, in input order. Encode grouping is
+    per ``batch_size`` window of input items: the ready items in a window go into a
+    single ``encode_batch`` call (skipped/failed items in the window don't split
+    it), keeping output deterministic and order-stable.
+
+    Stage-0 profiling: with ``NANO_TOKENIZE_PROFILE=1`` set, accumulate wall time
+    spent BLOCKED on decode (``.result()`` waits — nonzero means the prefetch pool
+    can't keep the GPU fed → CPU-decode-bound) vs in ``encode_batch`` (GPU) vs
+    ``_save_tokens`` (volume I/O), and print a one-line summary when the generator
+    is exhausted. This is the gate that decides whether decode-side or GPU-side
+    levers move wall-clock — it writes the normal ``.pt`` output, so it's safe to
+    run over a throwaway wave subset."""
     if not items:
         return
+
+    _profile = os.environ.get("NANO_TOKENIZE_PROFILE", "").lower() in ("1", "true", "yes")
+    _prof = {"decode_wait": 0.0, "encode": 0.0, "save": 0.0, "n_encoded": 0}
 
     def _maybe_load(
         item: tuple[Path, Path],
     ) -> tuple[tuple[Path, Path], torch.Tensor | None, str, str | None]:
         """Returns (item, audio_or_None, status, error_or_None). status is one of
-        'ready', 'skipped_existing', 'failed_load'."""
+        'ready', 'skipped_existing', 'quality_skip', 'length_skip', 'failed_load'."""
         mp3_path, out_path = item
         if out_path.exists():
             return item, None, "skipped_existing", None
         try:
-            audio = _load_audio(mp3_path, codec.SAMPLE_RATE)
+            audio = _load_audio(mp3_path, codec.SAMPLE_RATE, codec.N_CHANNELS)
+            # Pre-encode length guard: a file long enough to overflow the codec's
+            # int32 CUDA launch config (SpectroStream) would abort() this worker —
+            # uncatchable by try/except around encode — so skip it now. Dropping
+            # it here means simply no .pt is written (same as a quality skip / a
+            # decode failure), which keeps packed-corpus membership consistent.
+            max_samples = _max_encode_samples(codec)
+            if int(audio.shape[-1]) > max_samples:
+                reason = (
+                    f"{audio.shape[-1] / codec.SAMPLE_RATE:.0f}s > "
+                    f"{max_samples / codec.SAMPLE_RATE:.0f}s cap (int32 overflow guard)"
+                )
+                return item, None, "length_skip", reason
             return item, audio, "ready", None
+        except QualitySkip as e:
+            return item, None, "quality_skip", str(e)
         except Exception as e:
             return item, None, "failed_load", str(e)
 
-    for chunk_start in range(0, len(items), batch_size):
-        chunk = items[chunk_start:chunk_start + batch_size]
+    n = len(items)
+    # Persistent loader pool with a sliding submission window: at most
+    # ``prefetch`` loads are kept outstanding ahead of the window being encoded,
+    # so decoded audio for upcoming files overlaps the current encode without
+    # growing memory past ~(prefetch + batch_size) waveforms.
+    with ThreadPoolExecutor(max_workers=max(1, prefetch)) as pool:
+        futures: dict[int, Future] = {}
+        submitted = 0
 
-        # Phase 1: load every file in the chunk, with a one-ahead background
-        # prefetch so the CPU loader overlaps with itself (and, for chunks > 1,
-        # the previous chunk's encode tail).
-        loaded: list[tuple[tuple[Path, Path], torch.Tensor | None, str, str | None]] = []
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_maybe_load, chunk[0])
-            for i, _ in enumerate(chunk):
-                result = future.result()
-                if i + 1 < len(chunk):
-                    future = pool.submit(_maybe_load, chunk[i + 1])
-                loaded.append(result)
+        def _submit_through(target: int) -> None:
+            nonlocal submitted
+            target = min(target, n)
+            while submitted < target:
+                futures[submitted] = pool.submit(_maybe_load, items[submitted])
+                submitted += 1
 
-        # Phase 2: batched encode for everything that loaded successfully.
-        encodable = [(idx, audio) for idx, (_, audio, status, _) in enumerate(loaded)
-                     if status == "ready" and audio is not None]
-        codes_by_idx: dict[int, torch.Tensor] = {}
-        encode_error: str | None = None
-        if encodable:
-            try:
-                codes_list = codec.encode_batch([audio for _, audio in encodable])
-                for (idx, _), codes in zip(encodable, codes_list):
-                    codes_by_idx[idx] = codes
-            except Exception as e:
-                # If the whole batch fails (OOM, model error), report each
-                # encodable item as failed so the caller can still make progress.
-                encode_error = str(e)
-            # Release cached-but-unallocated GPU memory between batches so a
-            # long encoder loop doesn't fragment its way into an OOM ~20
-            # files in. No-op on CPU; cheap on CUDA.
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        for win_start in range(0, n, batch_size):
+            win_end = min(win_start + batch_size, n)
+            # Submit this window plus a prefetch lookahead so the NEXT window's
+            # files decode while this window encodes.
+            _submit_through(win_end + prefetch)
 
-        # Phase 3: persist + yield in chunk order.
-        for idx, (item, _, status, err) in enumerate(loaded):
-            _, out_path = item
-            if status == "skipped_existing":
-                yield TokenizeResult(status="skipped_existing")
-                continue
-            if status == "failed_load":
-                yield TokenizeResult(status="failed", error=err)
-                continue
-            # status == "ready"
-            if encode_error is not None:
-                yield TokenizeResult(status="failed", error=encode_error)
-                continue
-            codes = codes_by_idx[idx]
-            if codes.shape[1] < min_frames:
-                yield TokenizeResult(status="skipped_short", frames=int(codes.shape[1]))
-                continue
-            frames = _save_tokens(codes, out_path)
-            yield TokenizeResult(status="done", frames=frames)
+            # Phase 1: collect this window's loads, in input order. The time spent
+            # here IS the decode-starvation signal: ~0 when prefetch stays ahead
+            # (GPU-bound), large when the loader pool can't keep up (CPU-bound).
+            _t0 = time.perf_counter()
+            loaded = [futures.pop(idx).result() for idx in range(win_start, win_end)]
+            _prof["decode_wait"] += time.perf_counter() - _t0
+
+            # Phase 2: batched encode for everything that loaded successfully.
+            encodable = [(idx, audio) for idx, (_, audio, status, _) in enumerate(loaded)
+                         if status == "ready" and audio is not None]
+            codes_by_idx: dict[int, torch.Tensor] = {}
+            encode_error: str | None = None
+            if encodable:
+                try:
+                    _t0 = time.perf_counter()
+                    codes_list = codec.encode_batch([audio for _, audio in encodable])
+                    _prof["encode"] += time.perf_counter() - _t0
+                    _prof["n_encoded"] += len(encodable)
+                    for (idx, _), codes in zip(encodable, codes_list):
+                        codes_by_idx[idx] = codes
+                except Exception as e:
+                    # If the whole batch fails (OOM, model error), report each
+                    # encodable item as failed so the caller can still make progress.
+                    encode_error = str(e)
+                # Release cached-but-unallocated GPU memory between batches so a
+                # long encoder loop doesn't fragment its way into an OOM ~20
+                # files in. No-op on CPU; cheap on CUDA.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # Phase 3: persist + yield in window order.
+            for idx, (item, _, status, err) in enumerate(loaded):
+                _, out_path = item
+                if status == "skipped_existing":
+                    yield TokenizeResult(status="skipped_existing")
+                    continue
+                if status == "quality_skip":
+                    # Near-silent / egregiously-clipped source — skip (don't tokenize).
+                    yield TokenizeResult(status="skipped_short", error=f"quality:{err}")
+                    continue
+                if status == "length_skip":
+                    # Too long for the codec's int32 launch config — skip pre-encode
+                    # (would otherwise abort() the worker). Counted as skipped_short;
+                    # no .pt written, so packed-corpus membership stays consistent.
+                    yield TokenizeResult(status="skipped_short", error=f"too_long:{err}")
+                    continue
+                if status == "failed_load":
+                    yield TokenizeResult(status="failed", error=err)
+                    continue
+                # status == "ready"
+                if encode_error is not None:
+                    yield TokenizeResult(status="failed", error=encode_error)
+                    continue
+                codes = codes_by_idx[idx]
+                if codes.shape[1] < min_frames:
+                    yield TokenizeResult(status="skipped_short", frames=int(codes.shape[1]))
+                    continue
+                _t0 = time.perf_counter()
+                frames = _save_tokens(codes, out_path)
+                _prof["save"] += time.perf_counter() - _t0
+                yield TokenizeResult(status="done", frames=frames)
+
+    if _profile:
+        n_enc = max(1, _prof["n_encoded"])
+        print(
+            f"[tokenize-profile] decode_wait={_prof['decode_wait']:.1f}s "
+            f"encode={_prof['encode']:.1f}s save={_prof['save']:.1f}s "
+            f"n_encoded={_prof['n_encoded']} "
+            f"(encode {1000 * _prof['encode'] / n_enc:.0f}ms/file; "
+            f"decode_wait/encode={_prof['decode_wait'] / max(1e-9, _prof['encode']):.2f}) "
+            f"— >1 means CPU-decode-bound, ~0 means GPU-encode-bound",
+            flush=True,
+        )
 
 
 def tokenize_corpus(
@@ -171,7 +405,7 @@ def tokenize_corpus(
     if not mp3s:
         raise SystemExit(f"No mp3s found in {corpus_dir}")
 
-    codec = DACodec(device=device)
+    codec = get_codec(device=device)  # NANO_CODEC: dac (default) or spectrostream
     min_frames = int(min_seconds * codec.FRAME_RATE_HZ)
 
     print(f"found {len(mp3s)} mp3s | device: {device}")

@@ -2,10 +2,12 @@
 
 A hummed/uploaded melody is conditioned on as a time-aligned **chromagram**
 (MusicGen-Melody style): one octave-invariant 12-bin pitch-class vector per audio
-frame, at the SAME ~86 Hz frame rate as the DAC tokens (``hop_length=512`` at
-44.1 kHz, matching ``DACodec.FRAME_RATE_HZ``). The decoder adds a projection of
-this sequence to its per-frame input, so the model regenerates the melodic contour
-in whatever timbre the text prompt asks for.
+frame, at the SAME frame rate as the audio codec tokens (``hop_length = SAMPLE_RATE
+// FRAME_RATE_HZ``, both read from the active codec — DAC: 512 @ 44.1 kHz → 86 Hz;
+SpectroStream: 1920 @ 48 kHz → 25 Hz). The decoder adds a projection of this
+sequence to its per-frame input, so the model regenerates the melodic contour in
+whatever timbre the text prompt asks for. Chroma stays MONO (pitch is octave- and
+channel-invariant) even when the codec is stereo.
 
 ``extract_chroma`` is the SINGLE source of truth for the chroma id stream, shared
 by the dataset (train-time, via the Modal melody job + packer) and inference
@@ -33,9 +35,15 @@ from pathlib import Path
 import librosa
 import numpy as np
 
+from model.codec import codec_constants
+
 N_CHROMA = 12
-SAMPLE_RATE = 44100
-HOP_LENGTH = 512  # -> 86.13 Hz; DACodec uses the same hop, frame count = ceil(n/hop)
+# Match the active codec's frame grid (NANO_CODEC): DAC -> 44100/512 (86 Hz),
+# SpectroStream -> 48000/1920 (25 Hz). The chroma frame count must equal the token
+# frame count for the same audio, so these MUST track the codec used to tokenize.
+_CODEC = codec_constants()
+SAMPLE_RATE = _CODEC["sample_rate"]
+HOP_LENGTH = _CODEC["hop"]  # SAMPLE_RATE // FRAME_RATE_HZ; frame count = ceil(n/hop)
 _EPS = 1e-8
 
 
@@ -66,10 +74,11 @@ def _load_audio_file(path: str) -> np.ndarray:
 
 
 def _dac_frame_count(n_samples: int) -> int:
-    """Frames DAC would emit for ``n_samples`` mono samples: ceil(n / hop).
+    """Frames the active codec emits for ``n_samples`` samples: ceil(n / hop).
 
-    Mirrors ``DACodec.encode_batch`` (``t_i = (samples + hop - 1) // hop``) so the
-    chroma frame count matches the token frame count for the same audio.
+    Mirrors the codec's ``encode`` frame-count rule (``ceil(samples / hop)``) so the
+    chroma frame count matches the token frame count for the same audio. (Named for
+    historical reasons; ``HOP_LENGTH`` is codec-derived, so it's codec-generic.)
     """
     return (n_samples + HOP_LENGTH - 1) // HOP_LENGTH
 

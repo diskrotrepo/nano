@@ -7,14 +7,17 @@ listing) and reports:
     rails (see CLAUDE.md "Scale of training data")
   - per-stream coverage of the packed (trainable) corpus: tags, structure,
     keys, lyrics, phonemes, melody
-  - melody source (.mel.npy on nano-melody) vs packed (.mel.bin) coverage —
-    both must hold for a contour to actually train
-  - song-duration distribution from the packed offsets (and the share shorter
-    than the 60s training crop)
-  - model settings vs data scale: the default 400k-step run translated into
-    effective epochs of unique audio, with an under/over-training verdict
-    (nano is one fixed-shape ~2.0B net, so step count is the lever that has to
-    match the trainable-song scale)
+  - melody: packed (.mel.bin) coverage + a direct probe of packed chroma rows
+    for realness (source .mel.npy files are pruned after pack by the wave
+    pipeline, so their absence proves nothing)
+  - song-duration distribution from the packed offsets (frame rate detected
+    from the pack's n_codebooks: SpectroStream 25 Hz vs DAC 86 Hz) and the
+    share shorter than the DEFAULTS training crop
+  - model settings vs data scale: the DEFAULTS run (steps/batch/crop imported
+    from diskrot.modal_train) translated into effective epochs of unique
+    audio, with an under/over-training verdict (nano is one fixed-shape ~2.0B
+    net, so step count is the lever that has to match the trainable-song
+    scale)
   - lyric breakdown: instrumental(null) / hallucinated (what the filter
     would null, same rules as diskrot/filter_lyrics.py) / vocal-ready /
     never-transcribed
@@ -43,12 +46,16 @@ import modal
 
 app = modal.App("nano-lyrics-audit")
 
-image = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "numpy>=1.26", "py3langid>=0.3"
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("numpy>=1.26", "py3langid>=0.3")
+    .add_local_python_source("diskrot")  # for diskrot.modal_common.corpus_mount
 )
 
+from diskrot.modal_common import corpus_mount
+
 tokens_vol = modal.Volume.from_name("nano-tokens")
-corpus_vol = modal.Volume.from_name("nano-corpus")
+corpus_vol = corpus_mount()  # read-only R2 bucket
 # Source chromagrams live on their own volume (kept off nano-tokens for its
 # inode cap). Read-only here; create_if_missing so the audit still runs before
 # any melody pass has populated it.
@@ -58,7 +65,12 @@ melody_vol = modal.Volume.from_name("nano-melody", create_if_missing=True)
 @app.function(
     image=image,
     volumes={"/tokens": tokens_vol, "/corpus": corpus_vol, "/melody": melody_vol},
-    timeout=60 * 30,
+    # 30 min timed out at the ~1M-song corpus (R2 rglob + 1GB tags.json + the
+    # full lyric-shard merge); the sweep is sequential, so give it room.
+    timeout=60 * 60 * 3,
+    # The lyric/phoneme shard merges live in RAM (word-level timestamps for
+    # every vocal song) — same OOM class as phonemize's memory=32GB fix.
+    memory=32 * 1024,
     # Modal's spontaneous platform cancellations (the same waves that hit the
     # big .map fleets) can kill this single .remote() call mid-sweep — retry.
     retries=modal.Retries(max_retries=3, initial_delay=10.0),
@@ -108,24 +120,52 @@ def audit():
             merged.update(json.loads(shard.read_text()))
         return merged
 
-    # DAC frame rate (model/codec.py FRAME_RATE_HZ); inlined to keep the slim
-    # image free of torch. seconds = frames / 86.
-    FRAME_RATE_HZ = 86
+    # Frame rate is codec-dependent — DAC = 86 Hz, SpectroStream = 25 Hz
+    # (model/codec.py FRAME_RATE_HZ; inlined to keep the slim image free of
+    # torch). Detected from the pack itself below (an SS pack stores 32
+    # codebooks, a DAC pack 9), NOT from NANO_CODEC — this container doesn't
+    # carry that env, and the 2026-07-12 audit misread a 25 Hz SS pack at 86 Hz
+    # (every duration/hours figure 3.44x under). seconds = frames / frame_rate.
+    DAC_HZ, SS_HZ = 86, 25
+    # Train-shape constants for the epochs math come from the source of truth
+    # (module level is os/threading/modal only — no torch); inline fallbacks
+    # keep an hour-long sweep alive if that import ever breaks.
+    try:
+        from diskrot.modal_train import DEFAULTS as _TD
+        TRAIN_STEPS, GLOBAL_BATCH = int(_TD["steps"]), int(_TD["batch_size"])
+        SEG_SECONDS = float(_TD["segment_seconds"])
+    except Exception as exc:
+        print(f"(diskrot.modal_train DEFAULTS import failed: {exc!r} — "
+              f"using inline fallbacks)")
+        TRAIN_STEPS, GLOBAL_BATCH, SEG_SECONDS = 400_000, 32, 180.0
+    MODEL_PARAMS = "~2.0B"
     # Corpus health rails (see CLAUDE.md "Scale of training data"): below ~10k is
     # noise (pipeline-validation only), ~50k is the recommended floor for
-    # coherent output, ~500k is the nano-corpus inode ceiling.
-    FLOOR_NOISE, FLOOR_COHERENT, CEILING = 10_000, 50_000, 500_000
+    # coherent output, ~500k is a soft reference scale (R2 has no inode cap).
+    FLOOR_NOISE, FLOOR_COHERENT, REFERENCE = 10_000, 50_000, 500_000
 
     # --- corpus / packed (trainable) ---
-    corpus = {p.stem for p in Path("/corpus").glob("*.mp3")}
+    # rglob: raw audio lives in R2 under waves/wave_*/ (and possibly flat legacy).
+    corpus = {p.stem for p in Path("/corpus").rglob("*.mp3")}
     print(f"corpus mp3s:              {len(corpus)}")
 
     trainable: set[str] = set()
     durations: list[float] = []          # per-song seconds (from packed offsets)
     melody_packed: set[str] = set()      # songs in a shard packed WITH chroma
+    mel_sampled = mel_real = 0           # direct zero-fill probe of .mel.bin rows
     packed = Path("/tokens/packed")
+    packed_k, frame_rate = 0, DAC_HZ
     if (packed / "packed_index.json").exists():
         index = json.loads((packed / "packed_index.json").read_text())
+        # An SS pack stores 32 codebooks (NANO_SS_DEPTH), a DAC pack 9 — that
+        # pins the frame rate. Legacy indexes lack the field; peek at shard 0.
+        packed_k = int(index.get("n_codebooks") or 0)
+        if not packed_k and index["shards"]:
+            first = json.loads(
+                (packed / f"packed_{index['shards'][0]['shard_id']:03d}.json").read_text()
+            )
+            packed_k = int(first.get("n_codebooks") or 0)
+        frame_rate = SS_HZ if packed_k >= 24 else DAC_HZ
         for shard_entry in index["shards"]:
             meta = json.loads(
                 (packed / f"packed_{shard_entry['shard_id']:03d}.json").read_text()
@@ -135,28 +175,49 @@ def audit():
             # offsets are cumulative frame counts (len == n_songs + 1), so a
             # song's frame length is the gap between consecutive offsets.
             offsets = meta.get("offsets")
-            if isinstance(offsets, list) and len(offsets) == len(names) + 1:
+            has_offsets = isinstance(offsets, list) and len(offsets) == len(names) + 1
+            if has_offsets:
                 durations.extend(
-                    (offsets[i + 1] - offsets[i]) / FRAME_RATE_HZ
+                    (offsets[i + 1] - offsets[i]) / frame_rate
                     for i in range(len(names))
                 )
             # has_melody marks a shard packed with a chroma sidecar. Membership
             # there is identical to the token .bin (missing chroma is zero-filled,
-            # never dropped), so every name in the shard is melody-PACKED — though
-            # a zero-filled row carries no real contour (see source coverage below).
+            # never dropped), so every name in the shard is melody-PACKED. Whether
+            # the rows carry a REAL contour is probed directly: sample 3 songs'
+            # mid-song chroma from the .mel.bin (source .npy absence proves
+            # nothing — the wave pipeline prunes those after pack).
             if meta.get("has_melody"):
                 melody_packed.update(names)
+                mel_path = packed / f"packed_{shard_entry['shard_id']:03d}.mel.bin"
+                total_t = int(meta.get("total_T") or 0)
+                if has_offsets and names and total_t and mel_path.exists():
+                    mm = np.memmap(mel_path, dtype=np.float16, mode="r",
+                                   shape=(12, total_t))
+                    for i in {0, len(names) // 2, len(names) - 1}:
+                        length = offsets[i + 1] - offsets[i]
+                        w = min(length, 500)   # ~20s at 25 Hz, centered
+                        s = offsets[i] + (length - w) // 2
+                        mel_sampled += 1
+                        if np.any(mm[:, s:s + w]):
+                            mel_real += 1
+                    del mm
     print(f"packed (trainable) songs: {len(trainable)}")
+    if packed_k:
+        print(f"  pack codec:             n_codebooks={packed_k} → "
+              f"{'SpectroStream' if frame_rate == SS_HZ else 'DAC'} "
+              f"@ {frame_rate} Hz")
     n_train = len(trainable)
     if n_train:
         if n_train < FLOOR_NOISE:
             verdict = f"BELOW ~{FLOOR_NOISE//1000}k — expect noise (pipeline-validation only)"
         elif n_train < FLOOR_COHERENT:
             verdict = f"below ~{FLOOR_COHERENT//1000}k recommended floor — usable but thin"
-        elif n_train <= CEILING:
-            verdict = f"in the recommended ~{FLOOR_COHERENT//1000}k–{CEILING//1000}k band"
+        elif n_train <= REFERENCE:
+            verdict = f"in the recommended ~{FLOOR_COHERENT//1000}k–{REFERENCE//1000}k band"
         else:
-            verdict = f"above the ~{CEILING//1000}k inode ceiling (?)"
+            verdict = (f"above the ~{REFERENCE//1000}k reference scale — fine "
+                       f"(R2 corpus, no inode cap)")
         print(f"  scale check:            {verdict}")
 
     # --- per-stream coverage vs trainable ---
@@ -177,11 +238,15 @@ def audit():
 
     lyrics = load_lyrics_shards("/tokens/lyrics")
 
-    # Source chromagrams on nano-melody (the modal_melody.py output). A song with
-    # a .mel.npy here has a real contour; whether it reached the dataset also
-    # needs it folded into the pack (melody_packed below).
+    # Source chromagrams on nano-melody (the modal_melody.py output — per-wave
+    # subdirs waves/wave_<id>/ since the wave pipeline, flat for legacy, hence
+    # rglob). NOTE: modal_wave_cleanup prunes these once pack folds them in, so
+    # a near-zero count is NORMAL post-ingest and says nothing about the packed
+    # rows — the .mel.bin probe above is the authoritative realness signal.
+    # Source only matters where it exists WITHOUT packed (pack predates the
+    # chroma → re-pack with --mel-cache-dir).
     melody_src = {p.name[: -len(".mel.npy")]
-                  for p in Path("/melody").glob("*.mel.npy")}
+                  for p in Path("/melody").rglob("*.mel.npy")}
 
     def cov(name: str, have: set[str]) -> None:
         n = len(have & trainable) if trainable else len(have)
@@ -194,26 +259,29 @@ def audit():
     cov("keys", set(keys))
     cov("lyrics", set(lyrics))
     cov("phonemes", phonemes)
-    cov("melody", melody_src)
+    cov("melody", melody_packed)
 
-    # --- melody: source vs packed (the two must both hold for the model to use
-    # a contour). source = .mel.npy on nano-melody; packed = folded into a
-    # has_melody pack shard. Source-without-packed means the pack predates the
-    # chroma and needs a re-pack with --mel-cache-dir before melody trains. ---
+    # --- melody: packed = folded into a has_melody shard (the trainability
+    # signal, reported in the coverage table above); the probe reads packed
+    # chroma rows directly for realness. Source .mel.npy files are pruned by
+    # modal_wave_cleanup after pack, so low source is normal — it's only
+    # actionable where it exists WITHOUT packed (re-pack needed). ---
     print("\nmelody conditioning:")
     src_in_train = len(melody_src & trainable)
     pk_in_train = len(melody_packed & trainable)
-    print(f"  source (.mel.npy):      {src_in_train:>7} / {len(trainable)}  "
-          f"({src_in_train / max(len(trainable), 1):.1%})")
     print(f"  packed (.mel.bin):      {pk_in_train:>7} / {len(trainable)}  "
           f"({pk_in_train / max(len(trainable), 1):.1%})")
+    print(f"  source (.mel.npy):      {src_in_train:>7}  "
+          f"(pruned after pack — low is normal)")
     src_not_packed = len((melody_src & trainable) - melody_packed)
     if src_not_packed:
         print(f"  source not yet packed:  {src_not_packed}  "
               f"(re-pack with --mel-cache-dir to make these trainable)")
-    if pk_in_train and src_in_train < pk_in_train:
-        print(f"  packed-but-zero-filled: ~{pk_in_train - src_in_train}  "
-              f"(in a melody shard but no source chroma → silent rows)")
+    if mel_sampled:
+        note = ("" if mel_real == mel_sampled
+                else "  — zero rows = packed without source chroma")
+        print(f"  packed-chroma probe:    {mel_real}/{mel_sampled} sampled songs "
+              f"carry a real (nonzero) contour{note}")
 
     # --- song-duration distribution (from packed offsets) ---
     if durations:
@@ -225,11 +293,13 @@ def audit():
             print(f"  {label:>9}: {n:>7}  ({n / len(d):.1%})")
         print(f"  mean {d.mean():.0f}s  median {np.median(d):.0f}s  "
               f"min {d.min():.0f}s  max {d.max():.0f}s")
-        # Songs shorter than the Modal 60s training segment can't fill a crop
-        # (the dataset pads/wraps them) — a large share dilutes the effective set.
-        n_short = int((d < 60).sum())
+        # Songs shorter than the training crop (DEFAULTS segment_seconds) can't
+        # fill it — pad_short_songs masks the tail, so they train fine, but a
+        # large share dilutes the audio each crop actually carries.
+        n_short = int((d < SEG_SECONDS).sum())
         if n_short:
-            print(f"  shorter than 60s crop:  {n_short}  ({n_short / len(d):.1%})")
+            print(f"  shorter than {SEG_SECONDS:.0f}s crop:  {n_short}  "
+                  f"({n_short / len(d):.1%})")
 
     # --- model settings vs data scale ---
     # nano is ONE fixed-shape ~2.0B net (the DEFAULTS dict in
@@ -237,19 +307,19 @@ def audit():
     # sizes to pick from), so the only training lever that has to match the data
     # scale is the step count. Translate it into effective epochs of unique
     # audio: how many times the configured run sweeps the trainable corpus.
-    # Constants mirror DEFAULTS (steps / global batch_size / segment_seconds) —
-    # keep in sync if those change.
-    TRAIN_STEPS, GLOBAL_BATCH, SEG_SECONDS, MODEL_PARAMS = 400_000, 32, 60, "~2.0B"
+    # Constants come from diskrot.modal_train DEFAULTS, resolved at the top of
+    # this function (with inline fallbacks) — no manual sync to go stale.
     if durations:
         total_audio_s = float(np.array(durations).sum())
-        crops_drawn = TRAIN_STEPS * GLOBAL_BATCH          # 60s crops the run draws
+        crops_drawn = TRAIN_STEPS * GLOBAL_BATCH          # crops the run draws
         seconds_drawn = crops_drawn * SEG_SECONDS
         epochs = seconds_drawn / max(total_audio_s, 1.0)
         print(f"\nmodel settings vs data scale (DEFAULTS: {MODEL_PARAMS}, "
-              f"{TRAIN_STEPS:,} steps, global batch {GLOBAL_BATCH}, {SEG_SECONDS}s crops):")
+              f"{TRAIN_STEPS:,} steps, global batch {GLOBAL_BATCH}, "
+              f"{SEG_SECONDS:.0f}s crops):")
         print(f"  trainable audio:        {total_audio_s / 3600:,.0f} h  "
               f"({total_audio_s / 1e6:.1f}M s over {len(durations)} songs)")
-        print(f"  60s crops over run:     {crops_drawn / 1e6:.1f}M  "
+        print(f"  crops drawn over run:   {crops_drawn / 1e6:.1f}M × {SEG_SECONDS:.0f}s  "
               f"({seconds_drawn / 3600:,.0f} h drawn)")
         print(f"  effective epochs:       {epochs:.1f}x over unique audio")
         # Heuristic band for a fixed-shape run: too few passes leaves the net
@@ -347,4 +417,11 @@ def audit():
 
 @app.local_entrypoint()
 def main():
-    audit.remote()
+    # spawn (not remote) + `modal run --detach`: a blocking .remote() is owned by
+    # the local client, so a client drop CANCELS the in-flight sweep even with
+    # --detach (bit us at the ~1M-song scale, where the sweep outlives the
+    # client). Spawned, the audit survives; read the report via
+    # `modal app logs <app-id>`.
+    fc = audit.spawn()
+    print(f"audit launched (detached) — function call id: {fc.object_id}")
+    print("report goes to the app logs:  modal app logs <app-id from above> ")

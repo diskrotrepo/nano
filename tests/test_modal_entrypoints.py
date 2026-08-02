@@ -33,11 +33,21 @@ REPO = Path(__file__).resolve().parent.parent
 # spawn. Add here ONLY for a short interactive tool, never a corpus sweep.
 BLOCKING_OK = {
     "modal_clean_corrupt.py",   # one-off maintenance sweep, inline report
-    "modal_drop_long.py",       # dry-run blocks inline; apply path spawns
     "modal_export_ckpt.py",     # seconds — prints the pull command
     "modal_inspect_ckpts.py",   # seconds — prints the checkpoint table
     "modal_merge_lora.py",      # minutes — prints the pull command
     "modal_test_transcribe.py", # diagnostic probe, inline output
+    "modal_wave_cleanup.py",    # quick per-wave inode reclaim; dry-run reports inline
+    "modal_shard_stores.py",    # one-time JSON->shards migration, seconds, inline
+    "modal_spectrostream_spike.py",  # v9 codec spike — interactive A/B, inline report
+    "modal_duration_audit.py",       # quick read-only duration histogram, inline
+    "modal_ipa_coverage.py",         # v9 IPA-coverage spike — read-only, inline report
+    "modal_lyrics_lang_audit.py",    # read-only lyrics language-field audit, inline
+    "modal_lyrics_stats.py",         # read-only skip-Demucs gate: wave-vs-rest stats, inline
+    "modal_r2_wavify.py",            # dry-run blocks inline; apply path spawns
+    "modal_clean_dac_pt.py",         # dry-run blocks inline; apply path spawns
+    "modal_copy_conditioning.py",    # ~1k-file codec-subdir copy, seconds; dry-run inline
+    "modal_make_test_wave.py",       # server-side R2 copy of ~1k objects, seconds; teardown tool
 }
 
 MODAL_RUN_RE = re.compile(

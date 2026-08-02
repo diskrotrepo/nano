@@ -12,13 +12,40 @@ CFG_SCALES = [3.0, 4.0, 5.0, 6.0, 7.0]   # sweep the full 3-7 band; collapse
 #   finding does not transfer to v7_1500m — re-measure here).
 
 # ── ladder profiles: temperature + top_k co-vary, so grid the SHAPE, not the
-# 9x9 cross product. Each is a (temperature, top_k) pair, scalar or length-9. ──
+# 9x9 cross product. Each is a (temperature, top_k) pair, scalar or per-codebook
+# list. Ladders are authored at K=9 (v8/DAC) and resampled to the target
+# checkpoint's codebook count via NANO_SWEEP_K (24 for v9/SpectroStream) — the
+# server rejects a per_cb list whose length != the checkpoint's K. ──────────────
+import os
+
+SWEEP_K = int(os.environ.get("NANO_SWEEP_K", "9"))
+
+
+def _resample(vals, k=None):
+    """Linearly resample a ladder to k points, preserving shape + endpoints."""
+    k = k or SWEEP_K
+    n = len(vals)
+    if k == n:
+        return list(vals)
+    out = []
+    for i in range(k):
+        x = i * (n - 1) / (k - 1)
+        lo = int(x)
+        hi = min(lo + 1, n - 1)
+        out.append(round(vals[lo] + (vals[hi] - vals[lo]) * (x - lo), 4))
+    return out
+
+
+def _resample_topk(vals, k=None):
+    return [max(1, int(round(v))) for v in _resample(vals, k)]
+
+
 PROFILES = {
     "HOT_FLAT":    (0.9, 50),
-    "COLD_LADDER": ([0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25],
-                    [120, 90, 70, 50, 36, 26, 18, 12, 8]),
-    "WARM_LADDER": ([1.05, 0.98, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5, 0.42],
-                    [120, 90, 70, 50, 36, 26, 18, 12, 8]),
+    "COLD_LADDER": (_resample([0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25]),
+                    _resample_topk([120, 90, 70, 50, 36, 26, 18, 12, 8])),
+    "WARM_LADDER": (_resample([1.05, 0.98, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5, 0.42]),
+                    _resample_topk([120, 90, 70, 50, 36, 26, 18, 12, 8])),
 }
 
 # ── eval prompts: broad genre set so the ranking finds GENERAL-PURPOSE defaults,

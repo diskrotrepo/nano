@@ -46,11 +46,13 @@ g2p_required = pytest.mark.skipif(
 )
 
 
-def _make_ds(synth_tokens_dir, tmp_path, words, segments, bpm=None, gender=None, key=None):
+def _make_ds(synth_tokens_dir, tmp_path, words, segments, bpm=None, gender=None,
+             key=None, tempo=None):
     """Build a TokenDataset over a tiny synth corpus with the given lyrics +
-    structure (and optional bpm/gender/key) for song_000. ``words=[]`` exercises
-    the transcribed-but-wordless (instrumental) path; ``words=None`` writes a
-    null entry — the on-disk instrumental convention."""
+    structure (and optional bpm/gender/key/tempo) for song_000. ``words=[]``
+    exercises the transcribed-but-wordless (instrumental) path; ``words=None``
+    writes a null entry — the on-disk instrumental convention. ``bpm`` is the
+    structure-pass tempo; ``tempo`` is the (preferred) tempo.json bpm."""
     tokens_dir = synth_tokens_dir(n_files=2, T=1000)
     pack(tokens_dir, verbose=False)
     lyrics_path = tmp_path / "lyrics.json"
@@ -67,9 +69,13 @@ def _make_ds(synth_tokens_dir, tmp_path, words, segments, bpm=None, gender=None,
     if key is not None:
         keys_path = tmp_path / "keys.json"
         keys_path.write_text(json.dumps({"song_000": {"key": key}}))
+    tempo_path = None
+    if tempo is not None:
+        tempo_path = tmp_path / "tempo.json"
+        tempo_path.write_text(json.dumps({"song_000": {"bpm": tempo}}))
     return TokenDataset(
         tokens_dir, segment_frames=500, lyrics_path=lyrics_path,
-        structure_path=structure_path, keys_path=keys_path,
+        structure_path=structure_path, keys_path=keys_path, tempo_path=tempo_path,
         val_ratio=0.5, max_lyric_len=256,
     )
 
@@ -172,6 +178,32 @@ def test_tempo_prefix_bucket(synth_tokens_dir, tmp_path):
     assert ids[:6] == [BOS_PHONEME_ID, UNKNOWN_GENDER_ID, bpm_to_id(120.0),
                        UNKNOWN_KEY_ID, VOCALS_ID, STRUCTURE_TOKEN_TO_ID["verse"]]
     assert bpm_to_id(120.0) != UNKNOWN_TEMPO_ID  # a real bucket, not the fallback
+
+
+def test_tempo_json_is_loaded_and_overrides_structure_bpm(synth_tokens_dir, tmp_path):
+    """tempo.json (dense, diskrot.tempo_detect) is the preferred bpm source: it
+    fills the tempo map when structure has no bpm, and WINS where both exist."""
+    segments = [{"start": 0.0, "end": 10.0, "label": "verse"}]
+    words = [{"word": "hi", "start": 0.0, "end": 1.0}]
+    # tempo.json only (no structure bpm) -> tempo.json drives the map.
+    ds = _make_ds(synth_tokens_dir, tmp_path, words, segments, tempo=128.0)
+    assert ds._bpm["song_000"] == 128.0
+    # both present, different values -> tempo.json wins (structure bpm is fallback).
+    ds2 = _make_ds(synth_tokens_dir, tmp_path, words, segments, bpm=90.0, tempo=140.0)
+    assert ds2._bpm["song_000"] == 140.0
+
+
+@g2p_required
+def test_tempo_prefix_from_tempo_json(synth_tokens_dir, tmp_path):
+    """A tempo.json bpm (with no structure bpm) still lands in the tempo header slot
+    via the unchanged bpm_to_id, matching the bracket parser's numeric form."""
+    segments = [{"start": 0.0, "end": 10.0, "label": "verse"}]
+    ds = _make_ds(synth_tokens_dir, tmp_path,
+                  [{"word": "hello", "start": 0.5, "end": 1.5}], segments, tempo=128.0)
+    ids = ds._get_segment_lyric_ids("song_000", 0.0, 5.0)
+    assert ids[2] == bpm_to_id(128.0)
+    assert ids[2] != UNKNOWN_TEMPO_ID
+    assert ids == text_with_markers_to_phoneme_ids("[128bpm] [verse] hello")
 
 
 @g2p_required

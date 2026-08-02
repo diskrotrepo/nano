@@ -153,19 +153,6 @@ def load_descs(path: Path) -> list[str]:
     return out
 
 
-def corpus_mp3_count() -> int | None:
-    """Best-effort raw mp3 count on nano-corpus, to flag captioning lag."""
-    try:
-        r = subprocess.run(
-            ["modal", "volume", "ls", "nano-corpus", "--json"],
-            check=True, capture_output=True, text=True, timeout=120,
-        )
-        return sum(1 for e in json.loads(r.stdout)
-                   if str(e.get("Filename", "")).lower().endswith(".mp3"))
-    except Exception:
-        return None
-
-
 # ── regex pass ───────────────────────────────────────────────────────────────
 def regex_counts(descs: list[str]) -> dict[str, int]:
     out = {}
@@ -260,17 +247,6 @@ def main() -> int:
     p(lines, f"# nano genre-gap eval — {N:,} captioned songs")
     p(lines, f"# source: {tags_path}  (mtime {__import__('datetime').datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M})")
     p(lines, f"# floor: >={FLOOR_PCT:.0f}% of corpus AND >={FLOOR_SONGS:,} distinct songs\n")
-
-    # captioning-lag check
-    raw = corpus_mp3_count()
-    if raw is not None:
-        p(lines, f"## corpus coverage: {N:,} captioned / {raw:,} mp3s on nano-corpus "
-                 f"({100*N/raw:.0f}% captioned)")
-        if N < 0.9 * raw:
-            p(lines, "  ⚠ captioning lags the corpus — gap data may be present but not yet "
-                     "captioned, so caption-based coverage UNDER-states true coverage.\n")
-        else:
-            p(lines, "")
 
     rx = regex_counts(descs)
     cl = clap_counts(descs, tags_path, args.clap_sample, args.seed) if not args.no_clap else None

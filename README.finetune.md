@@ -8,10 +8,10 @@ the from-scratch data-prep and training pipeline, see [README.plan.md](README.pl
 
 | | Full fine-tune (`--init-from`) | LoRA (`--init-from --lora`) |
 |---|---|---|
-| What trains | **Every** weight, continued from the checkpoint | The base is **frozen**; small low-rank adapters (~21.6M params, ~1.4% of 1.5B) train on top |
+| What trains | **Every** weight, continued from the checkpoint | The base is **frozen**; small low-rank adapters (~21.6M params, ~1% of ~2.08B) train on top |
 | Optimizer / step | Fresh — new optimizer, step 0, fresh warmup + cosine schedule | Fresh, and only the adapters carry optimizer state |
 | Checkpoints | Standard full checkpoints (multi-GB) | **Adapter-only** (~100 MB) — must be **merged** into the base before serving |
-| Hardware | 8×H100 (same as a full run) | A **single H100 — or your local GPU / Apple Silicon**; freezing the base removes the optimizer-state memory that makes local 1.5B training impractical |
+| Hardware | 4×B200 (same as a full run) | A **single H100 — or your local GPU / Apple Silicon**; freezing the base removes the optimizer-state memory that makes local 1.5B training impractical |
 | Pick it when | Large new corpus; you want to shift the whole model (lower `--lr`, e.g. 5e-5) | Smaller corpus, style/domain adaptation, or you want to train locally |
 
 Both modes take the **architecture from the checkpoint** (`--d-model` etc.
@@ -24,7 +24,7 @@ main corpus (README.plan.md), just packed under its own directory.
 ```
 (optional) new corpus ──► README.plan.md waves ──► /tokens/<data-subdir>/…
                                                           │
-base checkpoint (v8_sing/best.pt) ──► fine-tune / LoRA train ──┬─ full FT ─► standard ckpt ─► (slim-export) ─► serve/eval
+base checkpoint (v9_stereo/best.pt) ──► fine-tune / LoRA train ──┬─ full FT ─► standard ckpt ─► (slim-export) ─► serve/eval
                                                                └─ LoRA ───► adapter ckpt ──► MERGE ─────────► serve/eval
 ```
 
@@ -39,7 +39,7 @@ layout (`packed/`, `tags.json`, `lyrics/`, `phonemes/`, …), then pass
 **2. Pick the base checkpoint:**
 
 ```bash
-modal run diskrot/modal_inspect_ckpts.py --prefix v8_sing   # on the volume
+modal run diskrot/modal_inspect_ckpts.py --prefix v9_stereo   # on the volume
 # local runs can point --init-from at any local .pt (full or *_inference slim)
 ```
 
@@ -49,7 +49,7 @@ modal run diskrot/modal_inspect_ckpts.py --prefix v8_sing   # on the volume
 ```bash
 # Modal LoRA (single H100 is plenty — recommended LoRA path)
 modal run --detach diskrot/modal_train.py \
-  --init-from v8_sing/best.pt --lora --ckpt-subdir v8_lora_x \
+  --init-from v9_stereo/best.pt --lora --ckpt-subdir v9_lora_x \
   [--data-subdir my_corpus] [--lora-r 16 --lora-alpha 32]
 
 # Local LoRA (Apple Silicon / single GPU — the headline local use)
@@ -57,9 +57,9 @@ python -m diskrot.train --device mps \
   --init-from ./checkpoints/latest.pt --lora --ckpt-dir ./checkpoints/ft_run \
   --cache-dir ./token_cache --tags-path ./tags.json --lyrics-path ./lyrics
 
-# Modal full fine-tune (8×H100, lower LR than the from-scratch 2.1e-4)
-modal run --detach diskrot/modal_train.py --n-gpus 8 \
-  --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
+# Modal full fine-tune (4×B200, lower LR than the from-scratch 1.5e-4)
+modal run --detach diskrot/modal_train.py --n-gpus 4 \
+  --init-from v9_stereo/best.pt --ckpt-subdir v9_ft --lr 5e-5
 ```
 
 **4. Monitor / resume** — exactly like training: same log format, and a re-run
@@ -71,7 +71,7 @@ inference checkpoint (full-FT checkpoints are already standard; use
 `modal_export_ckpt.py` to slim them as usual):
 
 ```bash
-modal run diskrot/modal_merge_lora.py --base v8_sing/best.pt --lora v8_lora_x/best.pt
+modal run diskrot/modal_merge_lora.py --base v9_stereo/best.pt --lora v9_lora_x/best.pt
 # local: python -m diskrot.merge_lora --base ... --lora ... --out ./checkpoints/merged_inference.pt
 ```
 
@@ -79,7 +79,7 @@ modal run diskrot/modal_merge_lora.py --base v8_sing/best.pt --lora v8_lora_x/be
 drop-in standard checkpoint:
 
 ```bash
-modal volume get nano-ckpts /v8_lora_x/merged_inference.pt ./checkpoints/latest.pt --force
+modal volume get nano-ckpts /v9_lora_x/merged_inference.pt ./checkpoints/latest.pt --force
 ```
 
 ## Rules of thumb
@@ -97,7 +97,7 @@ modal volume get nano-ckpts /v8_lora_x/merged_inference.pt ./checkpoints/latest.
   checkpoint has no `model` key — it records the base's path and is useless
   without it (and without merging, for inference).
 - **LR:** full fine-tune wants a lower LR than from-scratch (think 5e-5 vs
-  2.1e-4); LoRA tolerates the default-range LR since only adapters move.
-- **Nothing here touches the main run or the prepared data** — the v8 launch
+  1.5e-4); LoRA tolerates the default-range LR since only adapters move.
+- **Nothing here touches the main run or the prepared data** — the v9 launch
   command, checkpoint schema, and the data pipeline are unchanged; fine-tuning
   only ever writes to its own `--ckpt-subdir`.

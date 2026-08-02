@@ -21,33 +21,67 @@ nano is **one bespoke model trained at scale on one kind of data**. More of the
 same data helps; variety does not — do **not** curate for genre/style diversity.
 
 - **Recommended corpus size:** ~50k songs minimum for coherent output. Below ~10k
-  the model produces noise (pipeline-validation only). Ceiling is ~500k files
-  (the `nano-corpus` volume's inode limit).
+  the model produces noise (pipeline-validation only). No hard ceiling — the raw
+  audio lives in R2 object storage (the old ~500k figure was the retired
+  `nano-corpus` Volume's inode cap).
 - For the cost-per-1,000-songs table and end-to-end walkthrough, read
   [README.modal.md](../../../README.modal.md) — don't restate the numbers here.
 - For the per-stage data shapes, see the **Data Flow** section of
   [CLAUDE.md](../../../CLAUDE.md).
 
-## Volumes
+## Storage
 
-| Volume | Holds |
+Raw audio lives in **Cloudflare R2** (the `nano-audio` bucket, under
+`waves/wave_<id>/`), mounted via `modal_common.corpus_mount()`. The legacy
+`nano-corpus` Volume is retired. Everything else is on Modal Volumes:
+
+| Store | Holds |
 |---|---|
-| `nano-corpus` | Raw MP3 files |
-| `nano-tokens` | `.pt` token files, `packed/` shards (incl. `.mel.bin`), `tags.json`, `lyrics/`, `structure/`, `keys.json`, `phonemes/` |
+| `nano-audio` (R2) | Raw MP3 files under `waves/wave_<id>/` |
+| `nano-tokens` | `.pt` token files, `packed/` shards (incl. `.mel.bin` + `.stem.bin`), `tags.json`, `lyrics/`, `structure/`, `keys.json`, `phonemes/` |
 | `nano-melody` | `<name>.mel.npy` chroma sidecars (own volume — keeps nano-tokens under its inode cap) |
+| `nano-stems` | `<name>.stems.npy` stem-token sidecars (`[4,K,T]` int16; own volume, same inode rationale) |
 | `nano-ckpts` | Training checkpoints |
 
 All Modal fan-out steps below are launched with `--detach` and are **resumable** —
 re-run the same command to continue; it's safe to close your terminal.
 
+## The one-command path: the wave orchestrator
+
+For a real ingest, don't run the stages by hand — `modal_ingest_wave.py` runs
+ONE wave end-to-end, calling each **deployed** stage app in order and marking
+progress in `/tokens/waves/wave_<id>/status.json` (a re-run skips completed
+stages):
+
+```bash
+NANO_CODEC=spectrostream modal run --detach diskrot/modal_ingest_wave.py --wave-id 17
+```
+
+- **Prerequisite**: every stage app must be `modal deploy`ed once (with the
+  `diskrot` source baked in) so the orchestrator can look it up by name —
+  `modal run` apps are ephemeral and can't be. See the module docstring for
+  the deploy list, and re-deploy a stage after editing it (a re-deploy does
+  NOT rescue an in-flight call — stop the stale orchestrator first).
+- **`NANO_CODEC` must be set identically at every stage deploy AND at the
+  orchestrator run** (the v9 corpus is SpectroStream) — the #1 footgun.
+- Cost levers: `--stems-sample-pct` (default 50) samples the expensive GPU
+  stems stage; structure is similarly sampleable. Wave-by-wave model +
+  one-time R2 setup: [README.waves.md](../../../README.waves.md).
+
+The manual stages below are the à-la-carte reference (small corpora, re-running
+a single stage, local smoke tests).
+
 ## Pipeline (run in order)
 
 ### 1. Upload your MP3s
+Raw audio goes to the R2 `nano-audio` bucket under a wave prefix (S3-compatible
+upload — rclone / `aws s3 cp` / the Cloudflare UI). One-time R2 + `r2-creds` +
+`NANO_AUDIO_*` setup is in [README.waves.md](../../../README.waves.md#one-time-setup).
 ```bash
-modal volume create nano-corpus      # first time only
-modal volume put nano-corpus /path/to/mp3s/ /
+rclone copy /path/to/mp3s/ r2:nano-audio/waves/wave_0/
 ```
-Trailing `/` matters. (No crawler — you supply your own MP3s.)
+(No crawler — you supply your own MP3s. See [README.waves.md](../../../README.waves.md)
+for the wave-by-wave ingestion model.)
 
 ### 2. Prepare — validate, dedupe, drop
 Dry-run first (no deletions), inspect the report, then apply:
@@ -59,7 +93,18 @@ modal run --detach diskrot/modal_prepare.py --apply  # actually delete
 Drops files that fail `ffprobe`, byte-identical duplicates (SHA-256), clips <20s,
 and files >5:30. **Why the length cap:** long DJ mixes / album rips OOM the L4
 tokenizer and distort the per-file crop sampler. Resumable via
-`/tokens/prepare_manifest.json`.
+`/tokens/prepare_manifest.json`. Add **`--quality-gate`** to also decode each
+file and drop clipped / mostly-silent / dead / low-bitrate garbage
+(`diskrot.audio_quality`) — raises the training-data floor.
+
+### 2b. Audio near-dup dedup — *recommended*
+```bash
+modal run --detach diskrot/modal_audio_dedup.py            # dry-run report
+modal run --detach diskrot/modal_audio_dedup.py --apply    # delete near-dups
+```
+Catches acoustic near-duplicates SHA-256 misses (same song re-encoded —
+byte-different, identical sound): chromaprint fingerprint → 64-bit SimHash →
+LSH grouping, keeps the best copy per group. After prepare, before tokenize.
 
 ### 3. Tokenize — MP3 → DAC tokens
 Modal (fan-out, the scale path):
@@ -71,7 +116,10 @@ Local (validation / small corpora):
 python -m diskrot.tokenize --corpus /path/to/mp3s --out ./token_cache
 # flags: --device {cuda|mps|cpu}  --min-seconds 20.0  --batch-size 4
 ```
-Output: per-song int16 `.pt` files (`[9, T]`) on `nano-tokens` (or `./token_cache`).
+Output: per-song int16 `.pt` files (`[K, T]`) on `nano-tokens` (or `./token_cache`).
+`NANO_CODEC` picks the codec — DAC (default: mono, K=9, 86 Hz) or
+`spectrostream` (the v9 corpus: joint stereo, K=32 stored, 25 Hz) — and must
+match every later stage and the train launch.
 
 ### 4. Extract melody (chroma) — *optional*, needed for melody conditioning / `/cover`
 ```bash
@@ -91,6 +139,18 @@ works unchanged (tags+lyrics only).
 > / `.mel.npy` are only inputs to pack — prunable after packing (training reads only
 > the shards).
 
+### 4b. Extract stems — *optional*, only for stem conditioning / `/addstem` (currently deferred)
+```bash
+NANO_CODEC=spectrostream modal run --detach diskrot/modal_stems.py --wave-id <id> --sample-pct 50
+```
+Demucs-separates each song into 4 stems + codec-tokenizes them to a per-song
+`<name>.stems.npy` on **`nano-stems`**. GPU fan-out — the most expensive
+optional stage, hence `--sample-pct` (ingest default 50; non-sampled songs are
+flagged absent by the pack's present mask). After tokenize, before pack.
+**Skip unless you'll train with `use_stem_conditioning`** — it's `False` in
+the current `DEFAULTS` (deferred for v9), so today this stage is prep-ahead
+only. Calibrate cost with `--limit` first.
+
 ### 5. Pack — `.pt` files (+ chroma) → sharded mmap layout
 Required once before training. Auto-detected by the trainer.
 ```bash
@@ -103,7 +163,10 @@ Writes `packed/packed_NNN.bin` + per-shard JSON + `packed_index.json` on
 `nano-tokens`. The Modal wrapper mounts `nano-melody` and **auto-detects**
 `*.mel.npy` there, writing the parallel `packed_NNN.mel.bin` chroma sidecar (at the
 same offsets) back onto `nano-tokens`; the local packer needs `--mel-cache-dir` to
-do so. Shards are written atomically and a re-run skips complete-and-valid shards.
+do so. If you ran the stems stage, `--stem-cache-dir` likewise folds the
+`.stems.npy` files into a parallel `packed_NNN.stem.bin` sidecar with a
+per-song present mask. Shards are written atomically and a re-run skips
+complete-and-valid shards.
 
 ### 6. Auto-tag — *optional*, needed for text conditioning
 ```bash
@@ -112,8 +175,13 @@ modal run --detach diskrot/modal_auto_tag.py
 python -m diskrot.auto_tag --corpus /path/to/mp3s --out ./tags.json
 # flags: --device  --limit N
 ```
-LP-MusicCaps writes a natural-language description per song into `tags.json`.
-Re-running only processes new files.
+The **audio-LLM captioner** (Qwen2-Audio over the whole song — A100 fan-out)
+writes a rich natural-language description per song into `tags.json`, plus the
+per-song **vocal-gender** judgment and (v5) **per-stem captions**.
+`NANO_CAPTIONER=bart` selects the legacy single-window LP-MusicCaps path.
+Re-running only processes new files; `--redo` upgrades legacy entries
+(entries are stamped with `CAPTIONER_MARKER`, so it's resumable). Calibrate
+cost with `--limit 50` first — this and transcribe dominate wave cost.
 
 ### 7. Transcribe lyrics — *optional*, needed for lyric conditioning, **expensive**
 ```bash
@@ -122,9 +190,11 @@ modal run --detach diskrot/modal_transcribe.py
 python -m diskrot.transcribe_lyrics --corpus /path/to/mp3s --out ./lyrics
 # flags: --device
 ```
-Demucs (vocal isolation) → Whisper, into a sharded `lyrics/` dir. This is by far
-the costliest step — **skip it unless you will actually use lyric conditioning at
-inference.**
+Whisper (large-v3-turbo + VAD) **on the raw mix — the Modal stage is
+Demucs-free** (separation is a no-op-to-worse ASR input; vocal gender comes
+from the auto-tag captioner, not an F0 pass), into a sharded `lyrics/` dir.
+One of the two costliest steps (with auto-tag) — **skip it unless you will
+actually use lyric conditioning at inference.**
 
 ### 7b. Filter hallucinated lyrics — *recommended* after step 7 completes
 ```bash
@@ -137,6 +207,17 @@ with-words entries) so they train as `<instrumental>`, not `<vocals>` with
 garbage words. CPU, seconds, idempotent. **Only after the transcribe fleet has
 fully finished** (its orchestrator's in-memory flush clobbers concurrent edits),
 and before phonemize.
+
+### 7c. Forced-align lyrics — *optional, recommended for vocals*
+```bash
+modal run --detach diskrot/modal_align_lyrics.py --wave-id N          # dry-run eligibility (cheap)
+modal run --detach diskrot/modal_align_lyrics.py --wave-id N --apply  # L4 fan-out, rewrites in place
+```
+Sharpens Whisper's loose word timestamps with a CTC forced aligner (torchaudio
+MMS_FA; `--use-demucs` for vocal-isolated, sharper but costlier). In-place and
+idempotent (`aligned` stamp), refinement-only — failures keep the original
+timestamps. After transcribe + filter, before/around phonemize; tighter onsets
+help the sung-alignment learning.
 
 ### 8. Structure — *optional*, needed for section markers (`[chorus]` etc.)
 ```bash
@@ -152,7 +233,7 @@ modal run --detach diskrot/modal_phonemize.py
 # or locally: python -m diskrot.phonemize --lyrics-path ./lyrics --out-dir ./phonemes
 ```
 Pre-runs g2p per song into a sharded `phonemes/` dir so the DataLoader doesn't
-pay ~20–200 ms/song of live g2p at train time (which can starve the 8×H100
+pay ~20–200 ms/song of live g2p at train time (which can starve the multi-GPU
 step). CPU, ~$1, resumable. Re-run after any re-transcribe.
 
 ### 10. Key detect — *optional*, needs the melody-packed shards (steps 4+5)
@@ -173,6 +254,9 @@ without an estimate get `<unknown_key>`.
 - **Need melody / `/cover`?** Run step 4 (melody) then repack (step 5) so the chroma
   sidecar lands. Cheap (CPU) — worth it if you want the hum→re-render capability.
   With the sidecar packed, step 10 (key detect) is ~free and adds key control.
+- **Need stems / `/addstem`?** Step 4b + repack — but only if the run will set
+  `use_stem_conditioning` (deferred in the current `DEFAULTS`); otherwise skip
+  the priciest optional stage.
 - **Need section markers (`[verse]`/`[chorus]`)?** Run step 8 (expensive).
 - **Local vs Modal?** Modal for real fan-out scale; local for a smoke corpus to
   exercise the pipeline.
@@ -181,8 +265,9 @@ without an estimate get `<unknown_key>`.
 
 On `nano-tokens` you should have `packed/packed_index.json` (required); if you ran
 the melody step, `packed/` also has `packed_NNN.mel.bin` (and `packed_index.json`
-reports `"has_melody": true`); and per optional pass: `tags.json` (step 6),
-`lyrics/` (7), `structure/` (8), `phonemes/` (9), `keys.json` (10). Quick check:
+reports `"has_melody": true`); if you ran stems, `packed_NNN.stem.bin` too; and
+per optional pass: `tags.json` (step 6), `lyrics/` (7), `structure/` (8),
+`phonemes/` (9), `keys.json` (10). Quick check:
 ```bash
 modal volume ls nano-tokens
 modal volume ls nano-tokens packed | head

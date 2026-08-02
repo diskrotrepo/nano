@@ -10,6 +10,40 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+# Default chunking knobs (shared train==inference contract). CLAP's GPT2 text
+# branch caps at 77 tokens; CHUNK_TOKENS<77 leaves headroom for BPE boundary
+# drift on the decode→re-encode round-trip. MAX_CHUNKS bounds a pathological
+# description (~3000 dense/multilingual chars ≈ ~950 tokens ≈ ~13 chunks).
+CHUNK_TOKENS = 72
+MAX_CHUNKS = 16
+
+
+def chunk_text_ids(tokenizer, text: str, max_chunks: int = MAX_CHUNKS,
+                   chunk_tokens: int = CHUNK_TOKENS) -> list[str]:
+    """Split *text* into ``<=chunk_tokens``-GPT2-token windows using *tokenizer*.
+
+    The single source of truth for chunking, so the train precompute (which has
+    only a bare GPT2 ``AutoTokenizer``) and inference (``CLAPTextEncoder``) build
+    byte-identical chunk streams. A text that fits one window is returned as
+    ``[text]`` unchanged (the terse-tag backward-compat invariant). Empty ->
+    ``[]``. Over ``max_chunks`` windows logs and drops the tail (no silent
+    truncation)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Explicit truncation=False bypasses any tokenizer truncation patch so we
+    # get the FULL token list (add_special_tokens=False -> pure content).
+    ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+    if len(ids) <= chunk_tokens:
+        return [text]
+    windows = [ids[i:i + chunk_tokens] for i in range(0, len(ids), chunk_tokens)]
+    if len(windows) > max_chunks:
+        dropped = len(windows) - max_chunks
+        print(f"[clap-chunk] description is {len(ids)} tokens -> {len(windows)} "
+              f"chunks; capping at {max_chunks} (dropping {dropped} tail chunk(s))")
+        windows = windows[:max_chunks]
+    return [tokenizer.decode(w) for w in windows]
+
 
 class CLAPTextEncoder(nn.Module):
     """Frozen CLAP text encoder (Microsoft msclap).
@@ -113,6 +147,73 @@ class CLAPTextEncoder(nn.Module):
         emb = emb.to(self.proj.weight.device)
         projected = self.proj(emb)                             # [B, d_out]
         return projected.unsqueeze(1)                          # [B, 1, d_out]
+
+    def chunk_text(
+        self, text: str, max_chunks: int = MAX_CHUNKS, chunk_tokens: int = CHUNK_TOKENS,
+    ) -> list[str]:
+        """Split *text* into ``<=chunk_tokens``-GPT2-token windows for chunked CLAP.
+
+        CLAP's text branch is capped at ``text_len`` (77) tokens and pools the
+        whole input to ONE vector, so a long description must be split into
+        windows that each fit, then encoded into a *sequence* of pooled vectors
+        (see ``encode_chunked``). Delegates to the shared ``chunk_text_ids`` with
+        CLAP's own GPT2 tokenizer, so train precompute and inference chunk
+        identically. A text that fits one window is returned as ``[text]``
+        unchanged (the terse-tag backward-compat invariant)."""
+        self._ensure_clap()
+        return chunk_text_ids(self._clap.tokenizer, text, max_chunks, chunk_tokens)
+
+    @staticmethod
+    def additive_kv_mask(keep: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """bool keep-mask [B, N] -> additive cross-attn mask [B, 1, 1, N].
+
+        0 at kept chunks, -inf at padding — the same convention as
+        ``NanoAudioGPT.encode_lyrics``. Callers must keep >=1 chunk per row (a
+        fully -inf row NaNs the cross-attn softmax)."""
+        return torch.zeros(
+            keep.shape[0], 1, 1, keep.shape[1], dtype=dtype, device=keep.device,
+        ).masked_fill(~keep[:, None, None, :], float("-inf"))
+
+    @torch.no_grad()
+    def encode_chunked(
+        self, texts: list[str], max_chunks: int = 16,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode (possibly long) strings -> (emb [B, N_max, d_out], additive
+        kv_mask [B, 1, 1, N_max]).
+
+        Each string is split into ``<=77``-token chunks (``chunk_text``), every
+        chunk encoded by frozen CLAP to a pooled [1024] vector, and the padded
+        sequence projected to ``d_out`` — so a 3000-char description conditions
+        the decoder as ``N`` cross-attention positions instead of one averaged
+        vector. The mask is 0 at real chunks, -inf at padding; every row keeps
+        >=1 un-masked chunk (an empty string becomes a single un-masked *zero*
+        chunk, which a bias-free cross-attn maps to zero output == "no tags"), so
+        no row is ever fully masked. A string that fits one chunk reproduces
+        ``encode`` exactly."""
+        self._ensure_clap()
+        per_text = [self.chunk_text(t, max_chunks=max_chunks) for t in texts]
+        n_per = [len(c) for c in per_text]
+        n_max = max(max(n_per, default=1), 1)
+        flat = [c for chunks in per_text for c in chunks]
+        device = self.proj.weight.device
+        if flat:
+            flat_emb = self._clap.get_text_embeddings(flat).to(device)  # [sum_n, 1024]
+            dtype = flat_emb.dtype
+        else:
+            dtype = self.proj.weight.dtype
+        B = len(texts)
+        raw = torch.zeros(B, n_max, self.CLAP_DIM, device=device, dtype=dtype)
+        keep = torch.zeros(B, n_max, dtype=torch.bool, device=device)
+        idx = 0
+        for i, n in enumerate(n_per):
+            if n == 0:
+                keep[i, 0] = True  # un-masked zero chunk == "no tags"
+                continue
+            raw[i, :n] = flat_emb[idx:idx + n]
+            keep[i, :n] = True
+            idx += n
+        emb = self.proj(raw)  # [B, n_max, d_out]
+        return emb, self.additive_kv_mask(keep, emb.dtype)
 
     @torch.no_grad()
     def encode_audio(self, file_paths: list[str]) -> torch.Tensor:

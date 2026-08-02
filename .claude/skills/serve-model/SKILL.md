@@ -17,9 +17,15 @@ works. It **prefers the slim `best_inference.pt`** export. Produce and download 
 via the **train-model** skill (extract + download step):
 
 ```bash
-modal run diskrot/modal_export_ckpt.py --src v8_sing/best.pt
-modal volume get nano-ckpts /v8_sing/best_inference.pt ./checkpoints/latest.pt --force
+modal run diskrot/modal_export_ckpt.py --src v8_sing4/best.pt
+modal volume get nano-ckpts /v8_sing4/best_inference.pt ./checkpoints/latest.pt --force
 ```
+(Canonical checkpoint when none is named: `v8_sing4/best_inference.pt`.)
+
+**Codec must match the checkpoint**: the engine picks it from `NANO_CODEC`
+(default DAC). A v9/SpectroStream checkpoint needs `NANO_CODEC=spectrostream`
+in the serve environment — locally at launch, and baked into the image at
+`modal serve`/`deploy` time.
 
 ## Local server
 
@@ -28,10 +34,10 @@ uv sync                                                       # first time: buil
 uv run python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 ```
 Loads `./checkpoints/latest.pt` by default (override with `NANO_CKPT`). On Apple
-silicon the 1.5B model runs on `mps`; loading the checkpoint takes ~30s before the
+silicon the ~2.0B model runs on `mps`; loading the checkpoint takes ~30s before the
 `Uvicorn running` line. If port 8000 is busy it's usually a stale server — check
 `lsof -iTCP:8000 -sTCP:LISTEN` and `curl :8000/health` (the response reports
-`model_params`, so you can tell the 1.5B from the retired 287M model).
+`model_params`, so you can tell which checkpoint is loaded).
 
 **Apple-Silicon backend + dtype.** The Mac default is the **PyTorch-MPS** backend
 in **bf16** (the training dtype). Do NOT run fp16 on MPS: MPS accumulates fp16
@@ -42,9 +48,12 @@ keeps fp16 (fine + faster there). Overrides:
 - `NANO_DTYPE=fp32|bf16|fp16` — force the torch compute dtype (default bf16 on
   MPS, fp16 on CUDA). fp32 is ~2× memory/slower and not reliably better than
   bf16 at this scale; bf16 is the recommended Mac dtype.
-- `NANO_MLX=1` — opt into the MLX backend (faster single-token decode, separate
-  runtime; also bf16 now). Default is off → torch-MPS, which shares the CUDA code
-  path and is fully parity-tested (`tests/test_mlx_parity.py`).
+- `NANO_MLX=0` — opt OUT of the MLX backend back to torch-MPS. **MLX is the
+  Apple-Silicon default** (int8, ~1.9× faster than torch-MPS on the v10 DAC shape
+  and numerically correct as of 2026-08-02 — the CFG stage-batching that used to
+  collapse DAC to hiss now runs unbatched, activations/head default to fp32).
+  torch-MPS shares the CUDA code path and is fully parity-tested
+  (`tests/test_mlx_parity.py`) — fall back to it with `NANO_MLX=0` if needed.
 
 ## Modal server
 
@@ -53,9 +62,10 @@ modal serve diskrot/modal_serve.py     # dev: hot-reload, ephemeral public URL (
 modal deploy diskrot/modal_serve.py    # persistent public URL
 ```
 On the volume it prefers `/ckpts/v8_sing/best_inference.pt`, falling back to
-`best.pt` then `latest.pt`. Override with `NANO_CKPT=/ckpts/custom.pt` (baked
-into the image at serve/deploy time — local env doesn't reach the container
-otherwise).
+`best.pt` then `latest.pt` — note the baked-in candidates are the **older
+v8_sing dir**, so pass `NANO_CKPT=/ckpts/v8_sing4/best_inference.pt` for the
+canonical model. `NANO_CKPT` is baked into the image at serve/deploy time —
+local env doesn't reach the container otherwise.
 
 Every generation is also persisted to the **nano-output** volume
 (`<UTCstamp>_<mode>_<prompt-slug>_<id>.mp3`; `NANO_OUTPUT_DIR=/outputs`, set
@@ -85,8 +95,10 @@ needed (quantization happens at load).
   ```bash
   NANO_BITS=8 modal serve diskrot/modal_serve.py
   ```
-- **Apple Silicon** (local MLX backend): `NANO_MLX_BITS=8|4` (default 8). Force the
-  PyTorch-MPS path instead with `NANO_MLX=0`.
+- **Apple Silicon**: default is the MLX backend (int8, ~1.9× faster than torch-MPS
+  on v10 DAC and correct as of 2026-08-02). `NANO_MLX_BITS=8|4`,
+  `NANO_MLX_ACT_DTYPE=fp32|bf16` (default fp32 — bf16 activations leave residual
+  hiss). Fall back to torch-MPS with `NANO_MLX=0`.
 
 Both skip the embeddings and the lyric encoder (small + intelligibility-sensitive)
 and quantize the big attention/MLP/head Linears. The startup log prints the active
@@ -94,16 +106,21 @@ weight format (`weights=int8 weight-only (fp16 compute)`).
 
 ## Endpoints
 
-`GET /health`, `POST /generate`, `POST /extend`, `POST /cover`, `POST /infill`.
+`GET /health`, `GET /models` (multi-model serving via `NANO_MODELS`),
+`POST /generate`, `POST /generate_batch` (N takes in one batched decode),
+`POST /generate_stream` (+ `/extend_stream`, `/cover_stream`), `POST /extend`,
+`POST /cover`, `POST /infill`, `POST /stem`, `POST /addstem`,
+`GET /outputs/{name}`.
 `/generate` and `/extend` accept optional `prompt` (tags), `lyrics`, `style_audio`
 (file), and `style_weight`.
 
 **Sampling fields (HTTP form):** `temperature` / `top_k` / `top_p` are **scalars
 only** — passing a list (`[0.9,...]`) returns HTTP 422. For per-codebook control use
 the **separate** `per_cb_temperature` / `per_cb_top_k` / `per_cb_top_p` fields, each
-a **bare comma-separated list of 9** (no brackets), which override the scalar. A
-**decreasing** ladder (coarse codebooks hot, fine DAC-residual codebooks cold)
-usually sounds better than one flat temperature.
+a **bare comma-separated list of K** (no brackets; K = the checkpoint's codebook
+count — 9 on the v8/DAC checkpoints, 24 on v9/SpectroStream), which override the
+scalar. A **decreasing** ladder (coarse codebooks hot, fine residual codebooks
+cold) usually sounds better than one flat temperature.
 
 ```bash
 curl -X POST http://localhost:8000/generate \
@@ -148,7 +165,9 @@ generates a bridge that flows out of the first into the second — the response 
 generated middle with a short crossfade). `prompt` (tags) drives the fill's timbre;
 an optional `melody_audio` hum guides the gap's contour; **lyrics are not used**.
 Same per-cb sampling fields as above. **Requires a FIM-trained checkpoint**
-(`use_fim`, a v8+ model) — otherwise it returns HTTP 400.
+(`use_fim`) — otherwise it returns HTTP 400. **No shipped checkpoint has FIM
+yet**: it was deferred in both v8 and v9 (`use_fim=False` in `DEFAULTS`), so
+`/infill` 400s on every current checkpoint.
 
 ```bash
 curl -X POST http://localhost:8000/infill \
@@ -160,6 +179,20 @@ curl -X POST http://localhost:8000/infill \
   -F per_cb_temperature="0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3" \
   --output filled.mp3
 ```
+
+`/stem` is **pure Demucs source separation — no model involved**: multipart
+`audio=@file.mp3` plus `remove` (default `vocals`) or `keep` stem lists
+(drums/bass/other/vocals), returns the kept stems as a mono mixdown
+(`remove=vocals` → instrumental, `keep=vocals` → a-cappella). Works with **any**
+checkpoint; needs the `demucs` package installed.
+
+`/addstem` is the generative inverse — add a new stem to a finished song:
+multipart `audio=@song.mp3` + `target_stem` (drums/bass/vocals/other) +
+`prompt` (the stem's vibe); `output=mix` (default) returns the song with the
+new stem summed in, `output=stem` the isolated stem; `stem_cfg_scale` pushes
+adherence. **Requires a stem-trained checkpoint** (`use_stem_conditioning`) —
+deferred in both v8 and v9 (`use_stem_conditioning=False` in `DEFAULTS`), so
+like `/infill` it returns HTTP 400 on every current checkpoint.
 
 See the **Inference** section of [README.md](../../../README.md) for the full curl
 set (style blending, extend). For **prompt content** — how to write tags, the full

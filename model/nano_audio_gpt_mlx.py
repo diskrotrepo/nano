@@ -7,11 +7,12 @@ transformer runs here — the DAC codec and CLAP text encoder stay on PyTorch/MP
 and exchange tensors at the boundaries.
 
 `MLXNanoAudioGPT` duck-types the parts of NanoAudioGPT that server/inference.py
-touches: `.cfg`, `.num_params()`, `.param_dtype`, and a `generate(...)` with the
-same signature/return semantics (accepts torch tensors, returns a torch
-LongTensor after revert_delay). The math is kept faithful to the PyTorch source so
-fp32 logits match within tolerance (see tests/test_mlx_parity.py); fp16 and
-quantized weights trade exact parity for speed.
+touches: `.cfg`, `.num_params()`, `.param_dtype`, `_resolve_prompt`,
+`_generate_stream` (streaming + batched gen), and a `generate(...)` with the same
+signature/return semantics (accepts torch tensors, returns a torch LongTensor of
+un-delayed frames). The math is kept faithful to the PyTorch source so fp32 logits
+match within tolerance (see tests/test_mlx_parity.py); fp16 and quantized weights
+trade exact parity for speed.
 
 Import is lazy from the engine: this module (and `mlx`) are only loaded on
 Apple-Silicon macOS.
@@ -25,7 +26,6 @@ import mlx.nn as mnn
 import numpy as np
 import torch
 
-from .delay_pattern import revert_delay
 from .nano_audio_gpt import GPTConfig
 
 NEG_INF = float("-inf")
@@ -51,9 +51,9 @@ class _RMSNorm(mnn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        xf = x.astype(mx.float32)
-        norm = mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
-        return (xf * norm).astype(x.dtype) * self.weight
+        # Fused kernel; accumulates in fp32 internally — the fused equivalent of
+        # the explicit-upcast reduction this used to spell out op by op.
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class _SelfAttention(mnn.Module):
@@ -99,6 +99,11 @@ class _LyricEncLayer(mnn.Module):
         self.ln1 = _RMSNorm(d)
         self.qkv = mnn.Linear(d, 3 * d, bias=False)
         self.proj = mnn.Linear(d, d, bias=False)
+        # Optional QK-norm on the encoder's own attention (GPTConfig.use_lyric_qk_norm,
+        # default off but ON in the trained v8 checkpoint). RMSNorm over head_dim.
+        head_dim = d // cfg.lyric_enc_heads
+        self.q_norm = _RMSNorm(head_dim) if cfg.use_lyric_qk_norm else None
+        self.k_norm = _RMSNorm(head_dim) if cfg.use_lyric_qk_norm else None
         self.ln2 = _RMSNorm(d)
         self.fc1 = mnn.Linear(d, cfg.lyric_enc_d_ff, bias=False)
         self.fc2 = mnn.Linear(cfg.lyric_enc_d_ff, d, bias=False)
@@ -106,8 +111,8 @@ class _LyricEncLayer(mnn.Module):
 
 class _LyricEncoder(mnn.Module):
     """MLX mirror of model.lyric_encoder.LyricEncoder (params only; the
-    sinusoidal positional table is non-persistent and recomputed on the parent,
-    like the RoPE cos/sin tables)."""
+    sinusoidal positional table is non-persistent and recomputed on the
+    parent)."""
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -169,20 +174,27 @@ class _LayerCache:
         self.pos = 0
 
 
-def _rotate_half(x: mx.array) -> mx.array:
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return mx.concatenate([-x2, x1], axis=-1)
+class _CrossKV:
+    """Cached projected (+ k-normed) K/V for one cross-attention over a FIXED
+    conditioning sequence. Mirrors the torch CrossKVCache: `cond` never changes
+    across decode steps, so kv_proj(cond) runs once at prefill and is reused —
+    it was the dominant per-token cost with a long lyric stream."""
+
+    __slots__ = ("k", "v")
+
+    def __init__(self):
+        self.k: mx.array | None = None
+        self.v: mx.array | None = None
 
 
-def _apply_rotary(q: mx.array, k: mx.array, cos: mx.array, sin: mx.array):
-    # q/k: [B, H, T, D]; cos/sin: [T, D]
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
-    q_rot = (q * cos) + (_rotate_half(q) * sin)
-    k_rot = (k * cos) + (_rotate_half(k) * sin)
-    return q_rot, k_rot
+class _BlockCrossKV:
+    """The two cross-attention caches for one decoder block (tag + lyric)."""
+
+    __slots__ = ("text", "lyric")
+
+    def __init__(self):
+        self.text = _CrossKV()
+        self.lyric = _CrossKV()
 
 
 class MLXNanoAudioGPT(mnn.Module):
@@ -195,11 +207,18 @@ class MLXNanoAudioGPT(mnn.Module):
         dtype: mx.Dtype = mx.float16,
         bits: int | None = None,
         group_size: int = 64,
+        fp32_head: bool = True,
     ):
         super().__init__()
         self.cfg = cfg
         self.param_dtype = dtype
         self._dtype = dtype
+        # Keep the output head in fp32 (weight + matmul) regardless of the decoder
+        # dtype/quant. The head projects straight into the sampling logits with no
+        # downstream renorm, so bf16/int8 error there perturbs the sampled tokens
+        # and the DAC rollout compounds it into noise (measured on the v10 DAC
+        # shape: quantizing the head cost ~4% argmax agreement vs torch fp32).
+        self._fp32_head = fp32_head
         K = cfg.n_codebooks
         self.n_codebooks = K
         self.head_dim = cfg.d_model // cfg.n_heads
@@ -221,13 +240,10 @@ class MLXNanoAudioGPT(mnn.Module):
         # reshape+transpose recovers [B, K, T, V]).
         self.head = mnn.Linear(cfg.d_model, K * cfg.vocab_with_pad, bias=False)
 
-        # RoPE tables (non-persistent in torch — recomputed here, not loaded).
-        inv_freq = 1.0 / (cfg.rope_base ** (np.arange(0, self.head_dim, 2) / self.head_dim))
-        t = np.arange(cfg.max_seq_len)
-        freqs = np.outer(t, inv_freq)  # [max_seq_len, head_dim/2]
-        emb = np.concatenate([freqs, freqs], axis=-1)  # [max_seq_len, head_dim]
-        self._cos = mx.array(np.cos(emb)).astype(dtype)
-        self._sin = mx.array(np.sin(emb)).astype(dtype)
+        # RoPE via the fused mx.fast.rope kernel (non-traditional = the same
+        # split-half rotation as torch's rotate_half with concatenated freqs);
+        # angles are computed in the kernel, so no cos/sin tables are stored.
+        self._rope_base = float(cfg.rope_base)
 
         # Lyric sinusoidal positional table (non-persistent in torch — recomputed,
         # stored as an underscore attr so it stays out of the loaded param tree).
@@ -249,9 +265,54 @@ class MLXNanoAudioGPT(mnn.Module):
         else:
             self._bits = 16
 
+        # Force the head to fp32 (weight kept full-precision; the forward casts its
+        # input to fp32 too). Done after quant so the predicate has already left it
+        # unquantized.
+        if self._fp32_head:
+            self.head.weight = self.head.weight.astype(mx.float32)
+
         mx.eval(self.parameters())
+        self._prime_kernels()
 
     # ---- construction helpers -------------------------------------------------
+
+    def _prime_kernels(self) -> None:
+        """Run one tiny generation NOW, on the construction (main) thread, so every
+        MLX GPU op is initialized here before the first request.
+
+        MLX lazily initializes each *distinct* GPU operation the first time it
+        runs, and that first init must happen on the thread that owns the default
+        GPU stream (the main / construction thread). The server drives generation
+        from ephemeral per-request producer threads (see server/inference.py
+        `_stream_mp3`), so any op that was *not* already initialized on the main
+        thread raises ``RuntimeError: There is no Stream(gpu, 0) in current
+        thread`` the first time a worker thread hits it. The decoder path is
+        covered by the server's warmup gen, but the lyric/melody encoders are not
+        (warmup passes no lyrics/melody) — so a lyrics or /cover request was the
+        first place those kernels ran, on a worker thread, and crashed. Exercising
+        every conditioning path here (decoder + 3-stage CFG combine + lyric encoder
+        + melody encoder + the sampling kernels) primes them all. Init is
+        shape-agnostic, so a tiny fixed-shape pass covers real requests of any
+        length. Best-effort: a hiccup here only forfeits priming, it must never
+        brick model construction."""
+        try:
+            cfg = self.cfg
+            frames = max(cfg.n_codebooks + 2, 32)  # run the decode loop + one emit
+            text = torch.zeros(1, 1, cfg.d_model)
+            kw: dict = dict(
+                num_new_frames=frames, temperature=0.9, top_k=5, top_p=0.95,
+                text_emb=text, text_emb_neg=text, cfg_scale=2.0,
+            )
+            if self.has_lyric:
+                ids = torch.ones(1, 4, dtype=torch.long)
+                msk = torch.ones(1, 4, dtype=torch.bool)
+                kw.update(lyric_ids=ids, lyric_mask=msk, lyric_ids_neg=ids,
+                          lyric_mask_neg=msk, lyric_cfg_scale=2.0)
+            if self.has_melody:
+                kw.update(melody=torch.zeros(1, frames, 12), melody_cfg_scale=2.0)
+            self.generate(prompt=None, **kw)
+        except Exception as e:  # noqa: BLE001 — priming is best-effort
+            print(f"[mlx] kernel prime skipped: {type(e).__name__}: {e}", flush=True)
 
     def _load_torch_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         weights: list[tuple[str, mx.array]] = []
@@ -286,6 +347,11 @@ class MLXNanoAudioGPT(mnn.Module):
             # Keep the melody encoder full-precision too (small + sensitive).
             if path.startswith("melody_encoder"):
                 return False
+            # Keep the output head full-precision — it sets the sampling logits
+            # directly (no downstream renorm), so quantizing it is what tips the
+            # DAC rollout into noise. See self._fp32_head.
+            if self._fp32_head and path == "head":
+                return False
             # group quant needs in_features divisible by group_size
             if module.weight.shape[-1] % group_size != 0:
                 return False
@@ -307,7 +373,7 @@ class MLXNanoAudioGPT(mnn.Module):
             x = x + self.tok_embeds[k](tokens[:, k])
         return x
 
-    def _self_attn(self, attn: _SelfAttention, x: mx.array, cos, sin, cache: _LayerCache | None):
+    def _self_attn(self, attn: _SelfAttention, x: mx.array, start_pos: int, cache: _LayerCache | None):
         B, T, D = x.shape
         qkv = attn.qkv(x)
         q, k, v = mx.split(qkv, 3, axis=-1)
@@ -318,7 +384,10 @@ class MLXNanoAudioGPT(mnn.Module):
         if attn.q_norm is not None:
             q = attn.q_norm(q)
             k = attn.k_norm(k)
-        q, k = _apply_rotary(q, k, cos, sin)
+        q = mx.fast.rope(q, attn.head_dim, traditional=False,
+                         base=self._rope_base, scale=1.0, offset=start_pos)
+        k = mx.fast.rope(k, attn.head_dim, traditional=False,
+                         base=self._rope_base, scale=1.0, offset=start_pos)
 
         if cache is not None:
             old_pos = cache.pos
@@ -337,18 +406,27 @@ class MLXNanoAudioGPT(mnn.Module):
         return attn.proj(y)
 
     def _cross_attn(
-        self, ca: _CrossAttention, x: mx.array, cond: mx.array, mask: mx.array | None = None,
+        self, ca: _CrossAttention, x: mx.array, cond: mx.array,
+        mask: mx.array | None = None, cache: _CrossKV | None = None,
     ) -> mx.array:
         B, T, D = x.shape
-        T_c = cond.shape[1]
         q = ca.q_proj(x).reshape(B, T, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
-        kv = ca.kv_proj(cond)
-        k, v = mx.split(kv, 2, axis=-1)
-        k = k.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
         if ca.q_norm is not None:
             q = ca.q_norm(q)
-            k = ca.k_norm(k)
+        if cache is not None and cache.k is not None:
+            k, v = cache.k, cache.v
+        else:
+            T_c = cond.shape[1]
+            kv = ca.kv_proj(cond)
+            k, v = mx.split(kv, 2, axis=-1)
+            k = k.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, T_c, ca.n_heads, ca.head_dim).transpose(0, 2, 1, 3)
+            # k_norm is position-independent, so caching the post-norm K is exactly
+            # the value a recompute would produce (mirrors the torch cache).
+            if ca.k_norm is not None:
+                k = ca.k_norm(k)
+            if cache is not None:
+                cache.k, cache.v = k, v
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=ca.scale, mask=mask)
         y = y.transpose(0, 2, 1, 3).reshape(B, T, D)
         return ca.out_proj(y)
@@ -368,6 +446,9 @@ class MLXNanoAudioGPT(mnn.Module):
             q = q.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
             k = k.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
             v = v.reshape(B, L, nh, hd).transpose(0, 2, 1, 3)
+            if layer.q_norm is not None:
+                q = layer.q_norm(q)
+                k = layer.k_norm(k)
             y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self._lyric_scale, mask=add)
             y = y.transpose(0, 2, 1, 3).reshape(B, L, D)
             x = x + layer.proj(y)
@@ -407,9 +488,11 @@ class MLXNanoAudioGPT(mnn.Module):
         caches: list[_LayerCache] | None = None,
         start_pos: int = 0,
         text_emb: mx.array | None = None,
+        text_kv_mask: mx.array | None = None,
         lyric_emb: mx.array | None = None,
         lyric_kv_mask: mx.array | None = None,
         melody_emb: mx.array | None = None,
+        cross_caches: list[_BlockCrossKV] | None = None,
     ) -> mx.array:
         """tokens: [B, K, T] int32. Returns logits [B, K, T, V]."""
         B, K, T = tokens.shape
@@ -420,23 +503,29 @@ class MLXNanoAudioGPT(mnn.Module):
                 x = x + melody_emb[:, start_pos:start_pos + T, :]
             else:
                 x = x + self.melody_encoder.null  # learned null (dropped/uncond)
-        cos = self._cos[start_pos:start_pos + T]
-        sin = self._sin[start_pos:start_pos + T]
 
         for i, block in enumerate(self.blocks):
             cache = caches[i] if caches is not None else None
-            x = x + self._self_attn(block.attn, block.ln1(x), cos, sin, cache)
+            ckv = cross_caches[i] if cross_caches is not None else None
+            x = x + self._self_attn(block.attn, block.ln1(x), start_pos, cache)
             if block.has_cross_attn and text_emb is not None:
-                x = x + self._cross_attn(block.cross_attn, block.ln_cross(x), text_emb)
+                x = x + self._cross_attn(
+                    block.cross_attn, block.ln_cross(x), text_emb, mask=text_kv_mask,
+                    cache=ckv.text if ckv is not None else None,
+                )
             if block.has_lyric_attn and lyric_emb is not None:
                 x = x + self._cross_attn(
-                    block.lyric_attn, block.ln_lyric(x), lyric_emb, mask=lyric_kv_mask
+                    block.lyric_attn, block.ln_lyric(x), lyric_emb, mask=lyric_kv_mask,
+                    cache=ckv.lyric if ckv is not None else None,
                 )
             x = x + block.mlp.fc2(mnn.gelu(block.mlp.fc1(block.ln2(x))))
 
         x = self.ln_final(x)
+        # Head in fp32 (weight is fp32 when _fp32_head) so the logits that feed
+        # sampling are computed at full precision, not bf16.
+        hx = x.astype(mx.float32) if self._fp32_head else x
         logits = (
-            self.head(x)
+            self.head(hx)
             .reshape(B, T, self.n_codebooks, -1)
             .transpose(0, 2, 1, 3)  # [B, K, T, V]
         )
@@ -446,13 +535,14 @@ class MLXNanoAudioGPT(mnn.Module):
         self,
         tokens: mx.array,
         text_emb: mx.array | None = None,
+        text_kv_mask: mx.array | None = None,
         lyric_emb: mx.array | None = None,
         lyric_kv_mask: mx.array | None = None,
         melody_emb: mx.array | None = None,
     ) -> mx.array:
         """Full causal forward with no KV cache — used by parity tests."""
         return self(
-            tokens, caches=None, start_pos=0, text_emb=text_emb,
+            tokens, caches=None, start_pos=0, text_emb=text_emb, text_kv_mask=text_kv_mask,
             lyric_emb=lyric_emb, lyric_kv_mask=lyric_kv_mask, melody_emb=melody_emb,
         )
 
@@ -464,38 +554,87 @@ class MLXNanoAudioGPT(mnn.Module):
 
     # ---- sampling -------------------------------------------------------------
 
-    def _sample_codebook(self, logits: mx.array, temp, top_k, top_p) -> mx.array:
-        """logits: [B, V] -> [B] sampled token ids (int32)."""
-        if temp == 0:
-            return mx.argmax(logits, axis=-1).astype(mx.int32)
-        logits = logits / temp
+    def _sample_codebooks(self, logits: mx.array, temps, top_ks, top_ps) -> mx.array:
+        """logits: [B, Kv, V] for a contiguous run of codebooks -> [B, Kv] sampled
+        ids (int32). temps/top_ks/top_ps are the matching length-Kv slices of the
+        per-codebook sampling params.
 
-        if top_p is not None and 0.0 < top_p < 1.0:
-            order = mx.argsort(-logits, axis=-1)  # descending
-            sorted_logits = mx.take_along_axis(logits, order, axis=-1)
-            probs = mx.softmax(sorted_logits, axis=-1)
-            cum = mx.cumsum(probs, axis=-1)
-            cutoff = cum > top_p
-            # keep the first token that crosses the threshold (shift right by 1)
-            shifted = mx.concatenate(
-                [mx.zeros_like(cutoff[..., :1]), cutoff[..., :-1]], axis=-1
-            )
-            sorted_logits = mx.where(shifted, NEG_INF, sorted_logits)
-            inv = mx.argsort(order, axis=-1)  # permutation back to original order
-            logits = mx.take_along_axis(sorted_logits, inv, axis=-1)
+        One batched kernel sequence instead of a Python loop over codebooks —
+        at v9's K=24 the old per-codebook loop was ~150 tiny kernel launches per
+        decode step. Filtering semantics are identical per row: temp==0 -> argmax
+        of the raw logits; else temp-scale, nucleus (top_p) filter, then top_k
+        threshold on the filtered logits. Rows without a top_p/top_k pass through
+        (p=2.0 never crosses; k=V keeps everything)."""
+        B, Kv, V = logits.shape
+        greedy = mx.argmax(logits, axis=-1).astype(mx.int32)
+        if all(t == 0 for t in temps):
+            return greedy
 
-        if top_k is not None:
-            kth = mx.sort(logits, axis=-1)[..., -top_k]  # kth largest threshold
-            logits = mx.where(logits < kth[..., None], NEG_INF, logits)
+        safe_t = mx.array([float(t) if t else 1.0 for t in temps]).astype(logits.dtype)
+        x = logits / safe_t[None, :, None]
 
-        return mx.random.categorical(logits, axis=-1).astype(mx.int32)
+        # Sort descending once; both filters work in the sorted domain, then one
+        # inverse permutation restores original order.
+        order = mx.argsort(-x, axis=-1)
+        xs = mx.take_along_axis(x, order, axis=-1)
+
+        # top_p (nucleus): keep the first token that crosses the threshold
+        # (shift right by 1). cum > p is monotone, so the masked set is a suffix
+        # and xs stays descending-sorted afterwards.
+        p_arr = mx.array(
+            [p if (p is not None and 0.0 < p < 1.0) else 2.0 for p in top_ps]
+        ).astype(x.dtype)
+        probs = mx.softmax(xs, axis=-1)
+        cum = mx.cumsum(probs, axis=-1)
+        cutoff = cum > p_arr[None, :, None]
+        shifted = mx.concatenate(
+            [mx.zeros_like(cutoff[..., :1]), cutoff[..., :-1]], axis=-1
+        )
+        xs = mx.where(shifted, NEG_INF, xs)
+
+        # top_k: threshold = kth largest of the (top_p-filtered) row — index k-1
+        # in the descending sort. Same value-comparison (ties kept) as the old
+        # mx.sort(...)[..., -top_k] form.
+        k_idx = mx.array(
+            [min(int(k), V) - 1 if k is not None else V - 1 for k in top_ks],
+            dtype=mx.int32,
+        ).reshape(1, Kv, 1)
+        kth = mx.take_along_axis(xs, mx.broadcast_to(k_idx, (B, Kv, 1)), axis=-1)
+        xs = mx.where(xs < kth, NEG_INF, xs)
+
+        inv = mx.argsort(order, axis=-1)  # permutation back to original order
+        x = mx.take_along_axis(xs, inv, axis=-1)
+        sampled = mx.random.categorical(x, axis=-1).astype(mx.int32)
+        if any(t == 0 for t in temps):
+            tz = mx.array([t == 0 for t in temps])
+            sampled = mx.where(tz[None, :], greedy, sampled)
+        return sampled
 
     # ---- generate -------------------------------------------------------------
 
+    def _resolve_prompt(
+        self, prompt: torch.Tensor | None, batch_size: int = 1
+    ) -> tuple[torch.Tensor, bool]:
+        """torch-tensor counterpart of NanoAudioGPT._resolve_prompt — the server
+        calls this and feeds the result back into generate / _generate_stream
+        (which convert torch->mx internally). prompt=None -> a random DAC seed
+        column ([K,1], or [batch_size,K,1] when batched, each row an independent
+        from-scratch clip). A 2D [K,T] prompt unsqueezes to [1,K,T]."""
+        if prompt is None:
+            shape = (
+                (self.n_codebooks, 1) if batch_size == 1
+                else (batch_size, self.n_codebooks, 1)
+            )
+            prompt = torch.randint(0, self.cfg.vocab_per_codebook, shape)
+        squeeze_batch = prompt.dim() == 2
+        if squeeze_batch:
+            prompt = prompt.unsqueeze(0)
+        return prompt, squeeze_batch
+
     @torch.no_grad()
-    def generate(
+    def _generate_stream(
         self,
-        prompt: torch.Tensor | None,
+        prompt: torch.Tensor,
         num_new_frames: int,
         temperature: float | Sequence[float] = 1.0,
         top_k: int | None | Sequence[int | None] = 250,
@@ -503,6 +642,8 @@ class MLXNanoAudioGPT(mnn.Module):
         text_emb: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         text_emb_neg: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
+        text_kv_mask_neg: torch.Tensor | None = None,
         lyric_ids: torch.Tensor | None = None,
         lyric_mask: torch.Tensor | None = None,
         lyric_ids_neg: torch.Tensor | None = None,
@@ -510,27 +651,49 @@ class MLXNanoAudioGPT(mnn.Module):
         lyric_cfg_scale: float | None = None,
         melody: torch.Tensor | None = None,
         melody_cfg_scale: float | None = None,
-    ) -> torch.Tensor:
-        """Drop-in for NanoAudioGPT.generate. Accepts/returns torch tensors."""
+        emit_every: int = 256,
+        first_emit: int | None = None,
+    ):
+        """Shared decode loop behind generate(); yields the NEW frames as
+        un-delayed [B,K,n] torch LongTensor chunks (the cadence the server's
+        streaming path consumes). `prompt` must be a resolved [B,K,T] torch tensor
+        (see _resolve_prompt). generate() collects these chunks, so streamed and
+        one-shot tokens are identical by construction — the MLX analog of the torch
+        _generate_stream streaming contract."""
         cfg = self.cfg
         K = cfg.n_codebooks
         pad = cfg.pad_id
+        if first_emit is None:
+            first_emit = emit_every
 
-        if prompt is None:
-            seed = np.random.randint(0, cfg.vocab_per_codebook, size=(K, 1))
-            prompt_m = mx.array(seed.astype(np.int32))[None]  # [1, K, 1]
-            squeeze_batch = True
-        else:
-            squeeze_batch = prompt.dim() == 2
-            p = prompt.unsqueeze(0) if squeeze_batch else prompt
-            prompt_m = mx.array(p.detach().to(torch.int64).cpu().numpy().astype(np.int32))
-
+        prompt_m = mx.array(prompt.detach().to(torch.int64).cpu().numpy().astype(np.int32))
         B, _, T_prompt = prompt_m.shape
 
         def _per_cb(val, kind):
             if val is None or isinstance(val, (int, float)):
                 return [val] * K
             val = list(val)
+            if len(val) == 1:
+                return val * K
+            if len(val) != K:
+                # Mirror the torch _per_cb: resample a foreign-K ladder by
+                # linear interpolation instead of rejecting (see
+                # nano_audio_gpt._generate_stream).
+                L = len(val)
+                if any(v is None for v in val):
+                    val = [val[round(j * (L - 1) / max(K - 1, 1))] for j in range(K)]
+                else:
+                    is_int = all(isinstance(v, int) for v in val)
+                    fit = []
+                    for j in range(K):
+                        pos = j * (L - 1) / max(K - 1, 1)
+                        lo = int(pos)
+                        hi = min(lo + 1, L - 1)
+                        frac = pos - lo
+                        x = val[lo] * (1 - frac) + val[hi] * frac
+                        fit.append(max(1, round(x)) if is_int else x)
+                    val = fit
+                print(f"[generate-mlx] {kind} ladder length {L} != K={K} — resampled")
             assert len(val) == K, f"{kind} must be scalar or length {K}, got {len(val)}"
             return val
 
@@ -550,6 +713,19 @@ class MLXNanoAudioGPT(mnn.Module):
 
         cond = None if text_emb is None else _t2m(text_emb, self._dtype)
         neg = None if text_emb_neg is None else _t2m(text_emb_neg, self._dtype)
+
+        def _mask_t2m(m):
+            # Convert an incoming torch additive cross-attn mask to mx, replacing
+            # any -inf with the finite NEG_INF the mlx SDPA wants (an all-masked
+            # flash block with -inf NaNs; cf. the lyric mask). For B=1 inference
+            # the incoming tag mask is all-zeros (no padding), so this is a no-op.
+            if m is None:
+                return None
+            a = _t2m(m, self._dtype)
+            return mx.where(mx.isinf(a), mx.array(NEG_INF, dtype=a.dtype), a)
+
+        tkv_pos = _mask_t2m(text_kv_mask)
+        tkv_neg = _mask_t2m(text_kv_mask_neg)
 
         def _ids_to_mx(ids):
             return mx.array(ids.detach().to(torch.int64).cpu().numpy().astype(np.int32))
@@ -591,12 +767,14 @@ class MLXNanoAudioGPT(mnn.Module):
         # torch generate): logits = stages[0] + Σ scales[i]*(stages[i+1]-stages[i]).
         # Nesting order tags → lyrics → melody; axes without their own scale fold
         # into the cfg (tags) step.
-        full = {"text": cond, "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
+        full = {"text": cond, "tkv": tkv_pos,
+                "lemb": lyric_pos, "lkv": lyric_kv_pos, "mel": mel_pos}
         if not use_cfg:
             stages = [full]
             scales: list[float] = []
         else:
-            off = {"text": neg, "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
+            off = {"text": neg, "tkv": tkv_neg,
+                   "lemb": lyric_neg, "lkv": lyric_kv_neg, "mel": mel_neg}
             tags_on = dict(full)
             if composed_lyric:
                 tags_on["lemb"], tags_on["lkv"] = lyric_neg, lyric_kv_neg
@@ -614,33 +792,58 @@ class MLXNanoAudioGPT(mnn.Module):
                 mel_on["mel"] = mel_pos
                 stages.append(mel_on)
                 scales.append(melody_cfg_scale)
-        for s in stages:
-            s["caches"] = self._new_caches(B, T_delay)
+        # CFG guidance stages, run UNBATCHED — one B-row forward per stage. The
+        # batched S*B forward (stacking stages along the batch dim) is NOT
+        # logit-identical on the v10 DAC shape: the guided logits come out wrong
+        # and the rollout collapses to noise (cfg=1 / single-stage stayed clean;
+        # only cfg>1 broke). Per-stage costs len(stages) forwards/step, but the
+        # int8 decode is still ~2x faster than torch-MPS here and it is CORRECT.
+        S = len(stages)
+
+        # Run each guidance stage as its OWN B-row forward (see note above), each
+        # with its own self/cross caches, then combine the per-stage logits. One
+        # cross-attn K/V cache per block per stage: the conditioning is FIXED for
+        # the whole decode, so kv_proj(cond) runs once at prefill, not per step.
+        caches_s = [self._new_caches(B, T_delay) for _ in range(S)]
+        cross_s = [
+            [_BlockCrossKV() for _ in range(cfg.n_layers)] for _ in range(S)
+        ]
 
         def _run(inp, start):
-            for s in stages:
-                s["logits"] = self(
-                    inp, caches=s["caches"], start_pos=start,
-                    text_emb=s["text"], lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"],
-                    melody_emb=s["mel"],
+            return [
+                self(
+                    inp, caches=caches_s[i], start_pos=start,
+                    text_emb=s["text"], text_kv_mask=s["tkv"],
+                    lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"], melody_emb=s["mel"],
+                    cross_caches=cross_s[i],
                 )
+                for i, s in enumerate(stages)
+            ]
 
-        def _combine():
-            out = stages[0]["logits"]
+        def _combine(parts):
+            if S == 1:
+                return parts[0]
+            out = parts[0]
             for i, sc in enumerate(scales):
-                out = out + sc * (stages[i + 1]["logits"] - stages[i]["logits"])
+                out = out + sc * (parts[i + 1] - parts[i])
             return out
 
-        prefill_len = max(1, T_prompt)
-        _run(tokens[:, :, :prefill_len], 0)
-        logits = _combine()
-        mx.eval(logits, [c.k for c in stages[0]["caches"]])
+        def _emit(s, e):
+            # Un-delay new frames [s, e): cb k of frame f sits at delayed pos f+k.
+            chunk = mx.stack([tokens[:, k, s + k:e + k] for k in range(K)], axis=1)
+            mx.eval(chunk)
+            return torch.from_numpy(np.array(chunk, copy=False)).to(torch.long)
 
+        prefill_len = max(1, T_prompt)
+        logits = _combine(_run(tokens[:, :, :prefill_len], 0))
+        mx.eval(logits, [c.k for cs in caches_s for c in cs])
+
+        emitted = 0  # count of new frames already yielded
+        threshold = first_emit
         for pos in range(prefill_len, T_delay):
             if pos > prefill_len:
                 inp = tokens[:, :, pos - 1:pos]
-                _run(inp, pos - 1)
-                logits = _combine()
+                logits = _combine(_run(inp, pos - 1))
 
             step = logits[:, :, -1, :]  # [B, K, V]
             # Mask all control ids (pad, plus FIM <SUF>/<MID> when use_fim) so the
@@ -648,13 +851,72 @@ class MLXNanoAudioGPT(mnn.Module):
             # torch path's `step_logits[..., vocab_per_codebook:] = -inf`.
             step[:, :, cfg.vocab_per_codebook:] = NEG_INF
 
-            for k in range(K):
-                if k + T_prompt <= pos < k + T_total:
-                    tok = self._sample_codebook(step[:, k, :], temps[k], top_ks[k], top_ps[k])
-                    tokens[:, k, pos] = tok
-            mx.eval(tokens[:, :, pos])
+            # The delay pattern makes the codebooks live at this pos a CONTIGUOUS
+            # range (cb k samples while k + T_prompt <= pos < k + T_total), so all
+            # of them sample in one batched call + one scatter write.
+            k0 = max(0, pos - T_total + 1)
+            k1 = min(K, pos - T_prompt + 1)
+            if k1 > k0:
+                toks = self._sample_codebooks(
+                    step[:, k0:k1, :], temps[k0:k1], top_ks[k0:k1], top_ps[k0:k1]
+                )
+                tokens[:, k0:k1, pos] = toks
+            # Dispatch without blocking so the GPU works through this step while
+            # Python builds the next step's graph; hard-sync every 8 steps to
+            # bound the in-flight queue. (A per-step mx.eval serialized the two.)
+            if (pos - prefill_len) % 8 == 7:
+                mx.eval(tokens)
+            else:
+                mx.async_eval(tokens)
 
-        mx.eval(tokens)
-        delayed = torch.from_numpy(np.array(tokens, copy=False)).to(torch.long)
-        out = revert_delay(delayed, T_total)
+            # Emit any new frames now fully known: frame f completes at pos=f+K-1.
+            n_complete = min(pos - (K - 1), T_total - 1) - T_prompt + 1
+            if n_complete - emitted >= threshold:
+                yield _emit(T_prompt + emitted, T_prompt + n_complete)
+                emitted = n_complete
+                threshold = emit_every
+        if emitted < num_new_frames:
+            yield _emit(T_prompt + emitted, T_total)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: torch.Tensor | None,
+        num_new_frames: int,
+        temperature: float | Sequence[float] = 1.0,
+        top_k: int | None | Sequence[int | None] = 250,
+        top_p: float | None | Sequence[float | None] = None,
+        text_emb: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
+        text_emb_neg: torch.Tensor | None = None,
+        text_kv_mask: torch.Tensor | None = None,
+        text_kv_mask_neg: torch.Tensor | None = None,
+        lyric_ids: torch.Tensor | None = None,
+        lyric_mask: torch.Tensor | None = None,
+        lyric_ids_neg: torch.Tensor | None = None,
+        lyric_mask_neg: torch.Tensor | None = None,
+        lyric_cfg_scale: float | None = None,
+        melody: torch.Tensor | None = None,
+        melody_cfg_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Drop-in for NanoAudioGPT.generate. Accepts/returns torch tensors.
+
+        Thin collector over _generate_stream (mirrors the torch generate), so the
+        streamed and one-shot token sequences are identical by construction."""
+        prompt, squeeze_batch = self._resolve_prompt(prompt)
+        chunks = list(self._generate_stream(
+            prompt, num_new_frames,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            text_emb=text_emb, cfg_scale=cfg_scale, text_emb_neg=text_emb_neg,
+            text_kv_mask=text_kv_mask, text_kv_mask_neg=text_kv_mask_neg,
+            lyric_ids=lyric_ids, lyric_mask=lyric_mask,
+            lyric_ids_neg=lyric_ids_neg, lyric_mask_neg=lyric_mask_neg,
+            lyric_cfg_scale=lyric_cfg_scale,
+            melody=melody, melody_cfg_scale=melody_cfg_scale,
+        ))
+        new = (
+            torch.cat(chunks, dim=-1) if chunks
+            else prompt.new_zeros((prompt.shape[0], prompt.shape[1], 0))
+        )
+        out = torch.cat([prompt, new], dim=-1)
         return out.squeeze(0) if squeeze_batch else out

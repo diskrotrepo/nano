@@ -26,6 +26,7 @@ class FakeCodec:
     SAMPLE_RATE = 44100
     FRAME_RATE_HZ = 86
     N_CODEBOOKS = 9
+    N_CHANNELS = 1
 
     def __init__(self, frames_override: list[int] | None = None, raise_on_encode: bool = False):
         # frames_override: explicit T per file in call order (used to force
@@ -60,6 +61,15 @@ class FakeCodec:
         return out
 
 
+class FakeSSCodec(FakeCodec):
+    """SpectroStream-shaped stand-in: stereo, >=48 kHz. ``_max_encode_samples``
+    routes these through the (binding) SS int32-overflow ceiling, so the
+    pre-encode length guard fires for them."""
+    SAMPLE_RATE = 48000
+    FRAME_RATE_HZ = 25
+    N_CHANNELS = 2
+
+
 def _make_audio_files(tmp_path: Path, n: int, samples_each: int = 2048) -> list[Path]:
     """Drop ``n`` placeholder audio files in tmp_path. The real librosa-loaded
     audio is replaced by the monkeypatched ``_load_audio``, so the file content
@@ -75,15 +85,15 @@ def _make_audio_files(tmp_path: Path, n: int, samples_each: int = 2048) -> list[
 @pytest.fixture
 def patched_load_audio(monkeypatch):
     """Bypass librosa: return a deterministic mono tensor for any path."""
-    def _fake_load(mp3_path, sample_rate):
-        return torch.zeros((1, 2048), dtype=torch.float32)
+    def _fake_load(mp3_path, sample_rate, n_channels=1, normalize=True):
+        return torch.zeros((n_channels, 2048), dtype=torch.float32)
     monkeypatch.setattr(tokmod, "_load_audio", _fake_load)
     return _fake_load
 
 
 # ----- tokenize_one_file -----
 
-def test_one_file_done(tmp_path):
+def test_one_file_done(tmp_path, patched_load_audio):
     codec = FakeCodec()
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -94,7 +104,7 @@ def test_one_file_done(tmp_path):
     assert out.exists()
 
 
-def test_one_file_skipped_existing(tmp_path):
+def test_one_file_skipped_existing(tmp_path, patched_load_audio):
     codec = FakeCodec()
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -104,7 +114,7 @@ def test_one_file_skipped_existing(tmp_path):
     assert result.status == "skipped_existing"
 
 
-def test_one_file_short_not_persisted(tmp_path):
+def test_one_file_short_not_persisted(tmp_path, patched_load_audio):
     codec = FakeCodec(frames_override=[50])
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -115,7 +125,7 @@ def test_one_file_short_not_persisted(tmp_path):
     assert not out.exists()
 
 
-def test_one_file_codec_failure(tmp_path):
+def test_one_file_codec_failure(tmp_path, patched_load_audio):
     codec = FakeCodec(raise_on_encode=True)
     mp3 = tmp_path / "a.mp3"
     mp3.write_bytes(b"\x00")
@@ -192,6 +202,88 @@ def test_streaming_short_outputs_skipped_short(tmp_path, patched_load_audio):
     assert not items[2][1].exists()
 
 
+# ----- length-skip guard (SpectroStream int32-overflow pre-encode skip) -----
+
+def test_one_file_too_long_skipped_short(tmp_path, monkeypatch):
+    """A file whose post-resample length exceeds the SS codec's
+    ``_max_encode_samples`` ceiling is reported 'skipped_short' (NOT 'failed')
+    and writes NO .pt — the pre-encode guard that prevents the uncatchable
+    SpectroStream abort()."""
+    # Shrink the SS ceiling to 1s (48000 samples) so the fake waveform stays
+    # tiny; the module global is read at call time by _max_encode_samples.
+    monkeypatch.setattr(tokmod, "_MAX_ENCODE_SECONDS_SS", 1.0)
+
+    def _fake_long_load(mp3_path, sample_rate, n_channels=1, normalize=True):
+        # 2s of stereo at 48 kHz -> 96000 samples > 48000 cap.
+        return torch.zeros((n_channels, 2 * 48000), dtype=torch.float32)
+    monkeypatch.setattr(tokmod, "_load_audio", _fake_long_load)
+
+    codec = FakeSSCodec()
+    mp3 = tmp_path / "long.mp3"
+    mp3.write_bytes(b"\x00")
+    out = tmp_path / "long.pt"
+    result = tokenize_one_file(codec, mp3, out, min_frames=1)
+    assert result.status == "skipped_short"
+    assert "too_long" in (result.error or "")
+    assert not out.exists()
+
+
+def test_streaming_too_long_skipped_short(tmp_path, monkeypatch):
+    """Streaming path: an over-length file is skipped pre-encode (status
+    'skipped_short', no .pt, not counted as a failure), while a normal file in
+    the same chunk still encodes — so the guard never poisons the worker."""
+    monkeypatch.setattr(tokmod, "_MAX_ENCODE_SECONDS_SS", 1.0)
+
+    long_name = "song_001.mp3"
+
+    def _selective_load(mp3_path, sample_rate, n_channels=1, normalize=True):
+        if mp3_path.name == long_name:
+            return torch.zeros((n_channels, 2 * 48000), dtype=torch.float32)  # too long
+        return torch.zeros((n_channels, 2048), dtype=torch.float32)
+    monkeypatch.setattr(tokmod, "_load_audio", _selective_load)
+
+    codec = FakeSSCodec()
+    mp3s = _make_audio_files(tmp_path, 3)
+    items = [(p, tmp_path / (p.stem + ".pt")) for p in mp3s]
+    results = list(tokenize_files_streaming(codec, items, min_frames=1, batch_size=3))
+    statuses = [r.status for r in results]
+    assert statuses == ["done", "skipped_short", "done"]
+    assert "too_long" in (results[1].error or "")
+    # The over-length one wrote no .pt; the others did.
+    assert items[0][1].exists()
+    assert not items[1][1].exists()
+    assert items[2][1].exists()
+    # Only the two in-bounds files reached encode_batch.
+    assert codec.encode_batch_calls == 1
+    assert codec.last_batch_size == 2
+
+
+def test_max_encode_samples_thresholds():
+    """Pin the production length caps + the SS-vs-DAC classifier so a future edit
+    to the constants or the is_ss predicate is caught. SS (stereo AND >=48kHz)
+    routes through the measured int32 ceiling (360s); everything else gets the
+    looser DAC backstop (420s). The multiplier is the codec's own SAMPLE_RATE."""
+    # SpectroStream: 360s @ 48kHz — the measured-safe int32 cap.
+    assert tokmod._MAX_ENCODE_SECONDS_SS == 360.0
+    assert tokmod._max_encode_samples(FakeSSCodec()) == int(360.0 * 48000)
+    # DAC: 420s @ 44.1kHz backstop (DAC never approaches int32).
+    assert tokmod._MAX_ENCODE_SECONDS_DAC == 420.0
+    assert tokmod._max_encode_samples(FakeCodec()) == int(420.0 * 44100)
+
+    # The classifier needs BOTH N_CHANNELS==2 AND SR>=48000. A mono 48kHz codec
+    # is NOT SpectroStream -> falls back to the DAC (420s) ceiling.
+    class _Mono48k:
+        SAMPLE_RATE = 48000
+        N_CHANNELS = 1
+    assert tokmod._max_encode_samples(_Mono48k()) == int(420.0 * 48000)
+
+    # A codec missing N_CHANNELS entirely defaults (getattr -> 1) to the safe
+    # DAC branch rather than mis-detecting as SS.
+    class _NoChannels:
+        SAMPLE_RATE = 48000
+    assert tokmod._max_encode_samples(_NoChannels()) == int(420.0 * 48000)
+
+
 def test_streaming_batched_encode_failure_marks_all_failed(tmp_path, patched_load_audio):
     """If the whole encode_batch raises, every item that loaded successfully
     in that chunk should be reported as failed (so the caller can still make
@@ -215,10 +307,10 @@ def test_streaming_load_failure_isolated(tmp_path, monkeypatch):
     items = [(p, tmp_path / (p.stem + ".pt")) for p in mp3s]
     bad_path = mp3s[1]
 
-    def _selective_load(mp3_path, sample_rate):
+    def _selective_load(mp3_path, sample_rate, n_channels=1, normalize=True):
         if mp3_path == bad_path:
             raise IOError("corrupt mp3")
-        return torch.zeros((1, 2048), dtype=torch.float32)
+        return torch.zeros((n_channels, 2048), dtype=torch.float32)
     monkeypatch.setattr(tokmod, "_load_audio", _selective_load)
 
     results = list(tokenize_files_streaming(codec, items, min_frames=1, batch_size=3))

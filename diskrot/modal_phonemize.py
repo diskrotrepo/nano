@@ -25,23 +25,14 @@ app = modal.App("nano-phonemize")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    # v9 multilingual: espeak-ng is the phonemizer backend (system shared lib +
+    # the `phonemizer` Python wrapper), replacing the English-only g2p_en/nltk.
+    .apt_install("espeak-ng", "libespeak-ng1")
     .pip_install(
         "torch>=2.4",  # model.lyric_encoder import chain
         "numpy>=1.26",
-        "g2p_en>=2.1",
-        "nltk>=3.8",
+        "phonemizer>=3.2",
         "tqdm>=4.66",  # diskrot.transcribe_lyrics import chain (shard helpers)
-    )
-    .run_commands(
-        # g2p_en needs these nltk corpora; bake them into the image so the
-        # worker processes don't race to download them at runtime (a 16-way
-        # concurrent nltk.download() corrupts the zip -> BadZipFile). Both
-        # tagger names are required: g2p_en's import guard probes the OLD
-        # 'averaged_perceptron_tagger', while nltk>=3.9's pos_tag loads the
-        # '_eng' variant at call time.
-        "python -c \"import nltk; nltk.download('averaged_perceptron_tagger'); "
-        "nltk.download('averaged_perceptron_tagger_eng'); "
-        "nltk.download('cmudict')\"",
     )
     .add_local_python_source("diskrot", "model")
 )
@@ -52,7 +43,14 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 @app.function(
     image=image,
     cpu=16.0,
-    memory=16 * 1024,
+    # 32 GB, not 16: each of the 16 worker processes imports model.lyric_encoder
+    # for text_to_word_phoneme_groups, which pulls in torch at module top (~0.5 GB
+    # RSS/worker ≈ 8 GB just for torch, though phonemization never uses it) on top
+    # of the parent's loaded lyric words (~2.7 GB, COW-shared to the forks) and a
+    # per-language espeak backend built lazily in each worker (v9 multilingual).
+    # That sum crept past a 16 GB cap a little into the run (OOM SIGKILL 137 at
+    # bucket ~5/256), so give it headroom rather than starving the fan-out.
+    memory=32 * 1024,
     # ~322k songs at ~20-200ms each across 16 worker processes ≈ 1-2 h.
     timeout=60 * 60 * 8,
     retries=modal.Retries(max_retries=5, backoff_coefficient=1.0, initial_delay=5.0),

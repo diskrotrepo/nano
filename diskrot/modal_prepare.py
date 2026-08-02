@@ -1,4 +1,4 @@
-"""Validate, dedupe, and filter the nano-corpus volume.
+"""Validate, dedupe, and filter the raw audio in the R2 (``nano-audio``) bucket.
 
 Cheap CPU pass that runs after the corpus is uploaded and before the GPU steps
 (`modal_tokenize.py`, `modal_auto_tag.py`, `modal_transcribe.py`). Catches
@@ -33,7 +33,7 @@ left off. Re-runs over a fully-validated corpus regenerate the report from
 the manifest with zero validation work.
 
 Setup (one-time):
-    modal volume create nano-corpus
+    # raw audio lives in the R2 nano-audio bucket (NANO_AUDIO_BUCKET / NANO_AUDIO_ENDPOINT)
     modal volume create nano-tokens
 
 Spawns the orchestrator and returns immediately; `--detach` keeps the app
@@ -52,14 +52,30 @@ from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import (
+    ProgressReporter, bulk_delete_r2, corpus_mount, r2_env_secret, wave_subdir,
+)
+
 app = modal.App("nano-prepare")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")  # ffprobe ships with ffmpeg
+    # numpy backs the optional --quality-gate signal metrics (audio_quality); the
+    # decode itself goes through the ffmpeg binary above, so no librosa/soundfile.
+    # boto3 drives the batched R2 DeleteObjects in apply_deletions.
+    .pip_install("numpy", "boto3")
+    # Required for `modal deploy` (used by the ingest orchestrator's from_name
+    # lookup): unlike `modal run`, deploy does NOT auto-mount the entrypoint's
+    # package, so the top-level `from diskrot...` import below would fail with
+    # ModuleNotFoundError without this.
+    .add_local_python_source("diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+# read_only=False kept for parity with the wave-scoped listing; the actual
+# deletions no longer go through this mount — apply_deletions batch-deletes
+# straight from R2 via boto3 (see modal_common.bulk_delete_r2).
+corpus_vol = corpus_mount(read_only=False)
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 MIN_DURATION_S = 20.0
@@ -74,23 +90,30 @@ MAX_DURATION_S = 330.0  # 5:30
 MANIFEST_PATH = "/tokens/prepare_manifest.json"
 
 
+VALIDATOR_MAX_CONTAINERS = 50
+
+
 @app.cls(
     image=image,
     cpu=1.0,
-    max_containers=20,
+    max_containers=VALIDATOR_MAX_CONTAINERS,
     volumes={"/corpus": corpus_vol},
     timeout=60 * 60,
 )
 class Validator:
     @modal.method()
-    def validate_batch(self, names: list[str]) -> list[dict]:
-        """ffprobe + sha256 each file. No mutations, no commits."""
+    def validate_batch(self, names: list[str], quality_gate: bool = False) -> list[dict]:
+        """ffprobe + sha256 each file. No mutations, no commits.
+
+        ``quality_gate``: additionally decode each otherwise-ok file (via ffmpeg)
+        and run the content-quality metrics — flags hard-clipped, mostly-silent,
+        dead, and very-low-bitrate files as ``low_quality`` (deleted on --apply)."""
         import hashlib
         import json
         import subprocess
+        from concurrent.futures import ThreadPoolExecutor
 
-        results: list[dict] = []
-        for name in names:
+        def validate_one(name: str) -> dict:
             path = Path("/corpus") / name
             entry: dict = {"name": name, "stem": path.stem}
 
@@ -108,8 +131,7 @@ class Validator:
                 if proc.returncode != 0 or not proc.stdout.strip():
                     err = (proc.stderr or "ffprobe failed").strip()
                     entry.update(status="undecodable", error=err[:200])
-                    results.append(entry)
-                    continue
+                    return entry
                 meta = json.loads(proc.stdout)
                 streams = meta.get("streams", [])
                 fmt = meta.get("format", {})
@@ -124,8 +146,7 @@ class Validator:
             except (subprocess.TimeoutExpired, json.JSONDecodeError,
                     OSError, ValueError) as e:
                 entry.update(status="undecodable", error=str(e)[:200])
-                results.append(entry)
-                continue
+                return entry
 
             try:
                 h = hashlib.sha256()
@@ -138,8 +159,7 @@ class Validator:
                 sha = h.hexdigest()
             except OSError as e:
                 entry.update(status="undecodable", error=f"hash: {e}"[:200])
-                results.append(entry)
-                continue
+                return entry
 
             if duration_s < MIN_DURATION_S:
                 status = "too_short"
@@ -155,26 +175,51 @@ class Validator:
                 size_bytes=size_bytes,
                 sha256=sha,
             )
-            results.append(entry)
-        return results
+
+            # Content quality gate (opt-in). Only assess files that would otherwise
+            # be kept — undecodable/too_short/too_long already lose, no point
+            # decoding them. A decode failure inside assess_file yields an empty
+            # array → "ok" (we don't second-guess a file ffprobe accepted).
+            if quality_gate and status == "ok":
+                from diskrot.audio_quality import assess_file
+                try:
+                    q = assess_file(path, bit_rate=bit_rate)
+                    entry["quality"] = q.metrics
+                    if q.status == "low_quality":
+                        entry["status"] = "low_quality"
+                        entry["quality_reasons"] = q.reasons
+                except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+                    entry["quality_error"] = str(e)[:200]
+
+            return entry
+
+        # A few threads overlap the R2 FUSE read-waits: ffprobe/ffmpeg are
+        # subprocesses and sha256 releases the GIL, so the per-file work is
+        # I/O-bound from this process's view. Keep the pool small — the
+        # container reserves 1 core; bursts above it bill actual usage.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            return list(pool.map(validate_one, names))
 
 
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
 )
-def list_pending() -> tuple[list[str], dict, list[str]]:
-    """Return (mp3s not yet in manifest, current manifest, all mp3 names on disk)."""
+def list_pending(wave_id: str = "") -> tuple[list[str], dict, list[str]]:
+    """Return (mp3s not yet in manifest, current manifest, all mp3 names on disk).
+    Names are relative to /corpus (wave-prefixed when ``wave_id`` is set); the
+    manifest stays GLOBAL on /tokens so duplicates are caught across waves."""
     import json
 
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
-    all_names = [mp3.name for mp3 in mp3s]
+    mp3s = sorted((Path("/corpus") / wave_subdir(wave_id)).glob("*.mp3"))
+    all_names = [str(mp3.relative_to("/corpus")) for mp3 in mp3s]
     manifest_path = Path(MANIFEST_PATH)
     manifest: dict = {"version": 1, "files": {}}
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
     known = manifest.get("files", {})
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in known]
+    pending = [str(mp3.relative_to("/corpus")) for mp3 in mp3s
+               if mp3.stem not in known]
     print(f"found {len(mp3s):,} mp3s on volume, "
           f"{len(known):,} already in manifest, "
           f"{len(pending):,} pending validation")
@@ -196,24 +241,15 @@ def write_manifest(manifest: dict) -> None:
 
 @app.function(
     image=image,
-    volumes={"/corpus": corpus_vol},
+    # No /corpus mount: batch delete goes straight to R2 via boto3 (r2-creds =
+    # AWS keys, r2_env_secret = bucket + endpoint), not one FUSE unlink per file.
+    secrets=[modal.Secret.from_name("r2-creds"), r2_env_secret()],
     timeout=60 * 60,
 )
 def apply_deletions(names: list[str]) -> int:
-    n_deleted = 0
-    n_missing = 0
-    for name in names:
-        path = Path("/corpus") / name
-        try:
-            path.unlink()
-            n_deleted += 1
-        except FileNotFoundError:
-            n_missing += 1
-        except OSError as e:
-            print(f"failed to delete {name}: {e}")
-    corpus_vol.commit()
-    if n_missing:
-        print(f"(skipped {n_missing} already-gone files)")
+    n_deleted, errors = bulk_delete_r2(names)
+    if errors:
+        print(f"({len(errors)} objects failed to delete)")
     return n_deleted
 
 
@@ -232,15 +268,13 @@ def _build_report(
     kept = [v for v in files.values() if v.get("status") == "ok"]
     counts = {
         "undecodable": 0, "too_short": 0, "duplicate": 0, "too_long": 0,
+        "low_quality": 0,
     }
     for v in files.values():
         s = v.get("status")
         if s in counts:
             counts[s] += 1
-    total_marked = (
-        counts["undecodable"] + counts["too_short"]
-        + counts["duplicate"] + counts["too_long"]
-    )
+    total_marked = sum(counts.values())
 
     durations = sorted(v["duration_s"] for v in kept if v.get("duration_s"))
 
@@ -285,7 +319,8 @@ def _build_report(
         f"(undecodable {counts['undecodable']:,} · "
         f"too_short {counts['too_short']:,} · "
         f"duplicate {counts['duplicate']:,} · "
-        f"too_long {counts['too_long']:,})"
+        f"too_long {counts['too_long']:,} · "
+        f"low_quality {counts['low_quality']:,})"
     )
     if durations:
         lines.append(
@@ -326,15 +361,20 @@ def _build_report(
 def run_prepare(
     apply: bool = False,
     batch_size: int = 64,
+    wave_id: str = "",
+    quality_gate: bool = False,
 ):
     """Full prepare pass: list pending, validate across CPU containers, dedup,
     re-classify, then (if --apply) delete undecodable / too_short / duplicate /
-    too_long files. Designed to be `.spawn()`-ed from the local entrypoint so
-    the user can launch and walk away — progress and the dry-run report stream
-    to this orchestrator's container logs."""
+    too_long / low_quality files. Designed to be `.spawn()`-ed from the local
+    entrypoint so the user can launch and walk away — progress and the dry-run
+    report stream to this orchestrator's container logs. ``wave_id`` scopes the
+    pass to /corpus/waves/wave_<id> (the dedup manifest stays global).
+    ``quality_gate`` turns on the content-quality metrics (decode + clip/silence/
+    bitrate checks) — opt-in because the decode is real CPU work per file."""
     from datetime import datetime, timezone
 
-    pending, manifest, all_names = list_pending.remote()
+    pending, manifest, all_names = list_pending.remote(wave_id=wave_id)
     manifest.setdefault("files", {})
     manifest["version"] = 1
 
@@ -342,9 +382,10 @@ def run_prepare(
         chunks = [pending[i:i + batch_size]
                   for i in range(0, len(pending), batch_size)]
         print(f"validating {len(pending):,} files in {len(chunks):,} batches "
-              f"of ~{batch_size} across up to 20 containers...")
+              f"of ~{batch_size} across up to {VALIDATOR_MAX_CONTAINERS} containers...")
         n_done = 0
         last_checkpoint = 0
+        rep = ProgressReporter(len(pending), "prepare", unit="files")
         # Persist the manifest periodically so a worker preemption (these run
         # on preemptible CPU workers) doesn't discard hours of validation. On
         # restart, list_pending() skips anything already in the manifest, so we
@@ -356,17 +397,22 @@ def run_prepare(
         # counter (and manifest checkpointing) while the other 20 containers sat
         # idle but billing. With it off, completed batches yield immediately and
         # preemptions become invisible.
-        for batch in Validator().validate_batch.map(chunks, order_outputs=False):
+        if quality_gate:
+            print("  quality gate ON — decoding each file for clip/silence/bitrate checks")
+        for batch in Validator().validate_batch.map(
+            chunks, kwargs={"quality_gate": quality_gate}, order_outputs=False
+        ):
             for entry in batch:
                 manifest["files"][entry["stem"]] = entry
             n_done += len(batch)
-            print(f"  validated {n_done:,}/{len(pending):,}")
+            rep.update(len(batch))
             if n_done - last_checkpoint >= checkpoint_every:
                 manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
                 write_manifest.remote(manifest)
                 last_checkpoint = n_done
                 print(f"  [checkpoint] manifest persisted at "
                       f"{n_done:,}/{len(pending):,} validated")
+        rep.done()
         # Flush any tail since the last checkpoint before moving on.
         if n_done > last_checkpoint:
             manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -410,11 +456,18 @@ def run_prepare(
             manifest["files"][s]["status"] = "duplicate"
             manifest["files"][s]["duplicate_of"] = keeper
 
-    on_disk = set(all_names)
+    # Build the deletion list by cross-referencing the wave's ACTUAL on-disk paths
+    # (stem -> wave-prefixed relative name) against the manifest status keyed by
+    # stem — NOT by the manifest's stored `name`. The manifest is global and keyed
+    # by bare stem, and older entries stored a BARE filename (pre-wave-prefix), so
+    # `v["name"] in on_disk` (on_disk being today's wave-prefixed paths) matched
+    # nothing and silently deleted zero flagged files. Keying off on_disk also
+    # guarantees the emitted key is the correct R2 path for THIS wave's copy.
+    _DELETE = ("undecodable", "too_short", "duplicate", "too_long", "low_quality")
+    on_disk_by_stem = {Path(n).stem: n for n in all_names}
     deletion_names = [
-        v["name"] for v in manifest["files"].values()
-        if v.get("status") in ("undecodable", "too_short", "duplicate", "too_long")
-        and v["name"] in on_disk
+        name for stem, name in on_disk_by_stem.items()
+        if manifest["files"].get(stem, {}).get("status") in _DELETE
     ]
 
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -435,13 +488,18 @@ def run_prepare(
 def main(
     apply: bool = False,
     batch_size: int = 64,
+    wave_id: str = "",
+    quality_gate: bool = False,
 ):
     # spawn (not remote) — submit the orchestrator and return immediately.
     # Combined with `modal run --detach`, the app stays alive after the local
     # CLI exits, so the user can close their terminal and walk away. The
     # validation report and progress stream to the orchestrator's logs (watch
     # below), not this terminal — unlike the old inline entrypoint.
-    fc = run_prepare.spawn(apply=apply, batch_size=batch_size)
+    # --wave-id N scopes prepare to /corpus/waves/wave_N.
+    fc = run_prepare.spawn(
+        apply=apply, batch_size=batch_size, wave_id=wave_id, quality_gate=quality_gate,
+    )
     mode = "apply" if apply else "dry-run"
     print(f"prepare launched (detached, {mode}) — function call id: {fc.object_id}")
     print(f"watch:  modal app logs $(modal app list | "

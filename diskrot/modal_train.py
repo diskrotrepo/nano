@@ -16,11 +16,11 @@ Override architecture / hyperparams via CLI:
       --batch-size 32 --lr 2.1e-4 --warmup-steps 5000 \\
       --eval-batches 50 --ckpt-subdir v8_sing
 
-Multi-GPU DDP on 8×H100 (per-rank batch_size; global = n_gpus × that):
-    modal run --detach diskrot/modal_train.py --n-gpus 8 --batch-size 4
+Multi-GPU DDP on 4×B200 (per-rank batch_size; global = n_gpus × that):
+    modal run --detach diskrot/modal_train.py --n-gpus 4 --batch-size 8
 
 Fine-tune from an existing checkpoint (fresh optimizer/step, new subdir):
-    modal run --detach diskrot/modal_train.py --n-gpus 8 \\
+    modal run --detach diskrot/modal_train.py --n-gpus 4 \\
       --init-from v8_sing/best.pt --ckpt-subdir v8_ft --lr 5e-5
 
 LoRA-train (frozen base + adapters; single H100 is plenty; see README.finetune.md):
@@ -33,6 +33,7 @@ Pull checkpoints back when training is done (substitute the subdir):
 """
 from __future__ import annotations
 
+import os
 import threading
 
 import modal
@@ -98,6 +99,16 @@ image = (
         "TORCHINDUCTOR_CACHE_DIR": "/compile-cache/inductor",
         "TRITON_CACHE_DIR": "/compile-cache/triton",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",  # explicit; default varies by torch version
+        # Codec selection MUST reach the train container: dataset.py and the
+        # segment-frames math resolve the frame rate from NANO_CODEC at import
+        # (codec_constants()). Modal does not forward the local shell env to remote
+        # containers, so bake the build-shell value in here — same contract as
+        # modal_tokenize.py. Default "dac" keeps legacy runs byte-identical; a v9
+        # run just needs `export NANO_CODEC=spectrostream` before `modal run`.
+        # Without this the container falls back to DAC's 86 Hz and 180s -> 15,480
+        # frames overruns max_seq_len=8192.
+        "NANO_CODEC": os.environ.get("NANO_CODEC", "dac"),
+        "NANO_SS_DEPTH": os.environ.get("NANO_SS_DEPTH", "32"),
     })
     .add_local_python_source("model", "diskrot")
 )
@@ -146,9 +157,23 @@ DEFAULTS = {
     "n_heads": 16,                 # head_dim = 128 (even, RoPE-safe; 2048 % 16 == 0)
     "d_ff": 8192,
     "dropout": 0.05,
-    "max_seq_len": 8192,           # RoPE table covers ~95s at 86 Hz (60s seg = 5168 frames, fits)
+    # v9: the model predicts K=24 SpectroStream RVQ codebooks (joint stereo, vocab
+    # 1024 — same as DAC, so only the count changes). The corpus is tokenized at a
+    # STORED depth of 32 (env NANO_SS_DEPTH), and the dataset slices [:24]; bump this
+    # to <=32 to retune K with no re-tokenize. A DAC run would override to 9.
+    "n_codebooks": 24,
+    "max_seq_len": 8192,           # at 25 Hz (SpectroStream) covers ~5.4 min; a full
+                                   # song fits (210s = 5250 frames + K-1 delay tail)
     "use_gradient_checkpointing": True,
-    "segment_seconds": 60.0,       # 60s = 5160 frames; native ~1-min single-shot
+    # v9 full-song: 180s clips. At 25 Hz that's 4500 frames (< v8's 60s@86Hz =
+    # 5160), so per-step cost is comparable. pad_short_songs keeps every song
+    # (median ~190s) by padding+masking the tail, so nothing is dropped.
+    "segment_seconds": 180.0,
+    "pad_short_songs": True,
+    # EMA weights: select + save best.pt on the EMA's smoother val loss (fixes the
+    # noisy best-selection that flatlined v8_sing4). ~2x param memory (fp32 shadow).
+    "use_ema": True,
+    "ema_decay": 0.999,
     "batch_size": 32,              # global; per-rank = 4 on 8 ranks. Halved from 64
                                    # because 60s doubles the sequence — per-rank token
                                    # load (4×5160) is identical to the old 30s 8×2580
@@ -182,17 +207,20 @@ DEFAULTS = {
     # biased toward sung regions (dataset.bias_vocal_crops) + max_lyric_len 512.
     # Bumped from v8_sing3 (abandoned at ~1% / step 4k) so a bare relaunch starts
     # clean rather than resuming the old dir; override with --ckpt-subdir.
-    "ckpt_subdir": "v8_sing4",
+    "ckpt_subdir": "v9_stereo",
     # Lyric (phoneme) conditioning — a ~100M bidirectional encoder feeding a
     # per-block lyric cross-attention. Enabled together with tag conditioning.
     "lyric_enc_layers": 3,
     "lyric_enc_heads": 8,
     "lyric_enc_d_ff": 4096,
-    # 512 (up from 256): a dense 60s crop carries ~400-600 phoneme tokens; the
-    # old 256 cap silently truncated the tail (lyric_encoder.append_unit_capped),
-    # losing alignment signal on the back half of busy crops. Sizes only the
-    # encoder PE (non-persistent) + the dataset cap — no checkpoint reshape.
-    "max_lyric_len": 512,
+    # 1024 (up from 512): the 512 cap was sized for 60s crops (~400-600 phoneme
+    # tokens), but v9 trains on 180s crops — a dense/wordy 180s window can exceed
+    # 1500 IPA tokens, so 512 silently truncated the tail (append_unit_capped),
+    # starving the back half of busy crops of alignment signal (the exact failure
+    # bias_vocal_crops fixes, reintroduced at the crop tail). Hits the densest sung
+    # examples (rap/fast pop) hardest. Sizes only the encoder PE (non-persistent) +
+    # the dataset cap — no checkpoint reshape, free for a fresh run.
+    "max_lyric_len": 1024,
     # Melody (chroma) conditioning — a small additive encoder over the 12-bin
     # chromagram (~13M params). Enabled together with tags + lyrics.
     "melody_n_bins": 12,
@@ -211,15 +239,90 @@ DEFAULTS = {
     # swapped onto this checkpoint anyway.
     "use_fim": False,
     "fim_prob": 0.0,
+    # Generative stem conditioning (the /addstem path): add a stem to an existing
+    # song. On a stem-add batch the decoder TARGET is one isolated stem and the
+    # conditioning is the song's OTHER stems (+ the target-stem caption via tags);
+    # lyrics/melody drop. Needs the packed stem sidecar (modal_stems -> pack with
+    # stem_cache_dir). A new submodule (StemEncoder), so it's checkpoint-incompatible.
+    #
+    # OFF for v9 (2026-06-28 cost decision): the stems prep stage (Demucs + 4x codec
+    # on GPU) is the single most expensive prep line (~$7.6k at 50% sampling / ~$15k
+    # at 100%), AND a stem-add batch only fires when EVERY song in the per-rank batch
+    # has stems — at <100% sampling that's ~0.4% of batches, so the feature barely
+    # trains unless you pay for ~100% coverage. Worst cost/value of all the streams,
+    # so /addstem is deferred to a later continued-train if it earns it. Dropping it
+    # also removes the stem-add lyric-drop, restoring the clean 10% lyric-drop (more
+    # batches train singing). Set True + run the stems stage to re-enable on a fresh
+    # start. ``stem_prob`` is unused while this is False.
+    "use_stem_conditioning": False,
+    "stem_enc_layers": 2,
+    "n_stem_types": 4,
+    "stem_prob": 0.08,
+    # Codebook-0 loss up-weight (intelligibility lever). 1.0 = OFF (flat loss over
+    # all 24 codebooks, identical to history). >1.0 (try ~1.5) weights cb0 — the
+    # codebook carrying most phonetic content — harder, to push singing. cb0 is
+    # where v8 diverged in warmup, so only raise this with a short validation run.
+    "cb0_loss_weight": 1.0,
 }
 DDP_PER_RANK_BATCH = DEFAULTS["batch_size"] // 8   # = 4 (global 32 on 8 ranks)
+
+
+def _assert_codec_matches_pack(root: str) -> None:
+    """Refuse to train if NANO_CODEC disagrees with the pack's actual codec.
+
+    This closes the worst silent failure in the project. The frame rate is resolved
+    from the ENV at module scope (``dataset.py`` ``_FRAME_RATE_HZ``), never from the
+    data, and the pack index records no codec. So pointing a SpectroStream-configured
+    run (25 Hz) at a DAC pack (86 Hz) trains happily on temporally scrambled
+    conditioning: every structure/tempo/key marker and every vocal-biased crop lands
+    at the wrong time, val loss looks fine, and the output is quietly garbage.
+
+    The existing depth guard does NOT catch it — with ``--n-codebooks 9`` against a
+    9-codebook DAC pack, ``stored_k < model_k`` is false and the run proceeds.
+
+    Codebook depth identifies the codec unambiguously: DAC is always exactly 9;
+    SpectroStream stores 24 or 32. That is enough to verify the env without any
+    change to the pack format (so it works on packs already written).
+    """
+    import os
+    from pathlib import Path
+
+    from diskrot.pack_cache import SHARD_INDEX_NAME, load_shard_index
+
+    packed_dir = Path(root) / "packed"
+    if not (packed_dir / SHARD_INDEX_NAME).exists():
+        return  # no pack yet (e.g. a loose-.pt run) — nothing to cross-check
+
+    stored_k = int(load_shard_index(packed_dir)["n_codebooks"])
+    pack_codec = "dac" if stored_k == 9 else "spectrostream"
+    env_codec = "spectrostream" if os.environ.get(
+        "NANO_CODEC", "dac").lower() in ("spectrostream", "ss") else "dac"
+    if pack_codec != env_codec:
+        want_rate, got_rate = (86, 25) if pack_codec == "dac" else (25, 86)
+        raise SystemExit(
+            f"CODEC MISMATCH: the pack at {packed_dir} stores {stored_k} codebooks "
+            f"(= {pack_codec}, {want_rate} Hz), but NANO_CODEC={env_codec} "
+            f"({got_rate} Hz).\n"
+            f"Training would apply {got_rate} Hz timing to {want_rate} Hz tokens — "
+            f"every structure/tempo/key marker and crop would land at the wrong "
+            f"time, and NOTHING else would raise.\n"
+            f"Fix: export NANO_CODEC={pack_codec} before `modal run` "
+            f"(it is baked into the image from your shell), or point --data-subdir "
+            f"at the {env_codec} pack."
+        )
+    print(f"[guard] codec OK: pack={pack_codec} ({stored_k} cb) matches "
+          f"NANO_CODEC={env_codec}", flush=True)
 
 
 def _build_cfg_kwargs(
     steps: int, batch_size: int, lr: float, warmup_steps: int,
     patience: int, eval_batches: int, ckpt_subdir: str, text_conditioned: bool,
     segment_seconds: float = 10.0,
+    pad_short_songs: bool = DEFAULTS["pad_short_songs"],
+    use_ema: bool = DEFAULTS["use_ema"],
+    ema_decay: float = DEFAULTS["ema_decay"],
     fim_prob: float = DEFAULTS["fim_prob"],
+    stem_prob: float = DEFAULTS["stem_prob"],
     wandb_project: str | None = None, wandb_run_name: str | None = None,
     init_from: str = "",
     lora: bool = False,
@@ -231,6 +334,7 @@ def _build_cfg_kwargs(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ) -> dict:
     """Shared TrainConfig builder for both single- and multi-GPU paths.
     Returns a plain dict so it survives mp.spawn pickling.
@@ -242,15 +346,18 @@ def _build_cfg_kwargs(
     conditioning path under /tokens/{data_subdir}, so a fine-tune corpus can
     be packed beside the main one (same layout, one directory down)."""
     root = f"/tokens/{data_subdir}" if data_subdir else "/tokens"
+    _assert_codec_matches_pack(root)
     tags_path = f"{root}/tags.json" if text_conditioned else None
     lyrics_path = f"{root}/lyrics" if text_conditioned else None
     structure_path = f"{root}/structure" if text_conditioned else None
     keys_path = f"{root}/keys.json" if text_conditioned else None
     phonemes_path = f"{root}/phonemes" if text_conditioned else None
+    tempo_path = f"{root}/tempo.json" if text_conditioned else None
     from model.lora import DEFAULT_TARGETS
 
     return dict(
         fim_prob=fim_prob,
+        stem_prob=stem_prob,
         cache_dir=root,
         ckpt_dir=f"/ckpts/{ckpt_subdir}",
         device="cuda",
@@ -265,8 +372,12 @@ def _build_cfg_kwargs(
         structure_path=structure_path,
         keys_path=keys_path,
         phonemes_path=phonemes_path,
+        tempo_path=tempo_path,
         text_conditioned=text_conditioned,
         segment_seconds=segment_seconds,
+        pad_short_songs=pad_short_songs,
+        use_ema=use_ema,
+        ema_decay=ema_decay,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
         init_from=f"/ckpts/{init_from}" if init_from else None,
@@ -280,12 +391,14 @@ def _build_cfg_kwargs(
         distill_from=f"/ckpts/{distill_from}" if distill_from else None,
         distill_alpha=distill_alpha,
         distill_tau=distill_tau,
+        cb0_loss_weight=cb0_loss_weight,
     )
 
 
 def _build_model_cfg(
     d_model: int, n_layers: int, n_heads: int, d_ff: int, dropout: float,
     text_conditioned: bool,
+    n_codebooks: int = DEFAULTS["n_codebooks"],
     max_seq_len: int = DEFAULTS["max_seq_len"],
     use_gradient_checkpointing: bool = True,
     lyric_enc_layers: int = DEFAULTS["lyric_enc_layers"],
@@ -295,6 +408,9 @@ def _build_model_cfg(
     melody_n_bins: int = DEFAULTS["melody_n_bins"],
     melody_enc_layers: int = DEFAULTS["melody_enc_layers"],
     use_fim: bool = DEFAULTS["use_fim"],
+    use_stem_conditioning: bool = DEFAULTS["use_stem_conditioning"],
+    stem_enc_layers: int = DEFAULTS["stem_enc_layers"],
+    n_stem_types: int = DEFAULTS["n_stem_types"],
     use_qk_norm: bool = DEFAULTS["use_qk_norm"],
     use_lyric_qk_norm: bool = DEFAULTS["use_lyric_qk_norm"],
 ):
@@ -309,6 +425,10 @@ def _build_model_cfg(
         use_lyric_conditioning=text_conditioned,
         use_melody_conditioning=text_conditioned,
         use_fim=use_fim,
+        use_stem_conditioning=use_stem_conditioning,
+        stem_enc_layers=stem_enc_layers,
+        n_stem_types=n_stem_types,
+        n_codebooks=n_codebooks,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
         d_ff=d_ff, dropout=dropout,
         max_seq_len=max_seq_len,
@@ -329,6 +449,7 @@ def _ddp_worker(
     shared_bundle: dict | None = None,
     tag_cache_stacked=None,
     tag_cache_keys: list | None = None,
+    chunk_index: dict | None = None,
 ) -> None:
     """One DDP rank. Runs in a subprocess launched by mp.spawn.
 
@@ -351,6 +472,8 @@ def _ddp_worker(
         precomputed_tag_cache = {
             k: tag_cache_stacked[i] for i, k in enumerate(tag_cache_keys)
         }
+    # chunk_index (description -> [chunk_str]) crosses the spawn as a plain string
+    # dict (no tensors -> no FD pressure), like shared_bundle["tags"].
 
     text_conditioned = cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(text_conditioned=text_conditioned, **model_kwargs)
@@ -370,6 +493,7 @@ def _ddp_worker(
         ckpt_callback=callback,
         shared_bundle=shared_bundle,
         precomputed_tag_cache=precomputed_tag_cache,
+        precomputed_chunk_index=chunk_index,
     )
 
 
@@ -575,6 +699,8 @@ def train_remote(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    n_codebooks: int = DEFAULTS["n_codebooks"],
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ):
     from diskrot.train import TrainConfig, train_run
 
@@ -588,11 +714,13 @@ def train_remote(
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
         distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
+        cb0_loss_weight=cb0_loss_weight,
     )
     cfg_kwargs.pop("text_conditioned")
     model_cfg = _build_model_cfg(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
         dropout=dropout, text_conditioned=text_conditioned,
+        n_codebooks=n_codebooks,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
@@ -658,15 +786,17 @@ def train_remote_multi(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    n_codebooks: int = DEFAULTS["n_codebooks"],
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ):
     import torch
     import torch.multiprocessing as mp
     from pathlib import Path as _Path
 
     from diskrot.dataset import load_mmap_bundle
-    from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME
+    from diskrot.pack_cache import PACKED_DIR, SHARD_INDEX_NAME, load_shard_index
     from diskrot.train import TrainConfig
-    from model.codec import DACodec
+    from model.codec import codec_constants
 
     _setup_mp_sharing()
 
@@ -683,9 +813,11 @@ def train_remote_multi(
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
         distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
+        cb0_loss_weight=cb0_loss_weight,
     )
     model_kwargs = dict(
         d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff, dropout=dropout,
+        n_codebooks=n_codebooks,
         max_seq_len=max_seq_len,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
@@ -694,11 +826,24 @@ def train_remote_multi(
     _defaults = TrainConfig()
     # cfg_kwargs already carries the resolved segment_seconds; use it (not the
     # TrainConfig default) so the bundle covers the right crop window.
-    segment_frames = int(cfg_kwargs["segment_seconds"] * DACodec.FRAME_RATE_HZ)
+    # Active codec's frame rate (NANO_CODEC): DAC=86 Hz, SpectroStream=25 Hz.
+    segment_frames = int(cfg_kwargs["segment_seconds"] * codec_constants()["frame_rate_hz"])
     packed_dir = _Path(cfg_kwargs["cache_dir"]) / PACKED_DIR
     if not (packed_dir / SHARD_INDEX_NAME).exists():
         raise FileNotFoundError(
             f"No sharded packed layout at {packed_dir} — run diskrot.pack_cache first"
+        )
+    # Guard: the pack's STORED codebook depth must be >= the model's n_codebooks
+    # (the dataset slices stored -> model K). A mismatch is almost always a
+    # NANO_CODEC / --data-subdir mistake (e.g. a 24-cb model pointed at the old
+    # 9-cb DAC pack, or a stored depth < the chosen K). Fail fast with a clear msg.
+    _stored_k = int(load_shard_index(packed_dir)["n_codebooks"])
+    _model_k = int(model_kwargs.get("n_codebooks") or DEFAULTS["n_codebooks"])
+    if _stored_k < _model_k:
+        raise ValueError(
+            f"packed corpus at {packed_dir} stores {_stored_k} codebooks but the "
+            f"model wants n_codebooks={_model_k}. Re-tokenize deeper (NANO_SS_DEPTH) "
+            f"or lower DEFAULTS['n_codebooks'] / --data-subdir to the right pack."
         )
     print(f"[parent] sharded layout detected at {packed_dir} — using mmap bundle "
           f"(segment_frames={segment_frames})", flush=True)
@@ -712,11 +857,35 @@ def train_remote_multi(
         structure_path=cfg_kwargs["structure_path"],
         keys_path=cfg_kwargs["keys_path"],
         phonemes_path=cfg_kwargs["phonemes_path"],
+        tempo_path=cfg_kwargs["tempo_path"],
+        pad_short=cfg_kwargs.get("pad_short_songs", False),
     )
     tag_cache: dict = {}
+    chunk_index: dict = {}
     if text_conditioned and shared_bundle["tags"]:
-        unique_tags = sorted(set(shared_bundle["tags"].values()))
-        tag_cache = _precompute_clap_cache(unique_tags, d_model, n_gpus=n_gpus)
+        # Chunk every description into <=77-token windows (a long caption is
+        # split so CLAP can encode the WHOLE thing as a sequence instead of its
+        # truncated single pooled vector), then encode the unique CHUNKS. A bare
+        # gpt2 tokenizer here chunks byte-identically to msclap's (same model),
+        # so workers/inference agree without loading CLAP in the parent.
+        from transformers import AutoTokenizer
+
+        from model.text_encoder import chunk_text_ids
+
+        # Include per-stem captions (the /addstem target-stem tags) so a stem-add
+        # batch's swapped-in tag hits the precomputed cache like any description.
+        _stem_cap_strs = {
+            c for caps in shared_bundle.get("stem_caps", {}).values()
+            for c in caps if c
+        }
+        unique_descs = sorted(set(shared_bundle["tags"].values()) | _stem_cap_strs)
+        _tok = AutoTokenizer.from_pretrained("gpt2")
+        chunk_index = {d: chunk_text_ids(_tok, d) for d in unique_descs}
+        unique_chunks = sorted({c for chunks in chunk_index.values() for c in chunks})
+        n_tag_chunks = max((len(c) for c in chunk_index.values()), default=1)
+        print(f"[clap-parent] {len(unique_descs)} descriptions -> {len(unique_chunks)} "
+              f"unique chunks (max {n_tag_chunks} chunks/description)", flush=True)
+        tag_cache = _precompute_clap_cache(unique_chunks, d_model, n_gpus=n_gpus)
 
     # Hand the CLAP cache to the ranks as ONE stacked tensor + key list rather
     # than a dict of N separate tensors. mp.spawn shares each torch tensor via
@@ -743,7 +912,7 @@ def train_remote_multi(
         mp.spawn(
             _ddp_worker,
             args=(n_gpus, cfg_kwargs, model_kwargs, shared_bundle,
-                  tag_cache_stacked, tag_cache_keys),
+                  tag_cache_stacked, tag_cache_keys, chunk_index),
             nprocs=n_gpus, join=True,
         )
     finally:
@@ -808,6 +977,11 @@ def main(
     distill_from: str = "",
     distill_alpha: float = 0.5,
     distill_tau: float = 2.0,
+    # Pilot/experiment knobs: model codebook count (RVQ prefix of the stored
+    # depth — checkpoint-incompatible across values) and the cb0 loss up-weight
+    # (training-side only, checkpoint-compatible).
+    n_codebooks: int = DEFAULTS["n_codebooks"],
+    cb0_loss_weight: float = DEFAULTS["cb0_loss_weight"],
 ):
     if lora and not init_from:
         raise SystemExit("--lora requires --init-from (e.g. --init-from v8_sing/best.pt)")
@@ -833,6 +1007,7 @@ def main(
         lora_targets=lora_targets, lora_train_text_proj=lora_train_text_proj,
         data_subdir=data_subdir,
         distill_from=distill_from, distill_alpha=distill_alpha, distill_tau=distill_tau,
+        n_codebooks=n_codebooks, cb0_loss_weight=cb0_loss_weight,
     )
     if n_gpus > 1:
         fc = train_remote_multi.spawn(**common, n_gpus=n_gpus)

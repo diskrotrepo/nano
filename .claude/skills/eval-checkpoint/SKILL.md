@@ -25,7 +25,17 @@ matches the question.
 | Best lyric/cfg settings, with clips to listen to? (real path) | `modal run scripts/eval_lyric_sweep.py` (grid: cfg × lyric_cfg × ladder × {lyrics, instrumental}; sweetener ON; WER + one MP3 per cell) |
 | What sampling params are best? | `python -m eval.sweep.run_sweep --stage 1` then `--stage 2 --top-n 4` |
 | How well is each genre covered? | `python -m eval.genre_sweep` (gaps: `python eval/genre_gap_eval.py`) |
-| Is the DAC codec itself fine? | `python scripts/dac_roundtrip.py` |
+| Is the codec itself fine? | `python scripts/dac_roundtrip.py` (**DAC-hardcoded** — see codec caveat) |
+
+## Codec caveat (v9 / SpectroStream checkpoints)
+
+The codec must match the checkpoint. `eval_checkpoint` and `eval_lyric_sweep`
+go through `InferenceEngine`, which picks the codec from **`NANO_CODEC`** — set
+`NANO_CODEC=spectrostream` when evaluating a v9 checkpoint (locally AND in any
+Modal image env), or generation decodes with the wrong codec/frame rate.
+`dac_roundtrip.py`, `eval_train_vs_val.py`, and `eval_lyric_wer.py` **hardcode
+`DACodec`** and are DAC-only until ported — don't point them at a
+SpectroStream checkpoint.
 
 ## Details
 
@@ -60,7 +70,8 @@ conditioner isn't being used — but for *intelligibility* prefer the WER eval b
 ### Lyric intelligibility / WER — `eval_lyric_wer` (Modal, H100)
 ```bash
 modal run scripts/eval_lyric_wer.py
-# flags: --ckpt-path /ckpts/v8_sing/best.pt  --n-clips 30  --cfg-scale 3  --lyric-cfg-scale 0
+# flags: --ckpt-path /ckpts/v8_sing4/best.pt  --n-clips 30  --cfg-scale 3  --lyric-cfg-scale 0
+#   (the code default is the older /ckpts/v8_sing/best.pt — pass the path explicitly)
 ```
 The **primary success metric** for "does it sing the words." Generates audio
 conditioned on held-out lyric lines, transcribes the output with the same
@@ -70,7 +81,7 @@ intelligibility. Raise `--lyric-cfg-scale` (e.g. 5–6) to push the lyric axis h
 
 ### Realistic lyric sweep — `eval_lyric_sweep` (Modal, H100)
 ```bash
-modal run scripts/eval_lyric_sweep.py --ckpt-path /ckpts/v8_sing2/best_inference.pt
+modal run scripts/eval_lyric_sweep.py --ckpt-path /ckpts/v8_sing4/best_inference.pt
 # flags: --n-clips 5  --seconds 12  --cfg-scales 3.0,5.0  --lyric-cfgs 0.0,3.0,6.0
 ```
 Like `eval_lyric_wer` but through the **exact `/generate` path** — `InferenceEngine`
@@ -107,6 +118,8 @@ unless you pass `--local` / `--tags-path`.
 
 - A **local checkpoint** at `./checkpoints/best.pt` (or pass `--ckpt` / set
   `NANO_CKPT`). Get one via the **train-model** skill's extract + download step.
+  When no checkpoint is named, the canonical target is
+  `v8_sing4/best_inference.pt`.
 - Genre evals need `tags.json` on `nano-tokens`.
 
 > Local CLAP audio scoring can crash on systems with ffmpeg 8 (torchcodec

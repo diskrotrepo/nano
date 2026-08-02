@@ -1,4 +1,8 @@
-"""Modal entrypoint for lyrics transcription (Demucs + Whisper).
+"""Modal entrypoint for lyrics transcription (Whisper on the raw mix).
+
+Demucs-free: large-v3-turbo + VAD transcribes the mono mix directly (separation is
+a no-op-to-worse ASR input per arXiv:2506.15514) and vocal gender comes from the
+audio-LLM captioner (tags.json), so there is no vocal-isolation or F0 pass.
 
 Uses multiple GPU containers in parallel via Modal's class pattern.
 
@@ -9,18 +13,15 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
 import modal
 
+from diskrot.modal_common import ProgressReporter, corpus_mount, wave_subdir
+
 app = modal.App("nano-transcribe")
-
-
-def _cache_demucs():
-    from demucs.pretrained import get_model
-
-    get_model("htdemucs")
 
 
 image = (
@@ -36,21 +37,39 @@ image = (
         "numpy>=1.26",
         "tqdm>=4.66",
         "soundfile>=0.12",
-        "demucs",
-        "faster-whisper",
+        # >=1.1.0: BatchedInferencePipeline supports word_timestamps + the vad
+        # params (earlier 1.0.x batched mode lacks both).
+        "faster-whisper>=1.1.0",
     )
     .run_commands("pip install 'protobuf>=4'")
-    .run_function(_cache_demucs)
+    # Baked from the deploying shell. NANO_WHISPER_BATCH: VAD segments of one
+    # song decode as batches of this size via BatchedInferencePipeline (~1.5-2x
+    # L4 throughput); 0 = legacy sequential decode (the instant rollback lever —
+    # set both vars and redeploy). NANO_TRANSCRIBE_CONCURRENCY: see the
+    # @modal.concurrent comment on the class.
+    .env({
+        "NANO_WHISPER_BATCH": os.environ.get("NANO_WHISPER_BATCH", "8"),
+    })
+    # Demucs is gone from transcribe: Whisper runs on the raw mix (large-v3-turbo +
+    # VAD makes separation a no-op-to-worse ASR input, arXiv:2506.15514) and vocal
+    # gender comes from the audio-LLM captioner, so there is nothing left to isolate.
+    # Dropping the demucs dep + the htdemucs weight bake also frees the VRAM that
+    # capped @modal.concurrent at 2 — see the class below. (torch stays: it's a
+    # top-level import in diskrot.transcribe_lyrics.)
     .add_local_python_source("model", "diskrot")
 )
 
-corpus_vol = modal.Volume.from_name("nano-corpus", create_if_missing=True)
+corpus_vol = corpus_mount()  # R2 audio bucket (read-only); see modal_common.corpus_mount
 tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
 
 
 @app.cls(
     image=image,
     gpu="L4",
+    # 4 cores so the concurrent inputs' CPU work (ffmpeg decode, 44.1→16k resample,
+    # Silero VAD) doesn't contend — same pattern as the structure sibling stage.
+    # (The pyin gender Viterbi is gone — gender comes from the audio-LLM captioner.)
+    cpu=4.0,
     timeout=60 * 60,
     max_containers=50,
     # Retry inputs whose container died under them (guard exits, preemptions,
@@ -61,6 +80,14 @@ tokens_vol = modal.Volume.from_name("nano-tokens", create_if_missing=True)
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
+# Concurrent inputs per container overlap one song's GPU work (Whisper) with the
+# others' GPU-idle CPU tails (ffmpeg decode + 44.1→16k resample), raising L4
+# utilization at no FLOP cost. Was 4 for sequential batch-1 decode; with
+# BatchedInferencePipeline each input now drives real batch-8 GPU work, so 2 is
+# enough to keep the L4 fed while the other input decodes — and 4 concurrent
+# batch-8 decodes risk VRAM pressure on 24 GB. Env-driven (deploying shell) so
+# the NANO_WHISPER_BATCH=0 rollback can restore 4 in the same redeploy.
+@modal.concurrent(max_inputs=int(os.environ.get("NANO_TRANSCRIBE_CONCURRENCY", "2")))
 class Transcriber:
     @modal.enter()
     def load_models(self):
@@ -75,31 +102,43 @@ class Transcriber:
         import torch._dynamo.external_utils  # noqa: F401  (third observed lazy-import poison, 2026-06-11)
         import librosa
 
+        # Warm the one librosa kernel the Demucs-free path still hits (44.1→16k
+        # resample). pyin is no longer warmed — the F0 gender estimate is gone
+        # (gender now comes from the audio-LLM captioner).
         librosa.resample(np.zeros(1600, dtype=np.float32), orig_sr=44100, target_sr=16000)
-        librosa.pyin(np.zeros(8000, dtype=np.float32), sr=16000, fmin=65.0, fmax=1047.0)
 
-        from demucs.apply import apply_model
-        from demucs.pretrained import get_model
         from faster_whisper import WhisperModel
 
-        self.demucs_model = get_model("htdemucs")
-        self.demucs_model.to("cuda")
-        self.demucs_model.eval()
-        self.apply_fn = apply_model
-        # large-v3-turbo: 4 decoder layers vs 32, ~4-6x faster ASR at near-identical
+        # No Demucs: Whisper runs on the raw mix (see the image comment / class
+        # docstring). large-v3-turbo: 4 decoder layers vs 32, ~4-6x faster ASR at near-identical
         # transcription quality. The first ~30k songs were done with large-v3; the
         # transcript mix is fine for training data.
         self.whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
+        # Batched decode of one song's VAD segments (~1.5-2x GPU throughput at
+        # identical weights). batch_size=0 (env, baked at deploy) falls back to
+        # the sequential batch-1 path — the rollback lever if the post-wave
+        # lyrics-stats parity check drifts.
+        self.batch_size = int(os.environ.get("NANO_WHISPER_BATCH", "8"))
+        if self.batch_size:
+            from faster_whisper import BatchedInferencePipeline
+            self.batched = BatchedInferencePipeline(model=self.whisper_model)
         # Warm the full transcribe path INCLUDING the VAD filter: faster-whisper
         # imports onnxruntime lazily on the first vad_filter=True call, and that
         # import sporadically dies under loaded-model memory pressure, leaving
         # the container raising "Applying the VAD filter requires the
         # onnxruntime package" on every input (the 2026-06-11 storm — same
         # lazy-import poisoning as the scipy warmup above). Done here, a broken
-        # import fails @enter and the container never takes inputs.
+        # import fails @enter and the container never takes inputs. When batched
+        # decode is on, warm THAT path too — it is the runtime path the poison
+        # guards must have exercised.
         list(self.whisper_model.transcribe(
             np.zeros(16000, dtype=np.float32), language="en", vad_filter=True,
         )[0])
+        if self.batch_size:
+            list(self.batched.transcribe(
+                np.zeros(16000, dtype=np.float32), language="en",
+                vad_filter=True, batch_size=self.batch_size,
+            )[0])
         # Poison guard state: consecutive in-band failures. A healthy container
         # essentially never fails several distinct files in a row (prepare
         # already dropped corrupt/over-long audio), but a container with broken
@@ -107,19 +146,35 @@ class Transcriber:
         # fails EVERY input in ~4s and eats the queue (observed 2026-06-11:
         # ~146k of 180k results failed in-band; the NameError-only guard below
         # missed it because the storm wasn't a NameError).
+        # Guarded with a lock: under @modal.concurrent(max_inputs=2) two inputs
+        # run in this container's thread pool, so the read-modify-write of this
+        # int would race. The threshold is raised to 5 below (from 3) because up
+        # to 2 genuinely-bad files can be in-flight together on a HEALTHY
+        # container and both fail — we want more evidence of a persistent fault
+        # before exiting (and a spurious exit is only a wasted container: its
+        # inputs stay pending and are redone on a healthy one).
+        self._fail_lock = threading.Lock()
         self.consecutive_failures = 0
 
     @modal.method()
     def transcribe_file(self, mp3_name: str) -> tuple[str, dict | None, str | None]:
-        """Transcribe a single file. Returns (stem, result_or_None, error_or_None)."""
-        from diskrot.transcribe_lyrics import _separate_vocals, _transcribe
+        """Transcribe a single file. Returns (stem, result_or_None, error_or_None).
+
+        Demucs-free: Whisper runs on the raw mono mix and gender is not estimated
+        here (it comes from the audio-LLM captioner / tags.json). large-v3-turbo +
+        VAD on the mix is an equal-or-better ASR input (arXiv:2506.15514)."""
+        from diskrot.transcribe_lyrics import _load_mix_mono, _transcribe
 
         mp3_path = Path("/corpus") / mp3_name
         key = mp3_path.stem
         try:
-            vocals = _separate_vocals(self.demucs_model, self.apply_fn, mp3_path, "cuda")
-            result = _transcribe(self.whisper_model, vocals)
-            self.consecutive_failures = 0
+            mix_mono = _load_mix_mono(mp3_path)
+            result = _transcribe(
+                self.batched if self.batch_size else self.whisper_model,
+                mix_mono, estimate_gender=False,
+                batch_size=self.batch_size or None)
+            with self._fail_lock:
+                self.consecutive_failures = 0
             return (key, result, None)
         except NameError as e:
             # Poisoned module state (a lazy import died and left sys.modules
@@ -129,18 +184,21 @@ class Transcriber:
             print(f"poisoned container ({e}); exiting so Modal replaces it", flush=True)
             os._exit(13)
         except Exception as e:
-            self.consecutive_failures += 1
+            with self._fail_lock:
+                self.consecutive_failures += 1
+                n_fail = self.consecutive_failures
             err = f"{type(e).__name__}: {str(e)[:300]}"
             # Print in the WORKER so a failure storm is visible live in any
             # container's logs — save_results only surfaces these at flush time.
-            print(f"ERROR (consecutive {self.consecutive_failures}) {key}: {err}",
-                  flush=True)
-            if self.consecutive_failures >= 3:
-                # Distinct files don't fail back-to-back on a healthy container;
+            print(f"ERROR (consecutive {n_fail}) {key}: {err}", flush=True)
+            if n_fail >= 5:
+                # Distinct files don't fail repeatedly on a healthy container;
                 # persistent broken state (sticky CUDA assert etc.) does. Same
                 # remedy as the NameError guard: die, get replaced, the inputs
-                # stay pending and are redone on a healthy container.
-                print("3 consecutive failures — poisoned container; exiting so "
+                # stay pending and are redone on a healthy container. 5 (not 3)
+                # tolerates up to 2 concurrent genuinely-bad files without a
+                # spurious exit under @modal.concurrent.
+                print("5 consecutive failures — poisoned container; exiting so "
                       "Modal replaces it", flush=True)
                 os._exit(13)
             return (key, None, err)
@@ -153,6 +211,13 @@ LOCK_PATH = "/tokens/lyrics/.orchestrator.lock"
 LOCK_STALE_SEC = 24 * 60 * 60
 
 
+def _needs_lang_redo(entry) -> bool:
+    """A forced-English (pre-auto-detect) entry: has transcribed words but no
+    ``language`` field. ``--redo-missing-language`` re-transcribes exactly these
+    (auto-detect overwrites them with the correct language + un-garbled words)."""
+    return isinstance(entry, dict) and bool(entry.get("words")) and not entry.get("language")
+
+
 @app.function(
     image=image,
     volumes={"/corpus": corpus_vol, "/tokens": tokens_vol},
@@ -160,17 +225,60 @@ LOCK_STALE_SEC = 24 * 60 * 60
     # that's >1 GB of JSON — Modal's 300s default timeout is not enough.
     timeout=30 * 60,
 )
-def list_pending() -> list[str]:
-    """Return mp3 filenames not yet in the sharded lyrics dir."""
+def list_pending(wave_id: str = "", redo_missing_language: bool = False) -> list[str]:
+    """Return mp3 names (relative to /corpus) not yet in the sharded lyrics dir.
+    ``wave_id`` scopes the glob to /corpus/waves/wave_<id>; lyrics shards key on
+    the song stem either way. With ``redo_missing_language``, entries that exist
+    but lack a ``language`` field (the legacy forced-English transcribe) are ALSO
+    pending — a targeted re-do that a plain resume would skip."""
     from diskrot.transcribe_lyrics import load_lyrics_shards
 
     # The orchestrator now calls this repeatedly (sweep loop) — a warm-reused
     # container must see the shards committed by save_results since it started.
     tokens_vol.reload()
-    mp3s = sorted(Path("/corpus").glob("*.mp3"))
+    sub = wave_subdir(wave_id)
+    mp3s = sorted((Path("/corpus") / sub).glob("*.mp3"))
     existing = load_lyrics_shards(LYRICS_DIR)
-    pending = [mp3.name for mp3 in mp3s if mp3.stem not in existing]
-    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, {len(pending)} pending")
+
+    # Gate on successful tokenization. A song with no ``.pt`` failed the tokenize
+    # stage (undecodable / codec error), so it will never be packed or trained on
+    # — transcribing it burns GPU (Whisper decodes the same file through the same
+    # ffmpeg path and fails identically), and for the rare decode-ok/encode-fail
+    # file it would only write an orphaned lyrics entry no dataset ever reads
+    # (no tokens -> not in the packed corpus). In the wave pipeline
+    # (tokenize -> ... -> transcribe -> pack -> cleanup) the ``.pt`` files are
+    # still on the volume when transcribe runs, so this narrows the work to
+    # exactly the songs that survived tokenize — mirroring how melody/stems
+    # already derive their pending set from ``.pt`` stems.
+    #
+    # FALLBACK: if the wave has NO ``.pt`` at all, we can't distinguish "every
+    # file failed" from "tokenize hasn't run yet" or "pack+cleanup already pruned
+    # the loose .pt" — and unlike melody/stems, transcribe reads the mp3 directly
+    # so it *can* legitimately run after cleanup. In that case we don't gate and
+    # fall back to the prior corpus-glob behavior, so a standalone post-cleanup
+    # (or global --redo) run never silently transcribes nothing.
+    tokenized = {p.stem for p in (Path("/tokens") / sub).glob("*.pt")}
+    gate = bool(tokenized)
+
+    pending: list[str] = []
+    n_redo = 0
+    n_untok = 0
+    for mp3 in mp3s:
+        if gate and mp3.stem not in tokenized:
+            n_untok += 1  # failed tokenize (no .pt) — skip, it can't be trained on
+            continue
+        is_redo = (redo_missing_language and mp3.stem in existing
+                   and _needs_lang_redo(existing.get(mp3.stem)))
+        if mp3.stem not in existing or is_redo:
+            pending.append(str(mp3.relative_to("/corpus")))
+            if is_redo:
+                n_redo += 1
+
+    extra = f" (incl. {n_redo} language-redo)" if redo_missing_language else ""
+    gate_note = (f", {n_untok} skipped (no .pt — failed/not-yet tokenized)"
+                 if n_untok else "")
+    print(f"found {len(mp3s)} total mp3s, {len(existing)} already done, "
+          f"{len(pending)} pending{extra}{gate_note}")
     return pending
 
 
@@ -303,8 +411,11 @@ def _release_lock() -> None:
     # the file just stays pending.)
     nonpreemptible=True,
 )
-def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
+def orchestrate(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
+                redo_missing_language: bool = False):
     """Dispatch transcription and merge results into the sharded lyrics dir.
+    ``wave_id`` scopes the pass to /corpus/waves/wave_<id>. ``redo_missing_language``
+    additionally re-transcribes legacy entries that lack a ``language`` field.
 
     Runs the ``.map()`` collect/flush loop *remotely* (not in local_entrypoint)
     so ``--detach`` truly survives terminal close — the previous version ran
@@ -342,7 +453,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
         sweep = 0
         while True:
             sweep += 1
-            pending = list_pending.remote()
+            pending = list_pending.remote(
+                wave_id=wave_id, redo_missing_language=redo_missing_language)
             if not pending:
                 print("Nothing to transcribe — all files already transcribed")
                 return
@@ -357,9 +469,13 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
                 return
             prev_pending = len(pending)
             print(f"sweep {sweep}: {len(pending)} pending, dispatching in "
-                  f"chunks of {chunk_size} (flush_every={flush_every})...")
+                  f"chunks of {chunk_size} (flush_every={flush_every}; "
+                  f"Demucs-free: Whisper on raw mix)...")
 
             n_seen = n_errors = n_inband = 0
+            # Per-sweep heartbeat (pending is re-listed each sweep and shrinks, so
+            # the ETA is for THIS sweep — most work is the first one).
+            rep = ProgressReporter(len(pending), "transcribe", unit="files")
             # n_inband: per-file errors (returned, not raised) — these stay
             # pending and are NOT written; surfacing the count here is what
             # makes a poisoned-container storm visible (2026-06-11: 146k of
@@ -380,6 +496,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
                     chunk, order_outputs=False, return_exceptions=True
                 ):
                     n_seen += 1
+                    rep.update(1, extra=f"transcribed {n_seen - n_errors - n_inband:,}, "
+                                        f"in-band-fail {n_inband:,}, errored {n_errors:,}")
                     if isinstance(result, Exception):
                         n_errors += 1
                         if n_errors <= 20:
@@ -404,6 +522,8 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
                           f"{n_inband} failed in-band, "
                           f"{n_errors} cancelled/errored)")
                     save_results.remote(batch)
+            rep.done(extra=f"transcribed {n_seen - n_errors - n_inband:,}, "
+                           f"in-band-fail {n_inband:,}, errored {n_errors:,}")
             print(f"sweep {sweep} complete: {n_seen} seen, "
                   f"{n_seen - n_errors - n_inband} transcribed, "
                   f"{n_inband} failed in-band, {n_errors} cancelled/errored"
@@ -418,14 +538,23 @@ def orchestrate(flush_every: int = 5000, chunk_size: int = 3000):
 
 
 @app.local_entrypoint()
-def main(flush_every: int = 5000, chunk_size: int = 3000):
+def main(flush_every: int = 5000, chunk_size: int = 3000, wave_id: str = "",
+         redo_missing_language: bool = False):
     """Spawn the remote orchestrator and return immediately.
 
     Use with ``--detach`` so the run survives terminal close (both pieces are
     required: ``.spawn()`` so the entrypoint exits without blocking, and
     ``--detach`` so the app isn't auto-stopped when the entrypoint completes).
+    --wave-id N scopes transcription to /corpus/waves/wave_N.
+    --redo-missing-language re-transcribes legacy entries lacking a ``language``
+    field (the forced-English 128k) — auto-detect overwrites them.
+
+    Transcribe is Demucs-free: Whisper runs on the raw mix (large-v3-turbo + VAD
+    is an equal-or-better ASR input, arXiv:2506.15514) and vocal gender comes from
+    the audio-LLM captioner (tags.json), so there is no separation step or F0 pass.
     """
-    call = orchestrate.spawn(flush_every, chunk_size)
+    call = orchestrate.spawn(flush_every, chunk_size, wave_id=wave_id,
+                             redo_missing_language=redo_missing_language)
     print(f"spawned orchestrator: function call id {call.object_id}")
     print("Follow logs in the Modal dashboard; safe to close this terminal "
           "if launched with --detach.")

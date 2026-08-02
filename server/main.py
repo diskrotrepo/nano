@@ -10,6 +10,7 @@ Endpoints:
     POST /cover          re-render a hummed melody (chroma) in the prompt's timbre
     POST /infill         fill the gap between two clips → [before | middle | after]
     POST /stem           remove/isolate stems via Demucs (no model — any ckpt)
+    POST /addstem        generate a NEW stem that fits a song (stem-trained ckpt)
 
     /generate, /extend accept optional text (tags), lyrics, gender, bpm, key,
 vocal-presence, and style_audio conditioning (gender/bpm/key/vocals ride the
@@ -32,11 +33,19 @@ from datetime import datetime, timezone
 
 import glob
 
+import base64
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from server.inference import InferenceEngine
+
+# Upper bound on a single batched generation. Decode is memory-bandwidth-bound so
+# the wall-clock barely grows with B, but the KV cache scales linearly with it;
+# 8 fits a 30s clip on an H100 with huge headroom (see the plan's budget).
+MAX_BATCH = int(os.environ.get("NANO_MAX_BATCH", "8"))
 
 # --- Model registry (switch between checkpoints at serve time) ---------------
 # The server can hold several named checkpoints (e.g. "full"=v8_sing4 and
@@ -139,15 +148,6 @@ def _save_output(body: bytes, mime: str, mode: str, prompt: str) -> None:
         return
     ext = "mp3" if "mpeg" in mime else "wav"
     _save_named(body, _output_name(mode, prompt, ext))
-
-
-def _combine_text_lyrics(text: str, lyrics: str) -> str | None:
-    """Combine tags and lyrics into a single conditioning string."""
-    text = text.strip()
-    lyrics = lyrics.strip()
-    if text and lyrics:
-        return f"{text}. {lyrics}"
-    return text or lyrics or None
 
 
 def _norm_gender(gender: str) -> str | None:
@@ -317,6 +317,78 @@ def list_models() -> dict:
     return {"models": out, "default_model": DEFAULT_MODEL, "active_model": ACTIVE_MODEL}
 
 
+# ── Sampling presets ────────────────────────────────────────────────────────
+# Plain-language names for the per-codebook sampling shapes the sweeps rank
+# (eval/sweep/config.py + scripts/eval_sampling_sweep.py profiles). A preset
+# bundles the whole sampling shape (per-cb temperature/top_k ladders + top_p);
+# cfg_scale stays an independent "prompt strength" control. The `preset`
+# request field, when set, replaces the temperature/top_k/top_p params — the
+# advanced per-cb fields only apply when preset is empty (or "custom").
+SAMPLING_PRESETS: dict[str, dict] = {
+    "balanced": {  # = the sweep's default_ladder — the server's long-time default
+        "label": "Balanced",
+        "description": "Good middle ground between clean and varied. The default.",
+        "per_cb_temperature": "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42",
+        "per_cb_top_k": "120,90,70,50,36,26,18,12,8",
+        "top_p": 0.95,
+    },
+    "steady": {  # = user_ladder — the 2026-07 v10 sweep's cross-genre winner
+        "label": "Steady",
+        "description": "Cleaner and more consistent — a tighter groove with fewer surprises.",
+        "per_cb_temperature": "0.9,0.9,0.7,0.7,0.5,0.5,0.4,0.4,0.3",
+        "per_cb_top_k": "120,90,70,50,36,26,18,12,8",
+        "top_p": 0.95,
+    },
+    "safe": {  # = tight_ladder
+        "label": "Extra safe",
+        "description": "The most predictable, polished sound. Can get repetitive.",
+        "per_cb_temperature": "0.8,0.7,0.6,0.5,0.45,0.4,0.35,0.3,0.25",
+        "per_cb_top_k": "100,70,50,36,26,18,12,8,6",
+        "top_p": 0.95,
+    },
+    "adventurous": {  # = open_flat
+        "label": "Adventurous",
+        "description": "The loosest and most surprising. More variety, more rough edges.",
+        "per_cb_temperature": "0.95",
+        "per_cb_top_k": "80",
+        "top_p": 0.95,
+    },
+}
+DEFAULT_PRESET = "balanced"
+
+
+def _resolve_preset(
+    preset: str, per_cb_temperature: str, per_cb_top_k: str,
+    per_cb_top_p: str, top_p: float,
+) -> tuple[str, str, str, float]:
+    """Map a named preset onto the sampling params. Empty/"custom" keeps the
+    caller's own values (back-compat + the advanced panel); unknown -> 400."""
+    p = (preset or "").strip().lower()
+    if not p or p == "custom":
+        return per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p
+    if p not in SAMPLING_PRESETS:
+        raise HTTPException(
+            400, f"unknown preset {preset!r} — one of {sorted(SAMPLING_PRESETS)} or 'custom'")
+    d = SAMPLING_PRESETS[p]
+    return d["per_cb_temperature"], d["per_cb_top_k"], "", d["top_p"]
+
+
+@app.get("/presets")
+def list_presets() -> dict:
+    """The sampling presets the `preset` request field accepts. UIs populate
+    their picker from this (label + description are user-facing copy)."""
+    return {
+        "presets": [
+            {"id": k, "label": v["label"], "description": v["description"],
+             "default": k == DEFAULT_PRESET,
+             "per_cb_temperature": v["per_cb_temperature"],
+             "per_cb_top_k": v["per_cb_top_k"], "top_p": v["top_p"]}
+            for k, v in SAMPLING_PRESETS.items()
+        ],
+        "default_preset": DEFAULT_PRESET,
+    }
+
+
 @app.post("/generate")
 async def generate_endpoint(
     seconds: float = Form(30.0),
@@ -328,6 +400,7 @@ async def generate_endpoint(
     per_cb_temperature: str = Form("1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"),
     per_cb_top_k: str = Form("120,90,70,50,36,26,18,12,8"),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(7.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -337,7 +410,7 @@ async def generate_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     score_clap: bool = Form(False),
     model: str = Form(""),
 ) -> Response:
@@ -360,10 +433,11 @@ async def generate_endpoint(
         better than a single temperature applied across all 9.
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     style_bytes = (await style_audio.read()) if style_audio else None
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     try:
         result = engine.generate_audio(
             seconds=seconds,
@@ -371,7 +445,8 @@ async def generate_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            text=combined,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
@@ -393,6 +468,170 @@ async def generate_endpoint(
     return Response(content=body, media_type=mime, headers=headers)
 
 
+class BatchItem(BaseModel):
+    """One clip in a /generate_batch request. Any field left unset inherits the
+    batch-level shared default of the same name."""
+    prompt: str | None = None
+    lyrics: str | None = None
+    gender: str | None = None
+    bpm: float | None = None
+    negative_prompt: str | None = None
+    req_id: str | None = None
+
+
+class BatchRequest(BaseModel):
+    """Generate several clips in ONE batched forward ("8 at once" on one GPU).
+
+    Two ways to specify the batch:
+    - ``items``: an explicit list of per-clip params (many DIFFERENT prompts), each
+      inheriting the shared fields below where unset.
+    - ``count`` (with no ``items``): N identical TAKES of the shared prompt/lyrics.
+
+    Sampling, cfg, and ``seconds`` are shared across the batch (the decode loop
+    applies one set batch-wide)."""
+    items: list[BatchItem] | None = None
+    count: int = 1
+    # shared conditioning (defaults for items, or the prompt replicated `count`x)
+    prompt: str = ""
+    lyrics: str = ""
+    gender: str = ""
+    bpm: float = 0.0
+    negative_prompt: str = ""
+    # shared sampling / guidance
+    seconds: float = 30.0
+    temperature: float = 0.9
+    top_k: int = 50
+    top_p: float = 0.95
+    per_cb_temperature: str = "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"
+    per_cb_top_k: str = "120,90,70,50,36,26,18,12,8"
+    per_cb_top_p: str = ""
+    preset: str = ""
+    cfg_scale: float = 7.0
+    lyric_cfg_scale: float = 8.0
+    sweeten: bool = True
+    model: str = ""
+
+
+@app.post("/generate_batch")
+def generate_batch_endpoint(req: BatchRequest) -> dict:
+    """Generate up to NANO_MAX_BATCH clips from scratch in a SINGLE batched run.
+
+    Because autoregressive decode is memory-bandwidth-bound, B clips cost ≈ the
+    wall-clock of one — so this is the cheap "generate 8 at once" path (one GPU,
+    one batched forward) as opposed to fanning N requests across N containers.
+
+    Returns a JSON manifest: ``{"items": [{req_id, mime, sweetened_prompt,
+    audio_b64}, ...], "count", "seconds"}``. Each clip is returned inline as base64
+    (works with no server-side persistence) AND saved to OUTPUT_DIR when configured
+    (fetchable later via GET /outputs/{req_id})."""
+    _get_engine(req.model)
+    assert engine is not None
+    if req.seconds <= 0:
+        raise HTTPException(400, "seconds must be > 0")
+
+    # Resolve the batch into a flat list of per-clip param dicts.
+    raw_items = req.items if req.items else [BatchItem() for _ in range(max(1, req.count))]
+    if not raw_items:
+        raise HTTPException(400, "empty batch")
+    if len(raw_items) > MAX_BATCH:
+        raise HTTPException(400, f"batch too large: {len(raw_items)} > NANO_MAX_BATCH={MAX_BATCH}")
+
+    def _pick(item_val, shared_val):
+        return item_val if item_val is not None else shared_val
+
+    # Sweeten each DISTINCT prompt once (N identical takes -> one LLM call).
+    sweet_cache: dict[str, tuple[str, dict]] = {}
+
+    def _sweet(p: str) -> str:
+        if p not in sweet_cache:
+            sweet_cache[p] = _maybe_sweeten(p, req.sweeten)
+        return sweet_cache[p][0]
+
+    manifest: list[dict] = []
+    gen_requests: list[dict] = []
+    for n, item in enumerate(raw_items):
+        prompt = _pick(item.prompt, req.prompt)
+        lyrics = _pick(item.lyrics, req.lyrics)
+        gender = _pick(item.gender, req.gender)
+        bpm = _pick(item.bpm, req.bpm)
+        neg = _pick(item.negative_prompt, req.negative_prompt)
+        sweetened = _sweet(prompt)
+        gen_requests.append({
+            "text": sweetened or None,
+            "lyrics": (lyrics or "").strip() or None,
+            "negative_text": neg.strip() or None,
+            "gender": _norm_gender(gender),
+            "bpm": bpm or None,
+        })
+        req_id = (item.req_id or "").strip() or f"b{n}{uuid.uuid4().hex[:10]}"
+        manifest.append({"req_id": req_id, "sweetened_prompt": sweetened, "_prompt": prompt})
+
+    def _on_item(i: int, body: bytes, mime: str) -> None:
+        ext = "mp3" if "mpeg" in mime else "wav"
+        name = _output_name("generate", manifest[i]["_prompt"], ext, uid=manifest[i]["req_id"])
+        _save_named(body, name)
+        manifest[i]["mime"] = mime
+        manifest[i]["audio_b64"] = base64.b64encode(body).decode("ascii")
+        manifest[i]["file"] = name
+
+    b_temp, b_topk, b_topp_list, b_topp = _resolve_preset(
+        req.preset, req.per_cb_temperature, req.per_cb_top_k, req.per_cb_top_p, req.top_p)
+    try:
+        engine.generate_audio_batch(
+            gen_requests,
+            seconds=req.seconds,
+            temperature=_parse_per_cb_temp(b_temp, req.temperature),
+            top_k=_parse_per_cb_topk(b_topk, req.top_k),
+            top_p=_parse_per_cb_topp(b_topp_list, b_topp),
+            cfg_scale=req.cfg_scale,
+            lyric_cfg_scale=req.lyric_cfg_scale or None,
+            on_item=_on_item,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    for m in manifest:
+        m.pop("_prompt", None)
+    return {"items": manifest, "count": len(manifest), "seconds": req.seconds}
+
+
+def _generate_stream_response(
+    *, seconds, temperature, top_k, top_p, per_cb_temperature, per_cb_top_k,
+    per_cb_top_p, cfg_scale, prompt, lyrics, gender, bpm, negative_prompt,
+    sweeten, lyric_cfg_scale, req_id, model, preset="",
+) -> StreamingResponse:
+    """Shared body for the GET and POST /generate_stream endpoints."""
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
+    _get_engine(model)
+    assert engine is not None
+    if seconds <= 0:
+        raise HTTPException(400, "seconds must be > 0")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    name = _output_name("generate", prompt, "mp3", uid=req_id or None)
+
+    stream = engine.generate_audio_stream(
+        seconds=seconds,
+        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+        cfg_scale=cfg_scale,
+        text=prompt or None,
+        lyrics=(lyrics or "").strip() or None,
+        negative_text=negative_prompt.strip() or None,
+        lyric_cfg_scale=lyric_cfg_scale or None,
+        gender=_norm_gender(gender),
+        bpm=bpm or None,
+        on_complete=lambda body, mime: _save_named(body, name),
+    )
+    headers = dict(sweet_headers)
+    headers["X-Nano-Output-File"] = name
+    headers["Access-Control-Expose-Headers"] = (
+        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+    )
+    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
+
+
 @app.get("/generate_stream")
 def generate_stream_endpoint(
     seconds: float = 30.0,
@@ -402,6 +641,7 @@ def generate_stream_endpoint(
     per_cb_temperature: str = "1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42",
     per_cb_top_k: str = "120,90,70,50,36,26,18,12,8",
     per_cb_top_p: str = "",
+    preset: str = "",
     cfg_scale: float = 7.0,
     prompt: str = "",
     lyrics: str = "",
@@ -409,7 +649,7 @@ def generate_stream_endpoint(
     bpm: float = 0.0,
     negative_prompt: str = "",
     sweeten: bool = True,
-    lyric_cfg_scale: float = 0.0,
+    lyric_cfg_scale: float = 8.0,
     req_id: str = "",
     model: str = "",
 ) -> StreamingResponse:
@@ -424,34 +664,51 @@ def generate_stream_endpoint(
     Pass a client-generated `req_id`; the canonical gapless clip is saved under a
     filename ending in that id, so the client can fetch it from GET /outputs/{id}
     after playback for download / accurate duration / a gapless re-listen.
-    """
-    _get_engine(model)
-    assert engine is not None
-    if seconds <= 0:
-        raise HTTPException(400, "seconds must be > 0")
-    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
-    name = _output_name("generate", prompt, "mp3", uid=req_id or None)
 
-    stream = engine.generate_audio_stream(
-        seconds=seconds,
-        temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
-        top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
-        top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
-        cfg_scale=cfg_scale,
-        text=combined,
-        negative_text=negative_prompt.strip() or None,
-        lyric_cfg_scale=lyric_cfg_scale or None,
-        gender=_norm_gender(gender),
-        bpm=bpm or None,
-        on_complete=lambda body, mime: _save_named(body, name),
+    Lyrics longer than a GET URL can carry should use POST /generate_stream.
+    """
+    return _generate_stream_response(
+        seconds=seconds, temperature=temperature, top_k=top_k, top_p=top_p,
+        per_cb_temperature=per_cb_temperature, per_cb_top_k=per_cb_top_k,
+        per_cb_top_p=per_cb_top_p, cfg_scale=cfg_scale, prompt=prompt,
+        lyrics=lyrics, gender=gender, bpm=bpm, negative_prompt=negative_prompt,
+        sweeten=sweeten, lyric_cfg_scale=lyric_cfg_scale, req_id=req_id, model=model,
+        preset=preset,
     )
-    headers = dict(sweet_headers)
-    headers["X-Nano-Output-File"] = name
-    headers["Access-Control-Expose-Headers"] = (
-        "X-Nano-Output-File, X-Nano-Sweetened-Prompt"
+
+
+@app.post("/generate_stream")
+def generate_stream_post_endpoint(
+    seconds: float = Form(30.0),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form("1.05,0.98,0.9,0.82,0.74,0.66,0.58,0.5,0.42"),
+    per_cb_top_k: str = Form("120,90,70,50,36,26,18,12,8"),
+    per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
+    cfg_scale: float = Form(7.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    gender: str = Form(""),
+    bpm: float = Form(0.0),
+    negative_prompt: str = Form(""),
+    sweeten: bool = Form(True),
+    lyric_cfg_scale: float = Form(8.0),
+    req_id: str = Form(""),
+    model: str = Form(""),
+) -> StreamingResponse:
+    """POST form variant of GET /generate_stream — same progressive MP3 stream,
+    but lyrics ride the request body, so long lyrics that would overflow a GET URL
+    still stream (instead of dropping to a no-progress buffered POST /generate)."""
+    return _generate_stream_response(
+        seconds=seconds, temperature=temperature, top_k=top_k, top_p=top_p,
+        per_cb_temperature=per_cb_temperature, per_cb_top_k=per_cb_top_k,
+        per_cb_top_p=per_cb_top_p, cfg_scale=cfg_scale, prompt=prompt,
+        lyrics=lyrics, gender=gender, bpm=bpm, negative_prompt=negative_prompt,
+        sweeten=sweeten, lyric_cfg_scale=lyric_cfg_scale, req_id=req_id, model=model,
+        preset=preset,
     )
-    return StreamingResponse(stream, media_type="audio/mpeg", headers=headers)
 
 
 @app.get("/outputs/{name}")
@@ -487,6 +744,7 @@ async def extend_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -496,7 +754,7 @@ async def extend_endpoint(
     sweeten: bool = Form(True),
     style_audio: UploadFile | None = File(None),
     style_weight: float = Form(0.5),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     model: str = Form(""),
 ) -> Response:
     """Continue a clip forward from a point in time. Returns [original 0→T | new].
@@ -511,13 +769,14 @@ async def extend_endpoint(
     repeatedly to chain a clip past the model's single-shot length cap.
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await audio.read()
     if not data:
         raise HTTPException(400, "empty audio upload")
     style_bytes = (await style_audio.read()) if style_audio else None
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     try:
         body, mime = engine.extend_audio(
             data,
@@ -528,7 +787,8 @@ async def extend_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            text=combined,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
             negative_text=negative_prompt.strip() or None,
             style_audio_bytes=style_bytes or None,
             style_weight=style_weight,
@@ -551,6 +811,7 @@ async def cover_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -559,7 +820,7 @@ async def cover_endpoint(
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     model: str = Form(""),
 ) -> Response:
     """Cover a hummed/uploaded melody in the prompt's timbre.
@@ -574,12 +835,13 @@ async def cover_endpoint(
     Requires a checkpoint trained with melody conditioning (use_melody_conditioning).
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await melody_audio.read()
     if not data:
         raise HTTPException(400, "empty melody_audio upload")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     try:
         body, mime = engine.cover_audio(
             data,
@@ -587,7 +849,8 @@ async def cover_endpoint(
             top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
             top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
             cfg_scale=cfg_scale,
-            text=combined,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
             negative_text=negative_prompt.strip() or None,
             melody_cfg_scale=melody_cfg_scale or None,
             lyric_cfg_scale=lyric_cfg_scale or None,
@@ -612,6 +875,7 @@ async def extend_stream_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -619,7 +883,7 @@ async def extend_stream_endpoint(
     bpm: float = Form(0.0),
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     req_id: str = Form(""),
     model: str = Form(""),
 ) -> StreamingResponse:
@@ -627,12 +891,13 @@ async def extend_stream_endpoint(
     continuation as it's produced (progressive MSE playback; bypasses the 150s
     wall). The finished clip is saved to OUTPUT_DIR (fetch via /outputs/{req_id})."""
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await audio.read()
     if not data:
         raise HTTPException(400, "empty audio upload")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     name = _output_name("extend", prompt, "mp3", uid=req_id or None)
     stream = engine.extend_audio_stream(
         data,
@@ -643,7 +908,8 @@ async def extend_stream_endpoint(
         top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
         top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
         cfg_scale=cfg_scale,
-        text=combined,
+        text=prompt or None,
+        lyrics=(lyrics or "").strip() or None,
         negative_text=negative_prompt.strip() or None,
         lyric_cfg_scale=lyric_cfg_scale or None,
         gender=_norm_gender(gender),
@@ -667,6 +933,7 @@ async def cover_stream_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     lyrics: str = Form(""),
@@ -675,19 +942,20 @@ async def cover_stream_endpoint(
     negative_prompt: str = Form(""),
     sweeten: bool = Form(True),
     melody_cfg_scale: float = Form(0.0),
-    lyric_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(8.0),
     req_id: str = Form(""),
     model: str = Form(""),
 ) -> StreamingResponse:
     """Streaming /cover: re-render the hum's melody in the prompt's timbre,
     streaming the result as it generates. Needs a melody-trained checkpoint."""
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     data = await melody_audio.read()
     if not data:
         raise HTTPException(400, "empty melody_audio upload")
     prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
-    combined = _combine_text_lyrics(prompt, lyrics)
     name = _output_name("cover", prompt, "mp3", uid=req_id or None)
     stream = engine.cover_audio_stream(
         data,
@@ -695,7 +963,8 @@ async def cover_stream_endpoint(
         top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
         top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
         cfg_scale=cfg_scale,
-        text=combined,
+        text=prompt or None,
+        lyrics=(lyrics or "").strip() or None,
         negative_text=negative_prompt.strip() or None,
         melody_cfg_scale=melody_cfg_scale or None,
         lyric_cfg_scale=lyric_cfg_scale or None,
@@ -722,6 +991,7 @@ async def infill_endpoint(
     per_cb_temperature: str = Form(""),
     per_cb_top_k: str = Form(""),
     per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
     cfg_scale: float = Form(3.0),
     prompt: str = Form(""),
     negative_prompt: str = Form(""),
@@ -740,6 +1010,8 @@ async def infill_endpoint(
     Requires a checkpoint trained with FIM (use_fim — a v8+ model).
     """
     _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
     assert engine is not None
     before = await before_audio.read()
     after = await after_audio.read()
@@ -787,8 +1059,8 @@ async def stem_endpoint(
       `keep=vocals` -> a-cappella, `keep=drums` -> drums only.
 
     Stem names: drums, bass, other, vocals (aliases like `vox` fold in).
-    Generating a brand-new stem (the complementary "add" direction) needs a
-    stem-conditioned checkpoint and is not this endpoint.
+    Generating a brand-new stem (the complementary "add" direction) is the
+    separate `/addstem` endpoint, which needs a stem-conditioned checkpoint.
     """
     _get_engine(model)
     assert engine is not None
@@ -810,3 +1082,70 @@ async def stem_endpoint(
         raise HTTPException(400, str(e))
     _save_output(body, mime, "stem", "+".join(keep_set))
     return Response(content=body, media_type=mime)
+
+
+@app.post("/addstem")
+async def addstem_endpoint(
+    audio: UploadFile = File(...),
+    target_stem: str = Form("bass"),
+    temperature: float = Form(0.9),
+    top_k: int = Form(50),
+    top_p: float = Form(0.95),
+    per_cb_temperature: str = Form(""),
+    per_cb_top_k: str = Form(""),
+    per_cb_top_p: str = Form(""),
+    preset: str = Form(""),
+    cfg_scale: float = Form(3.0),
+    prompt: str = Form(""),
+    lyrics: str = Form(""),
+    negative_prompt: str = Form(""),
+    stem_cfg_scale: float = Form(0.0),
+    lyric_cfg_scale: float = Form(0.0),
+    output: str = Form("mix"),
+    sweeten: bool = Form(True),
+    model: str = Form(""),
+) -> Response:
+    """Generate a NEW stem that fits an existing song — the generative inverse of
+    `/stem`'s removal.
+
+    Upload a song, pick `target_stem` (drums / bass / vocals / other) and describe
+    the vibe in `prompt` (e.g. "funky 70s warbly bassline"). The song is
+    Demucs-separated; the model conditions on its OTHER stems + the prompt and
+    generates the target stem. `output=mix` (default) returns the song with the new
+    stem summed in; `output=stem` returns the isolated generated stem. `stem_cfg_scale`
+    (>0) pushes how tightly the new stem fits the song, independent of `cfg_scale`.
+
+    `lyrics` applies ONLY when `target_stem=vocals` — the model sings those words
+    (same `[marker]` + phoneme syntax as /generate) over the song's other stems;
+    `lyric_cfg_scale` (>0) pushes diction. Ignored for drums/bass/other.
+
+    Requires a checkpoint trained with stem conditioning (use_stem_conditioning) and
+    the `demucs` package.
+    """
+    _get_engine(model)
+    per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p = _resolve_preset(
+        preset, per_cb_temperature, per_cb_top_k, per_cb_top_p, top_p)
+    assert engine is not None
+    data = await audio.read()
+    if not data:
+        raise HTTPException(400, "empty audio upload")
+    prompt, sweet_headers = _maybe_sweeten(prompt, sweeten)
+    try:
+        body, mime = engine.add_stem(
+            data,
+            target_stem=target_stem,
+            temperature=_parse_per_cb_temp(per_cb_temperature, temperature),
+            top_k=_parse_per_cb_topk(per_cb_top_k, top_k),
+            top_p=_parse_per_cb_topp(per_cb_top_p, top_p),
+            cfg_scale=cfg_scale,
+            text=prompt or None,
+            lyrics=(lyrics or "").strip() or None,
+            negative_text=negative_prompt.strip() or None,
+            stem_cfg_scale=stem_cfg_scale or None,
+            lyric_cfg_scale=lyric_cfg_scale or None,
+            output=(output or "mix").strip().lower(),
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    _save_output(body, mime, "addstem", f"{target_stem}: {prompt}")
+    return Response(content=body, media_type=mime, headers=sweet_headers)
