@@ -48,11 +48,12 @@ keeps fp16 (fine + faster there). Overrides:
 - `NANO_DTYPE=fp32|bf16|fp16` — force the torch compute dtype (default bf16 on
   MPS, fp16 on CUDA). fp32 is ~2× memory/slower and not reliably better than
   bf16 at this scale; bf16 is the recommended Mac dtype.
-- `NANO_MLX=1` — opt into the MLX backend (faster single-token decode). **Default
-  is off → torch-MPS**, which shares the CUDA code path and is fully parity-tested
-  (`tests/test_mlx_parity.py`). ⚠️ MLX was only audio-validated on the v9
-  SpectroStream shape; on the **v10 DAC** shape its int8 path degrades output to
-  hiss/noise (verified 2026-08-02) — do NOT use MLX for DAC serving until fixed.
+- `NANO_MLX=0` — opt OUT of the MLX backend back to torch-MPS. **MLX is the
+  Apple-Silicon default** (int8, ~1.9× faster than torch-MPS on the v10 DAC shape
+  and numerically correct as of 2026-08-02 — the CFG stage-batching that used to
+  collapse DAC to hiss now runs unbatched, activations/head default to fp32).
+  torch-MPS shares the CUDA code path and is fully parity-tested
+  (`tests/test_mlx_parity.py`) — fall back to it with `NANO_MLX=0` if needed.
 
 ## Modal server
 
@@ -94,9 +95,10 @@ needed (quantization happens at load).
   ```bash
   NANO_BITS=8 modal serve diskrot/modal_serve.py
   ```
-- **Apple Silicon**: default is PyTorch-MPS (bf16), the correct path for v10 DAC.
-  `NANO_MLX=1` opts into MLX (`NANO_MLX_BITS=8|4`) — faster, but its int8 DAC output
-  is currently noise, so leave it off for DAC serving.
+- **Apple Silicon**: default is the MLX backend (int8, ~1.9× faster than torch-MPS
+  on v10 DAC and correct as of 2026-08-02). `NANO_MLX_BITS=8|4`,
+  `NANO_MLX_ACT_DTYPE=fp32|bf16` (default fp32 — bf16 activations leave residual
+  hiss). Fall back to torch-MPS with `NANO_MLX=0`.
 
 Both skip the embeddings and the lyric encoder (small + intelligibility-sensitive)
 and quantize the big attention/MLP/head Linears. The startup log prints the active

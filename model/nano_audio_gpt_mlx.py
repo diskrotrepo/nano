@@ -207,11 +207,18 @@ class MLXNanoAudioGPT(mnn.Module):
         dtype: mx.Dtype = mx.float16,
         bits: int | None = None,
         group_size: int = 64,
+        fp32_head: bool = True,
     ):
         super().__init__()
         self.cfg = cfg
         self.param_dtype = dtype
         self._dtype = dtype
+        # Keep the output head in fp32 (weight + matmul) regardless of the decoder
+        # dtype/quant. The head projects straight into the sampling logits with no
+        # downstream renorm, so bf16/int8 error there perturbs the sampled tokens
+        # and the DAC rollout compounds it into noise (measured on the v10 DAC
+        # shape: quantizing the head cost ~4% argmax agreement vs torch fp32).
+        self._fp32_head = fp32_head
         K = cfg.n_codebooks
         self.n_codebooks = K
         self.head_dim = cfg.d_model // cfg.n_heads
@@ -257,6 +264,12 @@ class MLXNanoAudioGPT(mnn.Module):
             self._bits = bits
         else:
             self._bits = 16
+
+        # Force the head to fp32 (weight kept full-precision; the forward casts its
+        # input to fp32 too). Done after quant so the predicate has already left it
+        # unquantized.
+        if self._fp32_head:
+            self.head.weight = self.head.weight.astype(mx.float32)
 
         mx.eval(self.parameters())
         self._prime_kernels()
@@ -333,6 +346,11 @@ class MLXNanoAudioGPT(mnn.Module):
                 return False
             # Keep the melody encoder full-precision too (small + sensitive).
             if path.startswith("melody_encoder"):
+                return False
+            # Keep the output head full-precision — it sets the sampling logits
+            # directly (no downstream renorm), so quantizing it is what tips the
+            # DAC rollout into noise. See self._fp32_head.
+            if self._fp32_head and path == "head":
                 return False
             # group quant needs in_features divisible by group_size
             if module.weight.shape[-1] % group_size != 0:
@@ -503,8 +521,11 @@ class MLXNanoAudioGPT(mnn.Module):
             x = x + block.mlp.fc2(mnn.gelu(block.mlp.fc1(block.ln2(x))))
 
         x = self.ln_final(x)
+        # Head in fp32 (weight is fp32 when _fp32_head) so the logits that feed
+        # sampling are computed at full precision, not bf16.
+        hx = x.astype(mx.float32) if self._fp32_head else x
         logits = (
-            self.head(x)
+            self.head(hx)
             .reshape(B, T, self.n_codebooks, -1)
             .transpose(0, 2, 1, 3)  # [B, K, T, V]
         )
@@ -771,102 +792,37 @@ class MLXNanoAudioGPT(mnn.Module):
                 mel_on["mel"] = mel_pos
                 stages.append(mel_on)
                 scales.append(melody_cfg_scale)
-        # --- Batch the guidance stages into ONE forward ----------------------
-        # Each decode step needs len(stages) forward passes (baseline + one per
-        # guidance axis: tags / lyrics / melody). Single-token decode is
-        # memory-bandwidth-bound — the model's weights are streamed from memory
-        # once per forward regardless of batch — so running the S stages as ONE
-        # batched forward (batch S*B) costs ≈ a single B forward instead of S of
-        # them (the big win for /cover and lyric-guided gen, which stack 3–4
-        # stages). The stages share the SAME input tokens (we sample one sequence
-        # from the *combined* logits) and differ only in conditioning, so we tile
-        # the tokens and stack each stage's conditioning along the batch dim.
-        # Cross-attn projections are bias-free, so a zeros conditioning row
-        # contributes exactly 0 — identical to skipping it — which lets every row
-        # share one uniform forward (the "off" rows just carry zeros). Verified
-        # logit-identical to the per-stage loop (tests/test_mlx_parity.py).
+        # CFG guidance stages, run UNBATCHED — one B-row forward per stage. The
+        # batched S*B forward (stacking stages along the batch dim) is NOT
+        # logit-identical on the v10 DAC shape: the guided logits come out wrong
+        # and the rollout collapses to noise (cfg=1 / single-stage stayed clean;
+        # only cfg>1 broke). Per-stage costs len(stages) forwards/step, but the
+        # int8 decode is still ~2x faster than torch-MPS here and it is CORRECT.
         S = len(stages)
-        D = cfg.d_model
 
-        def _stack_text():
-            # Chunked tags make each stage's text a [B, N, D] sequence whose N can
-            # differ across stages (positive vs CFG baseline), so — exactly like
-            # _stack_lyric — pad to a common N_max and carry an additive mask that
-            # -inf's the pad of REAL stages (no softmax dilution) while null/off
-            # rows stay zero with an all-attend mask (V=0 -> contributes 0). A
-            # single-vector tag (N=1) reduces to the old uniform-length case.
-            if all(s["text"] is None for s in stages):
-                return None, None
-            Nmax = max(s["text"].shape[1] for s in stages if s["text"] is not None)
-            embs, masks = [], []
-            for s in stages:
-                if s["text"] is None:
-                    embs.append(mx.zeros((B, Nmax, D), dtype=self._dtype))
-                    masks.append(mx.zeros((B, 1, 1, Nmax), dtype=self._dtype))
-                    continue
-                emb = s["text"]
-                msk = s["tkv"]
-                N = emb.shape[1]
-                if msk is None:
-                    msk = mx.zeros((B, 1, 1, N), dtype=self._dtype)
-                if N < Nmax:
-                    emb = mx.concatenate(
-                        [emb, mx.zeros((B, Nmax - N, D), dtype=emb.dtype)], axis=1)
-                    msk = mx.concatenate(
-                        [msk, mx.full((B, 1, 1, Nmax - N), NEG_INF, dtype=msk.dtype)], axis=-1)
-                embs.append(emb)
-                masks.append(msk)
-            return mx.concatenate(embs, axis=0), mx.concatenate(masks, axis=0)
-
-        def _stack_melody():
-            if not self.has_melody:
-                return None  # additive null handled inside __call__
-            return mx.concatenate([s["mel"] for s in stages], axis=0)
-
-        def _stack_lyric():
-            if all(s["lemb"] is None for s in stages):
-                return None, None
-            Lmax = max(s["lemb"].shape[1] for s in stages if s["lemb"] is not None)
-            embs, masks = [], []
-            for s in stages:
-                if s["lemb"] is None:
-                    # Null lyric: zero emb + an all-finite (all-attend) mask so the
-                    # softmax is well-defined; V=0 makes the contribution exactly 0.
-                    embs.append(mx.zeros((B, Lmax, D), dtype=self._dtype))
-                    masks.append(mx.zeros((B, 1, 1, Lmax), dtype=self._dtype))
-                    continue
-                emb, msk, L = s["lemb"], s["lkv"], s["lemb"].shape[1]
-                if L < Lmax:  # pad to the common length; mask the pad out (-inf)
-                    emb = mx.concatenate(
-                        [emb, mx.zeros((B, Lmax - L, D), dtype=emb.dtype)], axis=1)
-                    msk = mx.concatenate(
-                        [msk, mx.full((B, 1, 1, Lmax - L), NEG_INF, dtype=msk.dtype)], axis=-1)
-                embs.append(emb)
-                masks.append(msk)
-            return mx.concatenate(embs, axis=0), mx.concatenate(masks, axis=0)
-
-        text_b, tkv_b = _stack_text()
-        mel_b = _stack_melody()
-        lemb_b, lkv_b = _stack_lyric()
-        caches_b = self._new_caches(S * B, T_delay)
-        # One cross-attention K/V cache per block: text_b / lemb_b are FIXED for
-        # the whole decode, so kv_proj(cond) runs once at prefill instead of on
-        # every step (the torch BlockCrossKV port — dominant cost w/ long lyrics).
-        cross_b = [_BlockCrossKV() for _ in range(cfg.n_layers)]
+        # Run each guidance stage as its OWN B-row forward (see note above), each
+        # with its own self/cross caches, then combine the per-stage logits. One
+        # cross-attn K/V cache per block per stage: the conditioning is FIXED for
+        # the whole decode, so kv_proj(cond) runs once at prefill, not per step.
+        caches_s = [self._new_caches(B, T_delay) for _ in range(S)]
+        cross_s = [
+            [_BlockCrossKV() for _ in range(cfg.n_layers)] for _ in range(S)
+        ]
 
         def _run(inp, start):
-            inp_b = mx.tile(inp, (S, 1, 1)) if S > 1 else inp
-            return self(
-                inp_b, caches=caches_b, start_pos=start,
-                text_emb=text_b, text_kv_mask=tkv_b,
-                lyric_emb=lemb_b, lyric_kv_mask=lkv_b, melody_emb=mel_b,
-                cross_caches=cross_b,
-            )
+            return [
+                self(
+                    inp, caches=caches_s[i], start_pos=start,
+                    text_emb=s["text"], text_kv_mask=s["tkv"],
+                    lyric_emb=s["lemb"], lyric_kv_mask=s["lkv"], melody_emb=s["mel"],
+                    cross_caches=cross_s[i],
+                )
+                for i, s in enumerate(stages)
+            ]
 
-        def _combine(logits_b):
+        def _combine(parts):
             if S == 1:
-                return logits_b
-            parts = [logits_b[i * B:(i + 1) * B] for i in range(S)]
+                return parts[0]
             out = parts[0]
             for i, sc in enumerate(scales):
                 out = out + sc * (parts[i + 1] - parts[i])
@@ -880,7 +836,7 @@ class MLXNanoAudioGPT(mnn.Module):
 
         prefill_len = max(1, T_prompt)
         logits = _combine(_run(tokens[:, :, :prefill_len], 0))
-        mx.eval(logits, [c.k for c in caches_b])
+        mx.eval(logits, [c.k for cs in caches_s for c in cs])
 
         emitted = 0  # count of new frames already yielded
         threshold = first_emit

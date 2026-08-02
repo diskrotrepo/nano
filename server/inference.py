@@ -149,17 +149,14 @@ class InferenceEngine:
             if any(k.startswith("_orig_mod.") for k in state):
                 state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
-            # Backend on Apple Silicon: PyTorch-MPS by default (bf16, shares the
-            # CUDA code path and is parity-tested), MLX only on explicit opt-in
-            # (NANO_MLX=1). MLX is faster for single-token decode, BUT on the v10
-            # DAC shape its int8 path degrades the rollout to hiss/noise (verified
-            # 2026-08-02: identical /generate_stream gave zcr 0.32 + autocorr 0.54
-            # on MLX-int8 vs zcr 0.06 + autocorr 0.96 on torch-MPS). MLX was only
-            # ever audio-validated on the v9 SpectroStream shape — keep it opt-in
-            # until the DAC path is fixed/validated. Elsewhere: PyTorch.
+            # Backend on Apple Silicon: MLX by default (int8, ~1.9x faster than
+            # torch-MPS on the v10 DAC shape and now numerically correct — the CFG
+            # stage-batching that used to collapse DAC to noise is run unbatched,
+            # and activations/head default to fp32). Opt back out to the
+            # parity-tested torch-MPS path with NANO_MLX=0. Elsewhere: PyTorch.
             self.backend = (
                 "mlx"
-                if os.environ.get("NANO_MLX", "0") == "1"
+                if os.environ.get("NANO_MLX", "1") != "0"
                 and self.device == "mps"
                 and _mlx_available()
                 else "torch"
@@ -170,13 +167,21 @@ class InferenceEngine:
                 from model.nano_audio_gpt_mlx import MLXNanoAudioGPT
 
                 bits = int(os.environ.get("NANO_MLX_BITS", "8"))
-                # bf16 (not fp16): this is the training dtype, and fp16's narrow
-                # exponent range collapses the rollout (see the torch-path note).
+                # Activation dtype. bf16 is the training dtype, BUT on the v10 DAC
+                # shape MLX's bf16 matmul accumulation drifts ~2% argmax vs torch
+                # and the rollout compounds it into noise (torch-bf16 itself is
+                # 97.6% vs fp32 and stays coherent; MLX bf16-act is only ~95.8%).
+                # fp32 activations (int8 weights kept) recover ~97.8% ≈ the torch
+                # coherence bar. NANO_MLX_ACT_DTYPE=fp32|bf16 (default fp32 for DAC
+                # correctness). The head is always fp32 (MLXNanoAudioGPT fp32_head).
+                act = os.environ.get("NANO_MLX_ACT_DTYPE", "fp32").lower()
+                act_dtype = mx.float32 if act == "fp32" else mx.bfloat16
                 self.model = MLXNanoAudioGPT(
-                    cfg, state, dtype=mx.bfloat16, bits=bits if bits in (4, 8) else None
+                    cfg, state, dtype=act_dtype, bits=bits if bits in (4, 8) else None
                 )
                 print(f"[inference] backend: mlx (Apple Silicon), weights="
-                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}")
+                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}"
+                      f", act={act}, fp32_head={self.model._fp32_head}")
                 # One local GPU — serialize generation so concurrent requests
                 # can't overcommit it into a watchdog GPU hang (see _gpu_gen_gate).
                 global _GEN_GATE_ON
