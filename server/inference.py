@@ -170,13 +170,21 @@ class InferenceEngine:
                 from model.nano_audio_gpt_mlx import MLXNanoAudioGPT
 
                 bits = int(os.environ.get("NANO_MLX_BITS", "8"))
-                # bf16 (not fp16): this is the training dtype, and fp16's narrow
-                # exponent range collapses the rollout (see the torch-path note).
+                # Activation dtype. bf16 is the training dtype, BUT on the v10 DAC
+                # shape MLX's bf16 matmul accumulation drifts ~2% argmax vs torch
+                # and the rollout compounds it into noise (torch-bf16 itself is
+                # 97.6% vs fp32 and stays coherent; MLX bf16-act is only ~95.8%).
+                # fp32 activations (int8 weights kept) recover ~97.8% ≈ the torch
+                # coherence bar. NANO_MLX_ACT_DTYPE=fp32|bf16 (default fp32 for DAC
+                # correctness). The head is always fp32 (MLXNanoAudioGPT fp32_head).
+                act = os.environ.get("NANO_MLX_ACT_DTYPE", "fp32").lower()
+                act_dtype = mx.float32 if act == "fp32" else mx.bfloat16
                 self.model = MLXNanoAudioGPT(
-                    cfg, state, dtype=mx.bfloat16, bits=bits if bits in (4, 8) else None
+                    cfg, state, dtype=act_dtype, bits=bits if bits in (4, 8) else None
                 )
                 print(f"[inference] backend: mlx (Apple Silicon), weights="
-                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}")
+                      f"{'bf16' if self.model._bits == 16 else f'int{self.model._bits}'}"
+                      f", act={act}, fp32_head={self.model._fp32_head}")
                 # One local GPU — serialize generation so concurrent requests
                 # can't overcommit it into a watchdog GPU hang (see _gpu_gen_gate).
                 global _GEN_GATE_ON
