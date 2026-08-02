@@ -48,9 +48,10 @@ keeps fp16 (fine + faster there). Overrides:
 - `NANO_DTYPE=fp32|bf16|fp16` — force the torch compute dtype (default bf16 on
   MPS, fp16 on CUDA). fp32 is ~2× memory/slower and not reliably better than
   bf16 at this scale; bf16 is the recommended Mac dtype.
-- `NANO_MLX=1` — opt into the MLX backend (faster single-token decode, separate
-  runtime; also bf16 now). Default is off → torch-MPS, which shares the CUDA code
-  path and is fully parity-tested (`tests/test_mlx_parity.py`).
+- `NANO_MLX=0` — opt OUT of the MLX backend back to torch-MPS. MLX is now the
+  Apple-Silicon default (int8, ~5.5× faster single-token decode; codebook-agnostic
+  so it handles v10's DAC 9-cb shape). torch-MPS shares the CUDA code path and is
+  fully parity-tested (`tests/test_mlx_parity.py`) — use it if MLX misbehaves.
 
 ## Modal server
 
@@ -92,8 +93,9 @@ needed (quantization happens at load).
   ```bash
   NANO_BITS=8 modal serve diskrot/modal_serve.py
   ```
-- **Apple Silicon** (local MLX backend): `NANO_MLX_BITS=8|4` (default 8). Force the
-  PyTorch-MPS path instead with `NANO_MLX=0`.
+- **Apple Silicon** (MLX backend, now the default): `NANO_MLX_BITS=8|4` (default 8;
+  int4 ~7.4× vs torch-MPS but lower precision). Force the PyTorch-MPS path with
+  `NANO_MLX=0`.
 
 Both skip the embeddings and the lyric encoder (small + intelligibility-sensitive)
 and quantize the big attention/MLP/head Linears. The startup log prints the active

@@ -149,13 +149,14 @@ class InferenceEngine:
             if any(k.startswith("_orig_mod.") for k in state):
                 state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
-            # Backend on Apple Silicon: PyTorch-MPS by default (bf16, shares the
-            # CUDA code path and is fully parity-tested), MLX only on explicit
-            # opt-in (NANO_MLX=1) — MLX is faster for single-token decode but a
-            # separate runtime. Elsewhere: PyTorch.
+            # Backend on Apple Silicon: MLX by default (int8, ~5.5x faster single-
+            # token decode than PyTorch-MPS on the v10 shape — measured 202 vs 37
+            # frames/s; codebook-agnostic so it handles DAC's 9 cb). Opt back out
+            # to the parity-tested PyTorch-MPS path with NANO_MLX=0. Elsewhere:
+            # PyTorch. NANO_MLX_BITS (default 8) picks the MLX weight precision.
             self.backend = (
                 "mlx"
-                if os.environ.get("NANO_MLX", "0") == "1"
+                if os.environ.get("NANO_MLX", "1") != "0"
                 and self.device == "mps"
                 and _mlx_available()
                 else "torch"
