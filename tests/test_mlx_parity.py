@@ -79,16 +79,30 @@ def test_cached_decode_matches_oneshot(use_qk_norm):
     assert torch.equal(out_t, out_m)
 
 
-def test_cfg_path_runs_and_in_range():
-    cfg = _tiny_cfg(use_text_conditioning=True)
-    _, mlx_m = _build_pair(cfg, seed=4)
+def test_cfg_generate_matches_torch():
+    """CFG-guided (cfg_scale>1) greedy generate must match PyTorch token-for-token.
+
+    Regression guard for the MLX CFG path: it runs each guidance stage as its own
+    forward and combines the logits. A prior batched-forward implementation (all
+    stages stacked along the batch dim) was NOT logit-identical on the DAC shape
+    and collapsed the rollout to noise — but the old test only checked shape/range
+    (temperature=0.9, no torch reference), so it passed anyway. Greedy + exact
+    equality vs torch is what actually pins the guidance math.
+
+    NOTE: use_qk_norm=True is load-bearing — the batched-forward bug only surfaced
+    with qk-norm on (the v10 checkpoint's setting); with it off the old code
+    matched torch, which is exactly why the bug shipped. Don't drop it."""
+    cfg = _tiny_cfg(use_text_conditioning=True, use_qk_norm=True)
+    m, mlx_m = _build_pair(cfg, seed=4)
     K = cfg.n_codebooks
     tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 8))
     text_emb = torch.randn(1, 2, cfg.d_model)
-    out = mlx_m.generate(tokens[0], num_new_frames=5, temperature=0.9, top_k=50,
-                         top_p=0.95, text_emb=text_emb, cfg_scale=3.0)
-    assert out.shape == (K, 8 + 5)
-    assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
+    kw = dict(num_new_frames=5, temperature=0.0, top_k=None, top_p=None,
+              text_emb=text_emb, cfg_scale=3.0)
+    out_t = m.generate(tokens[0], **kw)
+    out_m = mlx_m.generate(tokens[0], **kw)
+    assert out_t.shape == (K, 8 + 5)
+    assert torch.equal(out_t, out_m)
 
 
 def test_unconditional_generate_from_none():
@@ -159,19 +173,25 @@ def test_cached_decode_matches_with_lyrics():
     assert torch.equal(out_t, out_m)
 
 
-def test_lyric_composed_cfg_runs_and_in_range():
-    """Composed dual-axis guidance (separate lyric_cfg_scale) runs on MLX."""
-    cfg = _lyric_cfg(use_text_conditioning=True)
-    _, mlx_m = _build_pair(cfg, seed=8)
+def test_lyric_composed_cfg_matches_torch():
+    """Composed dual-axis guidance (tags cfg + separate lyric_cfg_scale, S=3 stages)
+    greedy-generates identically to PyTorch — the multi-stage combine + per-stage
+    cross/lyric caches must stay isolated (see test_cfg_generate_matches_torch).
+
+    qk-norm on (the trigger for the batched-forward bug — see that test)."""
+    cfg = _lyric_cfg(use_text_conditioning=True, use_qk_norm=True)
+    m, mlx_m = _build_pair(cfg, seed=8)
     K = cfg.n_codebooks
     tokens = torch.randint(0, cfg.vocab_per_codebook, (1, K, 8))
     text_emb = torch.randn(1, 1, cfg.d_model)
     ids, mask = _lyric_inputs()
-    out = mlx_m.generate(tokens[0], num_new_frames=5, temperature=0.9, top_k=50,
-                         top_p=0.95, text_emb=text_emb, cfg_scale=2.0,
-                         lyric_cfg_scale=4.0, lyric_ids=ids, lyric_mask=mask)
-    assert out.shape == (K, 8 + 5)
-    assert int(out.min()) >= 0 and int(out.max()) < cfg.vocab_per_codebook
+    kw = dict(num_new_frames=5, temperature=0.0, top_k=None, top_p=None,
+              text_emb=text_emb, cfg_scale=2.0, lyric_cfg_scale=4.0,
+              lyric_ids=ids, lyric_mask=mask)
+    out_t = m.generate(tokens[0], **kw)
+    out_m = mlx_m.generate(tokens[0], **kw)
+    assert out_t.shape == (K, 8 + 5)
+    assert torch.equal(out_t, out_m)
 
 
 def _melody_cfg(**overrides) -> GPTConfig:
